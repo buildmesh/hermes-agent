@@ -9,6 +9,7 @@ Uses python-telegram-bot library for:
 
 import asyncio
 import dataclasses
+import importlib.util
 import inspect
 import json
 import logging
@@ -2920,7 +2921,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommandScopeAllGroupChats,
                     BotCommandScopeDefault,
                 )
-                from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
                 if not self._bot:
                     return
                 # Telegram allows up to 100 commands but has an undocumented
@@ -2928,8 +2928,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 # keep built-ins plus common skill commands visible while
                 # staying under the threshold; users can tune the cap via
                 # platforms.telegram.extra.command_menu.
-                max_commands = telegram_menu_max_commands()
-                menu_commands, hidden_count = telegram_menu_commands(max_commands=max_commands)
+                max_commands = MAX_COMMANDS_PER_SCOPE
+                menu_commands, hidden_count = self._telegram_menu_commands()
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 # Register for all scopes independently — Telegram picks the
                 # narrowest matching scope per chat type (forum topics fall
@@ -5303,6 +5303,9 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        if await self._maybe_handle_telegram_bridge_callback(update, query):
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -7440,6 +7443,156 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         return self._message_matches_mention_patterns(message)
 
+    def _telegram_bridge_paths(self) -> tuple[_Path, _Path] | None:
+        """Return (profile_root, hermes_base_home) when a bridge runtime is installed."""
+        try:
+            from hermes_constants import get_hermes_home
+            active_home = get_hermes_home().resolve()
+        except Exception:
+            return None
+
+        profile_root = active_home
+        hermes_base = active_home
+        if active_home.parent.name == "profiles":
+            hermes_base = active_home.parent.parent
+
+        dispatcher = profile_root / "bin" / "telegram_bridge_dispatch.py"
+        if not dispatcher.exists():
+            return None
+        return profile_root, hermes_base
+
+    def _telegram_menu_commands(self) -> tuple[list[tuple[str, str]], int]:
+        """Return bridge registry commands when installed, else Hermes defaults."""
+        dispatcher = self._load_telegram_bridge_dispatcher()
+        paths = self._telegram_bridge_paths()
+        if dispatcher is not None and paths is not None:
+            try:
+                menu_commands, hidden_count = dispatcher.telegram_bot_commands(
+                    paths[0],
+                    max_commands=MAX_COMMANDS_PER_SCOPE,
+                )
+                if menu_commands:
+                    return menu_commands, hidden_count
+            except Exception as exc:
+                logger.warning("[%s] Bridge command menu sync failed; using Hermes defaults: %s", self.name, exc)
+        from hermes_cli.commands import telegram_menu_commands
+        return telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+
+    def _load_telegram_bridge_dispatcher(self) -> Any | None:
+        paths = self._telegram_bridge_paths()
+        if paths is None:
+            return None
+        profile_root, _hermes_base = paths
+        dispatcher = profile_root / "bin" / "telegram_bridge_dispatch.py"
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "telegram_bridge_dispatch_live",
+                dispatcher,
+            )
+            if spec is None or spec.loader is None:
+                return None
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+            return module
+        except Exception as exc:
+            logger.error("[%s] Failed to load Telegram bridge dispatcher: %s", self.name, exc, exc_info=True)
+            return None
+
+    async def _render_telegram_bridge_payloads(
+        self,
+        dispatcher: Any,
+        payloads: list[dict[str, Any]],
+        bridge_config: dict[str, Any] | None = None,
+    ) -> None:
+        if not self._bot:
+            raise RuntimeError("Telegram bot is not connected")
+        await dispatcher.render_payloads_to_telegram(
+            payloads,
+            bot=self._bot,
+            inline_keyboard_button_cls=InlineKeyboardButton,
+            inline_keyboard_markup_cls=InlineKeyboardMarkup,
+            parse_mode_markdown_v2=ParseMode.MARKDOWN_V2,
+            bridge_config=bridge_config,
+        )
+
+    async def _maybe_handle_telegram_bridge_command(self, update: "Update", msg: "Message") -> bool:
+        dispatcher = self._load_telegram_bridge_dispatcher()
+        paths = self._telegram_bridge_paths()
+        if dispatcher is None or paths is None:
+            return False
+        text = msg.text or ""
+        match = re.match(r"^/([a-z][a-z0-9_]{0,31})(?:@[\w_]+)?(?:\s|$)", text.strip(), re.S)
+        if not match:
+            return False
+        command = match.group(1)
+        try:
+            from hermes_cli.commands import is_gateway_known_command
+            hermes_known = bool(is_gateway_known_command(command.replace("_", "-")))
+        except Exception:
+            hermes_known = False
+        profile_root, hermes_base = paths
+        try:
+            if not dispatcher.can_handle_command(profile_root, command, hermes_known=hermes_known):
+                return False
+            user_id = getattr(getattr(msg, "from_user", None), "id", None) or getattr(msg.chat, "id", None)
+            result = dispatcher.dispatch_command(
+                profile_root,
+                hermes_base,
+                text=text,
+                chat_id=int(msg.chat_id),
+                user_id=int(user_id),
+                telegram_message_id=int(msg.message_id),
+                update_id=getattr(update, "update_id", None),
+                hermes_known=hermes_known,
+            )
+            if not result.handled:
+                return False
+            await self._render_telegram_bridge_payloads(dispatcher, result.payloads, result.bridge_config)
+            logger.info("[%s] Telegram bridge handled /%s (%s)", self.name, command, result.reason)
+            return True
+        except Exception as exc:
+            logger.error("[%s] Telegram bridge command failed: %s", self.name, exc, exc_info=True)
+            await self.send(str(msg.chat_id), f"Telegram bridge error: {exc}")
+            return True
+
+    async def _maybe_handle_telegram_bridge_callback(self, update: "Update", query: Any) -> bool:
+        dispatcher = self._load_telegram_bridge_dispatcher()
+        paths = self._telegram_bridge_paths()
+        if dispatcher is None or paths is None:
+            return False
+        data = getattr(query, "data", "") or ""
+        if "." not in data:
+            return False
+        message = getattr(query, "message", None)
+        if message is None:
+            return False
+        profile_root, hermes_base = paths
+        try:
+            result = dispatcher.dispatch_callback(
+                profile_root,
+                hermes_base,
+                callback_query_id=str(query.id),
+                callback_data=data,
+                chat_id=int(message.chat_id),
+                user_id=int(getattr(query.from_user, "id", message.chat_id)),
+                telegram_message_id=int(message.message_id),
+                update_id=getattr(update, "update_id", None),
+                text=getattr(message, "text", None),
+            )
+            if not result.handled:
+                return False
+            await self._render_telegram_bridge_payloads(dispatcher, result.payloads, result.bridge_config)
+            logger.info("[%s] Telegram bridge handled callback %s (%s)", self.name, data, result.reason)
+            return True
+        except Exception as exc:
+            logger.error("[%s] Telegram bridge callback failed: %s", self.name, exc, exc_info=True)
+            try:
+                await query.answer(text=f"Telegram bridge error: {exc}", show_alert=True)
+            except Exception:
+                pass
+            return True
+
     async def _ensure_forum_commands(self, message) -> None:
         """Lazy-register bot commands for forum supergroups.
 
@@ -7456,8 +7609,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 if chat_id in self._forum_command_registered:
                     return
                 from telegram import BotCommand, BotCommandScopeChat
-                from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
-                menu_commands, _ = telegram_menu_commands(max_commands=telegram_menu_max_commands())
+                menu_commands, _ = self._telegram_menu_commands()
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 await self._bot.set_my_commands(bot_commands, scope=BotCommandScopeChat(chat_id=chat_id))
                 self._forum_command_registered.add(chat_id)
@@ -7523,6 +7675,9 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
         await self._ensure_forum_commands(msg)
+
+        if await self._maybe_handle_telegram_bridge_command(update, msg):
+            return
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
