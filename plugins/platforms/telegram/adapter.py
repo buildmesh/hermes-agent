@@ -7516,6 +7516,38 @@ class TelegramAdapter(BasePlatformAdapter):
             bridge_config=bridge_config,
         )
 
+    async def _rerender_telegram_bridge_with_repair(
+        self,
+        dispatcher: Any,
+        profile_root: _Path,
+        hermes_base: _Path,
+        envelope: dict[str, Any] | None,
+        bridge_config: dict[str, Any] | None,
+        error: Exception,
+    ) -> bool:
+        if envelope is None:
+            return False
+        repair_fn = getattr(dispatcher, "request_specialist_render_repair", None)
+        if not callable(repair_fn):
+            return False
+        repaired_payloads = repair_fn(
+            profile_root,
+            hermes_base,
+            envelope,
+            str(error).strip()[:800],
+        )
+        if not repaired_payloads:
+            return False
+        await dispatcher.render_payloads_to_telegram(
+            repaired_payloads,
+            bot=self._bot,
+            inline_keyboard_button_cls=InlineKeyboardButton,
+            inline_keyboard_markup_cls=InlineKeyboardMarkup,
+            parse_mode_markdown_v2=ParseMode.MARKDOWN_V2,
+            bridge_config=bridge_config,
+        )
+        return True
+
     async def _maybe_handle_telegram_bridge_command(self, update: "Update", msg: "Message") -> bool:
         dispatcher = self._load_telegram_bridge_dispatcher()
         paths = self._telegram_bridge_paths()
@@ -7532,6 +7564,7 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             hermes_known = False
         profile_root, hermes_base = paths
+        render_retry_failed = False
         try:
             if not dispatcher.can_handle_command(profile_root, command, hermes_known=hermes_known):
                 return False
@@ -7548,11 +7581,84 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             if not result.handled:
                 return False
-            await self._render_telegram_bridge_payloads(dispatcher, result.payloads, result.bridge_config)
+            try:
+                await self._render_telegram_bridge_payloads(dispatcher, result.payloads, result.bridge_config)
+            except Exception as exc:
+                repaired = await self._rerender_telegram_bridge_with_repair(
+                    dispatcher,
+                    profile_root,
+                    hermes_base,
+                    result.envelope,
+                    result.bridge_config,
+                    exc,
+                )
+                if not repaired:
+                    render_retry_failed = True
+                    raise
             logger.info("[%s] Telegram bridge handled /%s (%s)", self.name, command, result.reason)
             return True
         except Exception as exc:
             logger.error("[%s] Telegram bridge command failed: %s", self.name, exc, exc_info=True)
+            if render_retry_failed:
+                logger.warning(
+                    "[%s] Telegram bridge render retry failed for /%s; not surfacing to user",
+                    self.name,
+                    command,
+                )
+                return True
+            await self.send(str(msg.chat_id), f"Telegram bridge error: {exc}")
+            return True
+
+    async def _maybe_handle_telegram_bridge_text(self, update: "Update", msg: "Message") -> bool:
+        dispatcher = self._load_telegram_bridge_dispatcher()
+        paths = self._telegram_bridge_paths()
+        if dispatcher is None or paths is None:
+            return False
+        dispatch_text = getattr(dispatcher, "dispatch_text", None)
+        if not callable(dispatch_text):
+            return False
+        text = self._clean_bot_trigger_text(msg.text or "")
+        if not text:
+            return False
+        profile_root, hermes_base = paths
+        render_retry_failed = False
+        try:
+            user_id = getattr(getattr(msg, "from_user", None), "id", None) or getattr(msg.chat, "id", None)
+            result = dispatch_text(
+                profile_root,
+                hermes_base,
+                text=text,
+                chat_id=int(msg.chat_id),
+                user_id=int(user_id),
+                telegram_message_id=int(msg.message_id),
+                update_id=getattr(update, "update_id", None),
+            )
+            if not result.handled:
+                return False
+            try:
+                await self._render_telegram_bridge_payloads(dispatcher, result.payloads, result.bridge_config)
+            except Exception as exc:
+                repaired = await self._rerender_telegram_bridge_with_repair(
+                    dispatcher,
+                    profile_root,
+                    hermes_base,
+                    result.envelope,
+                    result.bridge_config,
+                    exc,
+                )
+                if not repaired:
+                    render_retry_failed = True
+                    raise
+            logger.info("[%s] Telegram bridge handled text (%s)", self.name, result.reason)
+            return True
+        except Exception as exc:
+            logger.error("[%s] Telegram bridge text failed: %s", self.name, exc, exc_info=True)
+            if render_retry_failed:
+                logger.warning(
+                    "[%s] Telegram bridge render retry failed for text; not surfacing to user",
+                    self.name,
+                )
+                return True
             await self.send(str(msg.chat_id), f"Telegram bridge error: {exc}")
             return True
 
@@ -7568,6 +7674,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if message is None:
             return False
         profile_root, hermes_base = paths
+        render_retry_failed = False
         try:
             result = dispatcher.dispatch_callback(
                 profile_root,
@@ -7582,11 +7689,30 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             if not result.handled:
                 return False
-            await self._render_telegram_bridge_payloads(dispatcher, result.payloads, result.bridge_config)
+            try:
+                await self._render_telegram_bridge_payloads(dispatcher, result.payloads, result.bridge_config)
+            except Exception as exc:
+                repaired = await self._rerender_telegram_bridge_with_repair(
+                    dispatcher,
+                    profile_root,
+                    hermes_base,
+                    result.envelope,
+                    result.bridge_config,
+                    exc,
+                )
+                if not repaired:
+                    render_retry_failed = True
+                    raise
             logger.info("[%s] Telegram bridge handled callback %s (%s)", self.name, data, result.reason)
             return True
         except Exception as exc:
             logger.error("[%s] Telegram bridge callback failed: %s", self.name, exc, exc_info=True)
+            if render_retry_failed:
+                try:
+                    await query.answer()
+                except Exception:
+                    pass
+                return True
             try:
                 await query.answer(text=f"Telegram bridge error: {exc}", show_alert=True)
             except Exception:
@@ -7653,6 +7779,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
             return
         await self._ensure_forum_commands(update.message)
+
+        if await self._maybe_handle_telegram_bridge_text(update, msg):
+            return
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
