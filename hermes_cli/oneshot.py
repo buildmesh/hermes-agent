@@ -294,15 +294,13 @@ def _create_session_db_for_oneshot():
         return None
 
 
-def _run_agent(
-    prompt: str,
+def create_noninteractive_agent(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
-) -> tuple[str, dict]:
-    """Build an AIAgent exactly like a normal CLI chat turn would, then
-    run a single conversation.  Returns ``(final_response, run_result)``."""
+) -> object:
+    """Build a profile-aware AIAgent for a noninteractive runtime."""
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
     from hermes_cli.config import load_config
@@ -416,6 +414,23 @@ def _run_agent(
     agent.stream_delta_callback = None
     agent.tool_gen_callback = None
 
+    return agent
+
+
+def _run_agent(
+    prompt: str,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    toolsets: object = None,
+    use_config_toolsets: bool = True,
+) -> tuple[str, dict]:
+    """Build an AIAgent like CLI chat, then run one conversation turn."""
+    agent = create_noninteractive_agent(
+        model=model,
+        provider=provider,
+        toolsets=toolsets,
+        use_config_toolsets=use_config_toolsets,
+    )
     result = agent.run_conversation(prompt)
     return (result.get("final_response") or "", result)
 

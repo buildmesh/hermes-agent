@@ -16,6 +16,7 @@ import logging
 import os
 import html as _html
 import re
+import sys
 import threading
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
@@ -508,6 +509,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
         self._telegram_bridge_notification_worker: Any | None = None
+        self._telegram_bridge_persistent_workers: Dict[str, asyncio.subprocess.Process] = {}
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -2929,7 +2931,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 # keep built-ins plus common skill commands visible while
                 # staying under the threshold; users can tune the cap via
                 # platforms.telegram.extra.command_menu.
-                max_commands = MAX_COMMANDS_PER_SCOPE
+                from hermes_cli.commands import telegram_menu_max_commands
+                max_commands = telegram_menu_max_commands()
                 menu_commands, hidden_count = self._telegram_menu_commands()
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
                 # Register for all scopes independently — Telegram picks the
@@ -3344,6 +3347,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "polling will be retried in the background",
                         self.name,
                     )
+            await self._start_telegram_bridge_persistent_workers()
             await self._start_telegram_bridge_notification_worker()
             
             self._mark_connected()
@@ -3374,6 +3378,7 @@ class TelegramAdapter(BasePlatformAdapter):
             
         except Exception as e:
             await self._stop_telegram_bridge_notification_worker()
+            await self._stop_telegram_bridge_persistent_workers()
             self._release_platform_lock()
             safe_error = _redact_telegram_error_text(e)
             message = f"Telegram startup failed: {safe_error}"
@@ -3495,6 +3500,7 @@ class TelegramAdapter(BasePlatformAdapter):
             pass
 
         await self._stop_telegram_bridge_notification_worker()
+        await self._stop_telegram_bridge_persistent_workers()
         await self._cancel_pending_delivery_tasks()
 
         if self._app:
@@ -7467,20 +7473,21 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _telegram_menu_commands(self) -> tuple[list[tuple[str, str]], int]:
         """Return bridge registry commands when installed, else Hermes defaults."""
+        from hermes_cli.commands import telegram_menu_commands, telegram_menu_max_commands
+        max_commands = telegram_menu_max_commands()
         dispatcher = self._load_telegram_bridge_dispatcher()
         paths = self._telegram_bridge_paths()
         if dispatcher is not None and paths is not None:
             try:
                 menu_commands, hidden_count = dispatcher.telegram_bot_commands(
                     paths[0],
-                    max_commands=MAX_COMMANDS_PER_SCOPE,
+                    max_commands=max_commands,
                 )
                 if menu_commands:
                     return menu_commands, hidden_count
             except Exception as exc:
                 logger.warning("[%s] Bridge command menu sync failed; using Hermes defaults: %s", self.name, exc)
-        from hermes_cli.commands import telegram_menu_commands
-        return telegram_menu_commands(max_commands=MAX_COMMANDS_PER_SCOPE)
+        return telegram_menu_commands(max_commands=max_commands)
 
     def _load_telegram_bridge_dispatcher(self) -> Any | None:
         paths = self._telegram_bridge_paths()
@@ -7519,6 +7526,70 @@ class TelegramAdapter(BasePlatformAdapter):
             parse_mode_markdown_v2=ParseMode.MARKDOWN_V2,
             bridge_config=bridge_config,
         )
+
+    async def _start_telegram_bridge_persistent_workers(self) -> None:
+        dispatcher = self._load_telegram_bridge_dispatcher()
+        paths = self._telegram_bridge_paths()
+        if dispatcher is None or paths is None:
+            return
+        specs_fn = getattr(dispatcher, "persistent_service_specs", None)
+        if not callable(specs_fn):
+            return
+        await self._stop_telegram_bridge_persistent_workers()
+        specs = specs_fn(paths[0], paths[1])
+        started: Dict[str, asyncio.subprocess.Process] = {}
+        try:
+            for spec in specs:
+                env = dict(os.environ)
+                env["HERMES_HOME"] = spec["profile_root"]
+                process = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-m",
+                    "hermes_cli.persistent_specialist_worker",
+                    "--profile-root",
+                    spec["profile_root"],
+                    "--socket",
+                    spec["socket_relative"],
+                    "--agent-id",
+                    spec["agent_id"],
+                    "--turn-timeout",
+                    str(spec["turn_timeout_seconds"]),
+                    "--reset-timeout",
+                    str(spec["reset_timeout_seconds"]),
+                    env=env,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                deadline = asyncio.get_running_loop().time() + float(spec["startup_timeout_seconds"])
+                socket_path = _Path(spec["socket_path"])
+                while not socket_path.exists() and process.returncode is None:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise TimeoutError(f"persistent worker startup timed out: {spec['agent_id']}")
+                    await asyncio.sleep(0.05)
+                if process.returncode is not None:
+                    raise RuntimeError(f"persistent worker exited during startup: {spec['agent_id']}")
+                started[spec["agent_id"]] = process
+                logger.info("[%s] Persistent specialist worker started: %s", self.name, spec["agent_id"])
+            self._telegram_bridge_persistent_workers = started
+        except Exception:
+            self._telegram_bridge_persistent_workers = started
+            await self._stop_telegram_bridge_persistent_workers()
+            raise
+
+    async def _stop_telegram_bridge_persistent_workers(self) -> None:
+        workers = getattr(self, "_telegram_bridge_persistent_workers", {})
+        self._telegram_bridge_persistent_workers = {}
+        for agent_id, process in workers.items():
+            if process.returncode is None:
+                process.terminate()
+        for agent_id, process in workers.items():
+            if process.returncode is None:
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+            logger.info("[%s] Persistent specialist worker stopped: %s", self.name, agent_id)
 
     async def _start_telegram_bridge_notification_worker(self) -> None:
         dispatcher = self._load_telegram_bridge_dispatcher()
@@ -7589,7 +7660,8 @@ class TelegramAdapter(BasePlatformAdapter):
         repair_fn = getattr(dispatcher, "request_specialist_render_repair", None)
         if not callable(repair_fn):
             return False
-        repaired_payloads = repair_fn(
+        repaired_payloads = await asyncio.to_thread(
+            repair_fn,
             profile_root,
             hermes_base,
             envelope,
@@ -7606,6 +7678,19 @@ class TelegramAdapter(BasePlatformAdapter):
             bridge_config=bridge_config,
         )
         return True
+
+    async def _await_telegram_bridge_dispatch(self, typing_chat_id: int, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        async def refresh_typing() -> None:
+            while True:
+                await self.send_typing(str(typing_chat_id))
+                await asyncio.sleep(4)
+
+        typing_task = asyncio.create_task(refresh_typing())
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        finally:
+            typing_task.cancel()
+            await asyncio.gather(typing_task, return_exceptions=True)
 
     async def _maybe_handle_telegram_bridge_command(self, update: "Update", msg: "Message") -> bool:
         dispatcher = self._load_telegram_bridge_dispatcher()
@@ -7628,7 +7713,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if not dispatcher.can_handle_command(profile_root, command, hermes_known=hermes_known):
                 return False
             user_id = getattr(getattr(msg, "from_user", None), "id", None) or getattr(msg.chat, "id", None)
-            result = dispatcher.dispatch_command(
+            result = await self._await_telegram_bridge_dispatch(
+                int(msg.chat_id),
+                dispatcher.dispatch_command,
                 profile_root,
                 hermes_base,
                 text=text,
@@ -7683,7 +7770,9 @@ class TelegramAdapter(BasePlatformAdapter):
         render_retry_failed = False
         try:
             user_id = getattr(getattr(msg, "from_user", None), "id", None) or getattr(msg.chat, "id", None)
-            result = dispatch_text(
+            result = await self._await_telegram_bridge_dispatch(
+                int(msg.chat_id),
+                dispatch_text,
                 profile_root,
                 hermes_base,
                 text=text,
@@ -7736,7 +7825,9 @@ class TelegramAdapter(BasePlatformAdapter):
         profile_root, hermes_base = paths
         render_retry_failed = False
         try:
-            result = dispatcher.dispatch_callback(
+            result = await self._await_telegram_bridge_dispatch(
+                int(message.chat_id),
+                dispatcher.dispatch_callback,
                 profile_root,
                 hermes_base,
                 callback_query_id=str(query.id),
