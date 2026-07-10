@@ -1,6 +1,7 @@
 import asyncio
 import json
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -152,3 +153,39 @@ async def test_worker_socket_negotiation_permissions_and_restart_recovery(tmp_pa
         assert replay["error"]["code"] == "DUPLICATE_IN_FLIGHT"
     finally:
         await recovered.stop()
+
+
+@pytest.mark.asyncio
+async def test_reset_waits_for_active_turn_and_blocks_new_admission(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingAgent(FakeAgent):
+        def run_conversation(self, prompt: str) -> dict:
+            entered.set()
+            release.wait(timeout=2)
+            return super().run_conversation(prompt)
+
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        turn_timeout=3,
+        reset_timeout=4,
+        agent_factory=BlockingAgent,
+    )
+    await worker.start()
+    try:
+        active = asyncio.create_task(worker.handle_request(request("active")))
+        assert await asyncio.to_thread(entered.wait, 1)
+        reset_task = asyncio.create_task(worker.handle_request(request("reset-active", "reset")))
+        await asyncio.sleep(0.05)
+        rejected = await worker.handle_request(request("too-soon"))
+        assert rejected["error"]["code"] == "QUEUE_FULL"
+        assert reset_task.done() is False
+        release.set()
+        assert (await active)["status"] == "completed"
+        assert (await reset_task)["status"] == "completed"
+    finally:
+        release.set()
+        await worker.stop()

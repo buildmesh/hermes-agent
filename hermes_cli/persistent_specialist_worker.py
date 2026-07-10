@@ -124,6 +124,7 @@ class PersistentSpecialistWorker:
         self._agent: Any | None = None
         self._conversation_id: str | None = None
         self._conversation_lock = asyncio.Lock()
+        self._resetting = False
         self._server: asyncio.AbstractServer | None = None
         self._instance_lock: Any | None = None
         self._stopping = False
@@ -315,7 +316,7 @@ class PersistentSpecialistWorker:
             return self._failure(request, "CONVERSATION_UNHEALTHY", "the specialist conversation requires recovery", False, "not_started")
         if self._conversation_id not in {None, conversation_id}:
             return self._failure(request, "CONVERSATION_LIMIT", "this v1 worker already owns another conversation", True, "not_started")
-        if self._conversation_lock.locked():
+        if request["operation"] == "turn" and (self._conversation_lock.locked() or self._resetting):
             return self._failure(request, "QUEUE_FULL", "the specialist conversation is busy", True, "not_started")
 
         now = _utcnow()
@@ -330,12 +331,35 @@ class PersistentSpecialistWorker:
             "updated_at": _iso(now),
         }
         _atomic_json(path, record)
-        async with self._conversation_lock:
+        started = time.monotonic()
+        if request["operation"] == "reset":
+            self._resetting = True
+            try:
+                await asyncio.wait_for(self._conversation_lock.acquire(), timeout=self.reset_timeout)
+            except asyncio.TimeoutError:
+                self._unhealthy = True
+                self.last_error_code = "RESET_UNCONFIRMED"
+                response = self._failure(
+                    request,
+                    "RESET_UNCONFIRMED",
+                    "the active specialist turn did not stop before the reset deadline",
+                    False,
+                    "outcome_unknown",
+                )
+                record["state"] = "outcome_unknown"
+                record["response"] = response
+                record["updated_at"] = _iso(_utcnow())
+                _atomic_json(path, record)
+                self._resetting = False
+                return response
+        else:
+            await self._conversation_lock.acquire()
+        try:
             self._conversation_id = conversation_id
-            started = time.monotonic()
             try:
                 if request["operation"] == "reset":
-                    await asyncio.wait_for(self._retire_agent(), timeout=self.reset_timeout)
+                    remaining = max(0.1, self.reset_timeout - (time.monotonic() - started))
+                    await asyncio.wait_for(self._retire_agent(), timeout=remaining)
                     self.conversation_instance_id = f"thread_{uuid.uuid4().hex}"
                     response = self._reset_response(request, started)
                 else:
@@ -376,6 +400,10 @@ class PersistentSpecialistWorker:
             record["updated_at"] = _iso(_utcnow())
             _atomic_json(path, record)
             return response
+        finally:
+            self._conversation_lock.release()
+            if request["operation"] == "reset":
+                self._resetting = False
 
     def _interrupt_agent(self) -> None:
         session = getattr(self._agent, "_codex_session", None)
