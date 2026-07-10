@@ -507,6 +507,7 @@ class TelegramAdapter(BasePlatformAdapter):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
+        self._telegram_bridge_notification_worker: Any | None = None
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -3343,6 +3344,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "polling will be retried in the background",
                         self.name,
                     )
+            await self._start_telegram_bridge_notification_worker()
             
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
@@ -3371,6 +3373,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
             
         except Exception as e:
+            await self._stop_telegram_bridge_notification_worker()
             self._release_platform_lock()
             safe_error = _redact_telegram_error_text(e)
             message = f"Telegram startup failed: {safe_error}"
@@ -3491,6 +3494,7 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+        await self._stop_telegram_bridge_notification_worker()
         await self._cancel_pending_delivery_tasks()
 
         if self._app:
@@ -7504,10 +7508,10 @@ class TelegramAdapter(BasePlatformAdapter):
         dispatcher: Any,
         payloads: list[dict[str, Any]],
         bridge_config: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> list[dict[str, Any]]:
         if not self._bot:
             raise RuntimeError("Telegram bot is not connected")
-        await dispatcher.render_payloads_to_telegram(
+        return await dispatcher.render_payloads_to_telegram(
             payloads,
             bot=self._bot,
             inline_keyboard_button_cls=InlineKeyboardButton,
@@ -7515,6 +7519,61 @@ class TelegramAdapter(BasePlatformAdapter):
             parse_mode_markdown_v2=ParseMode.MARKDOWN_V2,
             bridge_config=bridge_config,
         )
+
+    async def _start_telegram_bridge_notification_worker(self) -> None:
+        dispatcher = self._load_telegram_bridge_dispatcher()
+        paths = self._telegram_bridge_paths()
+        if dispatcher is None or paths is None or not self._bot:
+            return
+        factory = getattr(dispatcher, "create_notification_worker", None)
+        if not callable(factory):
+            return
+        await self._stop_telegram_bridge_notification_worker()
+        try:
+            worker = factory(
+                paths[0],
+                paths[1],
+                bot=self._bot,
+                inline_keyboard_button_cls=InlineKeyboardButton,
+                inline_keyboard_markup_cls=InlineKeyboardMarkup,
+                parse_mode_markdown_v2=ParseMode.MARKDOWN_V2,
+            )
+            await worker.start()
+            self._telegram_bridge_notification_worker = worker
+            logger.info("[%s] Telegram bridge notification worker started", self.name)
+        except Exception as exc:
+            self._telegram_bridge_notification_worker = None
+            logger.error(
+                "[%s] Telegram bridge notification worker failed to start: %s",
+                self.name,
+                exc,
+                exc_info=True,
+            )
+
+    async def _stop_telegram_bridge_notification_worker(self) -> None:
+        worker = getattr(self, "_telegram_bridge_notification_worker", None)
+        self._telegram_bridge_notification_worker = None
+        if worker is None:
+            return
+        try:
+            await worker.stop()
+            logger.info("[%s] Telegram bridge notification worker stopped", self.name)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Telegram bridge notification worker shutdown failed: %s",
+                self.name,
+                exc,
+                exc_info=True,
+            )
+
+    def _telegram_bridge_notification_health(self) -> dict[str, Any]:
+        worker = getattr(self, "_telegram_bridge_notification_worker", None)
+        if worker is None:
+            return {"running": False, "lock_owned": False, "queue_depth_by_state": {}}
+        try:
+            return worker.health()
+        except Exception as exc:
+            return {"running": False, "lock_owned": False, "error": str(exc)}
 
     async def _rerender_telegram_bridge_with_repair(
         self,
@@ -7631,6 +7690,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 chat_id=int(msg.chat_id),
                 user_id=int(user_id),
                 telegram_message_id=int(msg.message_id),
+                reply_to_message_id=getattr(getattr(msg, "reply_to_message", None), "message_id", None),
                 update_id=getattr(update, "update_id", None),
             )
             if not result.handled:
