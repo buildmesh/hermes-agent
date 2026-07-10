@@ -203,6 +203,8 @@ async def test_bridge_persistent_worker_lifecycle(tmp_path, monkeypatch):
         "startup_timeout_seconds": 2,
         "turn_timeout_seconds": 30,
         "reset_timeout_seconds": 45,
+        "queue_limit_per_conversation": 4,
+        "idle_conversation_seconds": 3600,
     }]
     adapter._load_telegram_bridge_dispatcher = MagicMock(return_value=dispatcher)
     adapter._telegram_bridge_paths = MagicMock(return_value=(profile_root, tmp_path))

@@ -84,6 +84,7 @@ async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> No
         assert second["render_payloads"][0]["render"]["text"] == "turn 2"
         assert duplicate == first
         assert len(agents) == 1
+        assert "turn_completed" in (tmp_path / "logs/persistent-specialist.jsonl").read_text()
 
         old_thread = second["conversation_instance_id"]
         codex_session = FakeCodexSession()
@@ -178,13 +179,19 @@ async def test_reset_waits_for_active_turn_and_blocks_new_admission(tmp_path: Pa
     try:
         active = asyncio.create_task(worker.handle_request(request("active")))
         assert await asyncio.to_thread(entered.wait, 1)
+        queued = asyncio.create_task(worker.handle_request(request("queued")))
+        await asyncio.sleep(0.05)
+        assert worker.health()["queued_turns"] == 1
         reset_task = asyncio.create_task(worker.handle_request(request("reset-active", "reset")))
         await asyncio.sleep(0.05)
         rejected = await worker.handle_request(request("too-soon"))
-        assert rejected["error"]["code"] == "QUEUE_FULL"
+        assert rejected["error"]["code"] == "RESET_IN_PROGRESS"
         assert reset_task.done() is False
         release.set()
         assert (await active)["status"] == "completed"
+        canceled = await queued
+        assert canceled["error"]["code"] == "RESET"
+        assert canceled["execution_state"] == "not_started"
         assert (await reset_task)["status"] == "completed"
     finally:
         release.set()
