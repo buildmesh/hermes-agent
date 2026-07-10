@@ -209,6 +209,10 @@ class PersistentSpecialistWorker:
     async def _retire_agent(self) -> None:
         agent, self._agent = self._agent, None
         if agent is not None:
+            session = getattr(agent, "_codex_session", None)
+            if session is not None:
+                await asyncio.to_thread(session.close)
+                agent._codex_session = None
             await asyncio.to_thread(agent.close)
 
     def health(self) -> dict[str, Any]:

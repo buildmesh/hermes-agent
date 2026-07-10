@@ -12,6 +12,7 @@ class FakeAgent:
     def __init__(self) -> None:
         self.turns = 0
         self.closed = False
+        self._codex_session = None
 
     def run_conversation(self, prompt: str) -> dict:
         self.turns += 1
@@ -25,6 +26,14 @@ class FakeAgent:
             "render": {"text": f"turn {self.turns}"},
         }]
         return {"completed": True, "partial": False, "final_response": json.dumps(payload)}
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeCodexSession:
+    def __init__(self) -> None:
+        self.closed = False
 
     def close(self) -> None:
         self.closed = True
@@ -76,10 +85,13 @@ async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> No
         assert len(agents) == 1
 
         old_thread = second["conversation_instance_id"]
+        codex_session = FakeCodexSession()
+        agents[0]._codex_session = codex_session
         reset = await worker.handle_request(request("reset1", "reset"))
         assert reset["status"] == "completed"
         assert reset["conversation_instance_id"] != old_thread
         assert agents[0].closed is True
+        assert codex_session.closed is True
 
         third = await worker.handle_request(request("event3"))
         assert third["render_payloads"][0]["render"]["text"] == "turn 1"
