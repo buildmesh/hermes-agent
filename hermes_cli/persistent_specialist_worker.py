@@ -83,10 +83,49 @@ def _extract_render_payloads(text: str) -> list[dict[str, Any]]:
         if start < 0 or end <= start:
             raise ValueError("specialist response did not contain a JSON array")
         stripped = stripped[start : end + 1]
-    value = json.loads(stripped)
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        repaired = _repair_missing_container_close(stripped, exc.pos)
+        if repaired is None:
+            raise
+        value = json.loads(repaired)
     if not isinstance(value, list) or not value or not all(isinstance(item, dict) for item in value):
         raise ValueError("specialist response must be a non-empty JSON object array")
     return value
+
+
+def _repair_missing_container_close(text: str, error_pos: int) -> str | None:
+    """Repair one provably missing array/object close at the decoder boundary."""
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    pairs = {"[": "]", "{": "}"}
+    for char in text[:error_pos]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in pairs:
+            stack.append(char)
+        elif char in "]}":
+            if not stack or pairs[stack[-1]] != char:
+                return None
+            stack.pop()
+
+    if in_string or not stack or error_pos >= len(text):
+        return None
+    expected = pairs[stack[-1]]
+    encountered = text[error_pos]
+    if encountered not in "]}" or encountered == expected:
+        return None
+    return text[:error_pos] + expected + text[error_pos:]
 
 
 def _bridge_prompt(envelope: dict[str, Any]) -> str:

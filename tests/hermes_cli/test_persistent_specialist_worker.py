@@ -6,7 +6,33 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli.persistent_specialist_worker import PROTOCOL, PersistentSpecialistWorker
+from hermes_cli.persistent_specialist_worker import (
+    PROTOCOL,
+    PersistentSpecialistWorker,
+    _extract_render_payloads,
+)
+
+
+def test_extract_render_payloads_repairs_one_missing_container_close() -> None:
+    malformed = (
+        '[{"schema_version":"telegram.bridge.render_payload.v1",'
+        '"render":{"text":"Corner contains 23 items.","blocks":['
+        '{"type":"table","columns":["Item","Quantity"],'
+        '"rows":[["Citric Acid, qt","2 jars"],["Paper towels","8 rolls"]}'
+        ']}}]'
+    )
+
+    payloads = _extract_render_payloads(malformed)
+
+    assert payloads[0]["render"]["blocks"][0]["rows"] == [
+        ["Citric Acid, qt", "2 jars"],
+        ["Paper towels", "8 rolls"],
+    ]
+
+
+def test_extract_render_payloads_rejects_other_malformed_json() -> None:
+    with pytest.raises(ValueError):
+        _extract_render_payloads('[{"render":{"text":"broken" "blocks":[]}}]')
 
 
 class FakeAgent:
