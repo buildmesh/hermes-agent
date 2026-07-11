@@ -12,6 +12,7 @@ import pytest
 import hermes_cli.persistent_specialist_worker as persistent_worker
 from hermes_cli.persistent_specialist_worker import (
     PROTOCOL,
+    PROTOCOL_V2,
     PersistentSpecialistWorker,
     _initialize_worker_process_context,
     _extract_render_payloads,
@@ -142,6 +143,86 @@ def request(event_id: str, operation: str = "turn") -> dict:
     }
 
 
+def v2_request(event_id: str, operation: str = "turn") -> dict:
+    value = request(event_id, operation)
+    value["protocol_version"] = PROTOCOL_V2
+    return value
+
+
+def correction_request(event_id: str, attempt_id: str = "corr_attempt_1") -> dict:
+    return {
+        "protocol_version": PROTOCOL_V2,
+        "request_id": f"req_{attempt_id}",
+        "operation": "correct_render",
+        "event_id": event_id,
+        "conversation_id": "conv_" + "1" * 64,
+        "deadline": "2099-01-01T00:00:00+00:00",
+        "correction_attempt_id": attempt_id,
+        "validation_errors": [{
+            "code": "RENDER_JSON_INVALID",
+            "path": "$",
+            "message": "candidate is not valid JSON",
+        }],
+        "target_constraints": {
+            "correlation_id": event_id,
+            "chat_id": 123,
+            "authorized_telegram_message_ids": [],
+            "callback_namespace": "hello",
+        },
+    }
+
+
+class CorrectionAgent:
+    def __init__(self, *, api_mode: str = "chat_completions") -> None:
+        self.api_mode = api_mode
+        self.turns = 0
+        self.tools = [{"type": "function", "function": {"name": "terminal"}}]
+        self.valid_tool_names = {"terminal"}
+        self.max_iterations = 8
+        self._fallback_chain = [{"provider": "fallback", "model": "fallback"}]
+        self._codex_session = None
+        self.session_cwd = None
+        self.tool_snapshots: list[list[dict]] = []
+        self.denied_execution = False
+        self.executed_tools = 0
+        self.closed = False
+
+    def _execute_tool_calls(self, *_args: object, **_kwargs: object) -> None:
+        self.executed_tools += 1
+
+    def run_conversation(self, prompt: str) -> dict:
+        self.turns += 1
+        self.tool_snapshots.append(list(self.tools))
+        if self.turns == 1:
+            return {
+                "completed": True,
+                "partial": False,
+                "api_calls": 1,
+                "final_response": '[{"schema_version":"telegram.bridge.render_payload.v1"',
+            }
+        try:
+            self._execute_tool_calls(object(), [], "correction")
+        except Exception as exc:
+            self.denied_execution = "denied" in str(exc).lower()
+        payload = [{
+            "schema_version": "telegram.bridge.render_payload.v1",
+            "message_id": "msg_corrected",
+            "correlation_id": "completed-malformed",
+            "action": "send",
+            "target": {"chat_id": 123},
+            "render": {"text": "corrected without rerunning domain work"},
+        }]
+        return {
+            "completed": True,
+            "partial": False,
+            "api_calls": 1,
+            "final_response": json.dumps(payload),
+        }
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def assert_complete_timing(response: dict) -> None:
     assert response["trace_id"].startswith("trace_")
     assert set(response["timing_ms"]) == {
@@ -256,6 +337,179 @@ async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> No
         assert len(agents) == 2
     finally:
         await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_v2_completed_turn_persists_raw_malformed_render_candidate(tmp_path: Path) -> None:
+    agent = CorrectionAgent()
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=lambda: agent,
+    )
+    await worker.start()
+    try:
+        response = await worker.handle_request(v2_request("completed-malformed"))
+    finally:
+        await worker.stop()
+
+    candidate = '[{"schema_version":"telegram.bridge.render_payload.v1"'
+    assert response["protocol_version"] == PROTOCOL_V2
+    assert response["status"] == "completed"
+    assert response["execution_state"] == "completed"
+    assert response["presentation_state"] == "candidate_unvalidated"
+    assert response["render_candidate"]["content"] == candidate
+    assert response["render_candidate"]["sha256"] == persistent_worker._candidate_hash(candidate)
+    assert "render_payloads" not in response
+    ledger_path = worker._ledger_path("conv_" + "1" * 64, "completed-malformed")
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger["execution_state"] == "completed"
+    assert ledger["presentation_state"] == "candidate_unvalidated"
+    assert ledger["render_candidate"] == candidate
+    assert ledger["render_candidate_sha256"] == response["render_candidate"]["sha256"]
+
+
+@pytest.mark.asyncio
+async def test_v2_reset_uses_render_candidate_contract(tmp_path: Path) -> None:
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=FakeAgent,
+    )
+    await worker.start()
+    try:
+        response = await worker.handle_request(v2_request("reset-v2", "reset"))
+    finally:
+        await worker.stop()
+
+    assert response["protocol_version"] == PROTOCOL_V2
+    assert response["execution_state"] == "completed"
+    assert response["presentation_state"] == "candidate_unvalidated"
+    payloads = json.loads(response["render_candidate"]["content"])
+    assert payloads[0]["correlation_id"] == "reset-v2"
+    assert "render_payloads" not in response
+
+
+@pytest.mark.asyncio
+async def test_v2_correction_is_same_conversation_tool_free_once_and_durable(tmp_path: Path) -> None:
+    agent = CorrectionAgent()
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=lambda: agent,
+    )
+    await worker.start()
+    try:
+        original = await worker.handle_request(v2_request("completed-malformed"))
+        correction = await worker.handle_request(correction_request("completed-malformed"))
+        correction_replay = await worker.handle_request(correction_request("completed-malformed"))
+        original_replay = await worker.handle_request(v2_request("completed-malformed"))
+        second_attempt = await worker.handle_request(
+            correction_request("completed-malformed", "corr_attempt_2")
+        )
+    finally:
+        await worker.stop()
+
+    assert original["execution_state"] == "completed"
+    assert correction["status"] == "completed"
+    assert correction["execution_state"] == "completed"
+    assert correction["presentation_state"] == "correction_candidate_unvalidated"
+    corrected = json.loads(correction["render_candidate"]["content"])
+    assert corrected[0]["render"]["text"] == "corrected without rerunning domain work"
+    assert correction_replay == correction
+    assert original_replay == original
+    assert second_attempt["status"] == "failed"
+    assert second_attempt["execution_state"] == "completed"
+    assert second_attempt["presentation_state"] == "correction_candidate_unvalidated"
+    assert second_attempt["error"]["code"] == "CORRECTION_ALREADY_ATTEMPTED"
+    assert agent.turns == 2
+    assert agent.tool_snapshots[0]
+    assert agent.tool_snapshots[1] == []
+    assert agent.denied_execution is True
+    assert agent.executed_tools == 0
+
+    ledger = json.loads(
+        worker._ledger_path("conv_" + "1" * 64, "completed-malformed").read_text(encoding="utf-8")
+    )
+    assert ledger["correction_attempt_id"] == "corr_attempt_1"
+    assert ledger["correction_attempt_count"] == 1
+    assert ledger["corrected_candidate"] == correction["render_candidate"]["content"]
+    assert ledger["correction_response"] == correction
+
+
+@pytest.mark.asyncio
+async def test_v2_correction_rejects_runtime_without_tool_free_enforcement(tmp_path: Path) -> None:
+    agent = CorrectionAgent(api_mode="codex_app_server")
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=lambda: agent,
+    )
+    await worker.start()
+    try:
+        await worker.handle_request(v2_request("completed-malformed"))
+        response = await worker.handle_request(correction_request("completed-malformed"))
+        replay = await worker.handle_request(correction_request("completed-malformed"))
+    finally:
+        await worker.stop()
+
+    assert response == replay
+    assert response["status"] == "failed"
+    assert response["execution_state"] == "completed"
+    assert response["presentation_state"] == "correction_failed"
+    assert response["error"]["code"] == "TOOL_FREE_CORRECTION_UNAVAILABLE"
+    assert agent.turns == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_in_flight_correction_recovers_failed_without_model_replay(tmp_path: Path) -> None:
+    original_agent = CorrectionAgent()
+    first = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=lambda: original_agent,
+    )
+    await first.start()
+    try:
+        await first.handle_request(v2_request("completed-malformed"))
+    finally:
+        await first.stop()
+
+    ledger_path = first._ledger_path("conv_" + "1" * 64, "completed-malformed")
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    pending = correction_request("completed-malformed")
+    ledger.update(
+        correction_attempt_id="corr_attempt_1",
+        correction_attempt_count=1,
+        correction_fingerprint=persistent_worker._correction_fingerprint(pending),
+        presentation_state="correction_in_flight",
+    )
+    ledger.pop("correction_response", None)
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+
+    replacement_agent = CorrectionAgent()
+    recovered = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=lambda: replacement_agent,
+    )
+    await recovered.start()
+    try:
+        response = await recovered.handle_request(pending)
+    finally:
+        await recovered.stop()
+
+    assert response["status"] == "failed"
+    assert response["execution_state"] == "completed"
+    assert response["presentation_state"] == "correction_failed"
+    assert response["error"]["code"] == "WORKER_RESTARTED_DURING_CORRECTION"
+    assert replacement_agent.turns == 0
 
 
 @pytest.mark.asyncio

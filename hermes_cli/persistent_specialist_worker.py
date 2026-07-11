@@ -21,7 +21,9 @@ from typing import Any, Callable
 
 
 PROTOCOL = "telegram.bridge.persistent_service.v1"
+PROTOCOL_V2 = "telegram.bridge.persistent_service.v2"
 MAX_LINE_BYTES = 1024 * 1024
+MAX_CANDIDATE_BYTES = 512 * 1024
 LEDGER_RETENTION = timedelta(days=30)
 TERMINAL_STATES = {"completed", "failed", "outcome_unknown"}
 TIMING_PHASES = ("queue", "initialization", "retirement", "model_and_tools", "render_preparation")
@@ -74,6 +76,60 @@ def _fingerprint(request: dict[str, Any]) -> str:
 
 def _ledger_key(conversation_id: str, event_id: str) -> str:
     return hashlib.sha256(f"{conversation_id}\0{event_id}".encode("utf-8")).hexdigest()
+
+
+def _candidate_hash(candidate: str) -> str:
+    return hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+
+
+def _bounded_candidate(candidate: str) -> dict[str, Any]:
+    raw = candidate.encode("utf-8")
+    bounded = raw[:MAX_CANDIDATE_BYTES]
+    while bounded:
+        try:
+            content = bounded.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            bounded = bounded[:-1]
+    else:
+        content = ""
+    return {
+        "content": content,
+        "sha256": _candidate_hash(candidate),
+        "truncated": len(raw) > len(bounded),
+    }
+
+
+def _correction_fingerprint(request: dict[str, Any]) -> str:
+    canonical = {
+        key: request[key]
+        for key in (
+            "protocol_version",
+            "operation",
+            "event_id",
+            "conversation_id",
+            "correction_attempt_id",
+            "validation_errors",
+            "target_constraints",
+        )
+    }
+    raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _correction_prompt(record: dict[str, Any], request: dict[str, Any]) -> str:
+    return (
+        "Correct only the formatting of the completed Telegram Bridge response below. "
+        "Do not repeat, continue, or verify the domain task. Return only a JSON array of "
+        "telegram.bridge.render_payload.v1 objects satisfying the immutable constraints and "
+        "validation feedback. No tools are available.\n\n"
+        "Immutable constraints:\n"
+        + json.dumps(request["target_constraints"], ensure_ascii=False, sort_keys=True)
+        + "\n\nValidation feedback:\n"
+        + json.dumps(request["validation_errors"], ensure_ascii=False, sort_keys=True)
+        + "\n\nOriginal render candidate:\n"
+        + str(record["render_candidate"])
+    )
 
 
 def _extract_render_payloads(text: str) -> list[dict[str, Any]]:
@@ -238,6 +294,34 @@ class PersistentSpecialistWorker:
             except Exception:
                 continue
             recovered = False
+            if (
+                record.get("presentation_state") == "correction_in_flight"
+                and record.get("correction_attempt_id")
+                and not record.get("correction_response")
+            ):
+                correction_response = {
+                    "protocol_version": PROTOCOL_V2,
+                    "request_id": record.get("correction_request_id")
+                    or f"req_recovered_correction_{record['event_id']}",
+                    "operation": "correct_render",
+                    "status": "failed",
+                    "execution_state": "completed",
+                    "presentation_state": "correction_failed",
+                    "event_id": record["event_id"],
+                    "correction_attempt_id": record["correction_attempt_id"],
+                    "runtime_instance_id": self.runtime_instance_id,
+                    "trace_id": f"trace_{uuid.uuid4().hex}",
+                    "error": {
+                        "code": "WORKER_RESTARTED_DURING_CORRECTION",
+                        "message": "the one render correction attempt was interrupted by worker restart",
+                        "retryable": False,
+                    },
+                    "timing_ms": _timing_ms(time.monotonic()),
+                }
+                record["presentation_state"] = "correction_failed"
+                record["correction_response"] = correction_response
+                record["updated_at"] = _iso(now)
+                _atomic_json(path, record)
             if record.get("state") == "in_flight":
                 recovered = True
                 record["state"] = "outcome_unknown"
@@ -409,18 +493,21 @@ class PersistentSpecialistWorker:
         hello: dict[str, Any] | None = None
         try:
             hello = await self._read(reader)
-            if hello.get("protocol_version") != PROTOCOL or hello.get("operation") != "hello":
+            if hello.get("protocol_version") not in {PROTOCOL, PROTOCOL_V2} or hello.get("operation") != "hello":
                 raise ValueError("hello negotiation required")
             await self._write(writer, {
-                "protocol_version": PROTOCOL,
+                "protocol_version": hello["protocol_version"],
                 "request_id": hello["request_id"],
                 "operation": "hello",
                 "status": "ready" if not self._unhealthy else "failed",
                 "runtime_instance_id": self.runtime_instance_id,
                 "framework": "hermes",
                 "profile": self.profile_root.name,
-                "supported_protocol_versions": [PROTOCOL],
-                "capabilities": ["turn", "reset", "health", "shutdown", "durable_event_ledger"],
+                "supported_protocol_versions": [PROTOCOL, PROTOCOL_V2],
+                "capabilities": [
+                    "turn", "reset", "health", "shutdown", "durable_event_ledger",
+                    "render_candidate", "tool_free_render_correction",
+                ],
             })
             request = await self._read(reader)
             response = await self.handle_request(request)
@@ -445,7 +532,7 @@ class PersistentSpecialistWorker:
 
     def _base_response(self, request: dict[str, Any], **extra: Any) -> dict[str, Any]:
         return {
-            "protocol_version": PROTOCOL,
+            "protocol_version": request.get("protocol_version", PROTOCOL),
             "request_id": request["request_id"],
             "operation": request["operation"],
             "request_id": request["request_id"],
@@ -520,7 +607,7 @@ class PersistentSpecialistWorker:
             "_trace_id": f"trace_{uuid.uuid4().hex}",
             "_started_at": time.monotonic(),
         }
-        if request.get("protocol_version") != PROTOCOL:
+        if request.get("protocol_version") not in {PROTOCOL, PROTOCOL_V2}:
             return self._protocol_failure_response(
                 request_id=str(request.get("request_id") or "req_error"),
                 operation=str(request.get("operation") or "health"),
@@ -544,6 +631,10 @@ class PersistentSpecialistWorker:
             )
             self._log_terminal_response("worker_shutdown_requested", request, response)
             return response
+        if operation == "correct_render":
+            if request["protocol_version"] != PROTOCOL_V2:
+                raise ValueError("correct_render requires protocol v2")
+            return await self._handle_correct_render(request)
         if operation not in {"turn", "reset"}:
             raise ValueError("unsupported operation")
         if self._stopping:
@@ -615,7 +706,8 @@ class PersistentSpecialistWorker:
 
         now = _utcnow()
         record = {
-            "schema_version": "telegram.bridge.persistent_event_record.v1",
+            "schema_version": "telegram.bridge.persistent_event_record.v2",
+            "protocol_version": request["protocol_version"],
             "request_id": request["request_id"],
             "conversation_id": conversation_id,
             "event_id": event_id,
@@ -703,6 +795,14 @@ class PersistentSpecialistWorker:
                             render_preparation=int((time.monotonic() - render_started) * 1000),
                         ),
                     )
+                    if request["protocol_version"] == PROTOCOL_V2:
+                        reset_candidate = response["render_candidate"]["content"]
+                        record.update(
+                            execution_state="completed",
+                            presentation_state="candidate_unvalidated",
+                            render_candidate=reset_candidate,
+                            render_candidate_sha256=_candidate_hash(reset_candidate),
+                        )
                 else:
                     initialization_started = time.monotonic()
                     if self._agent is None:
@@ -727,23 +827,38 @@ class PersistentSpecialistWorker:
                     if not result.get("completed", True) or result.get("partial"):
                         raise RuntimeError(result.get("error") or "model turn did not complete")
                     render_started = time.monotonic()
-                    payloads = _extract_render_payloads(result.get("final_response") or "")
+                    candidate = result.get("final_response") or ""
+                    payloads = None
+                    if request["protocol_version"] == PROTOCOL:
+                        payloads = _extract_render_payloads(candidate)
                     render_preparation_ms = int((time.monotonic() - render_started) * 1000)
-                    response = self._base_response(
-                        request,
-                        status="completed",
-                        execution_state="completed",
-                        event_id=event_id,
-                        conversation_instance_id=self.conversation_instance_id,
-                        render_payloads=payloads,
-                        timing_ms=_timing_ms(
+                    response_fields: dict[str, Any] = {
+                        "status": "completed",
+                        "execution_state": "completed",
+                        "event_id": event_id,
+                        "conversation_instance_id": self.conversation_instance_id,
+                        "timing_ms": _timing_ms(
                             started,
                             queue=queue_ms,
                             initialization=initialization_ms,
                             model_and_tools=model_and_tools_ms,
                             render_preparation=render_preparation_ms,
                         ),
-                    )
+                    }
+                    if request["protocol_version"] == PROTOCOL_V2:
+                        response_fields.update(
+                            presentation_state="candidate_unvalidated",
+                            render_candidate=_bounded_candidate(candidate),
+                        )
+                        record.update(
+                            execution_state="completed",
+                            presentation_state="candidate_unvalidated",
+                            render_candidate=candidate,
+                            render_candidate_sha256=_candidate_hash(candidate),
+                        )
+                    else:
+                        response_fields["render_payloads"] = payloads
+                    response = self._base_response(request, **response_fields)
                 self.last_success_at = _iso(_utcnow())
                 self._last_conversation_activity = time.monotonic()
                 record["state"] = "completed"
@@ -796,6 +911,137 @@ class PersistentSpecialistWorker:
             if request["operation"] == "reset":
                 self._resetting = False
 
+    async def _handle_correct_render(self, request: dict[str, Any]) -> dict[str, Any]:
+        from agent.tool_free_turn import ToolFreeTurnUnavailable, run_tool_free_conversation
+
+        conversation_id = request["conversation_id"]
+        event_id = request["event_id"]
+        path = self._ledger_path(conversation_id, event_id)
+        if not path.exists():
+            return self._correction_failure(
+                request, "ORIGINAL_EVENT_NOT_FOUND", "accepted completed event was not found",
+                "correction_failed",
+            )
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if record.get("execution_state") != "completed" or not isinstance(record.get("render_candidate"), str):
+            return self._correction_failure(
+                request, "ORIGINAL_EVENT_NOT_COMPLETED", "render correction requires completed domain execution",
+                "correction_failed",
+            )
+
+        attempt_id = request["correction_attempt_id"]
+        fingerprint = _correction_fingerprint(request)
+        existing_attempt = record.get("correction_attempt_id")
+        if existing_attempt:
+            if existing_attempt == attempt_id and record.get("correction_fingerprint") == fingerprint:
+                return record["correction_response"]
+            return self._correction_failure(
+                request,
+                "CORRECTION_ALREADY_ATTEMPTED",
+                "the completed event already used its one render correction attempt",
+                str(record.get("presentation_state") or "correction_failed"),
+            )
+        if self._conversation_id != conversation_id or self._agent is None:
+            response = self._correction_failure(
+                request,
+                "SAME_CONVERSATION_UNAVAILABLE",
+                "the original specialist conversation is not resident",
+                "correction_failed",
+            )
+            record.update(
+                correction_attempt_id=attempt_id,
+                correction_attempt_count=1,
+                correction_fingerprint=fingerprint,
+                correction_response=response,
+                presentation_state="correction_failed",
+                updated_at=_iso(_utcnow()),
+            )
+            _atomic_json(path, record)
+            return response
+
+        record.update(
+            correction_attempt_id=attempt_id,
+            correction_attempt_count=1,
+            correction_fingerprint=fingerprint,
+            correction_request_id=request["request_id"],
+            presentation_state="correction_in_flight",
+            updated_at=_iso(_utcnow()),
+        )
+        _atomic_json(path, record)
+        timeout = max(0.1, (_parse_time(request["deadline"]) - _utcnow()).total_seconds())
+        started = request["_started_at"]
+        try:
+            await asyncio.wait_for(self._conversation_lock.acquire(), timeout=timeout)
+        except asyncio.TimeoutError:
+            response = self._correction_failure(
+                request, "CORRECTION_DEADLINE_EXPIRED", "correction did not start before its deadline",
+                "correction_failed",
+            )
+            record["presentation_state"] = "correction_failed"
+        else:
+            try:
+                prompt = _correction_prompt(record, request)
+                task = asyncio.create_task(
+                    asyncio.to_thread(run_tool_free_conversation, self._agent, prompt)
+                )
+                self._active_model_task = task
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(task), timeout=min(self.turn_timeout, timeout))
+                finally:
+                    if task.done() and self._active_model_task is task:
+                        self._active_model_task = None
+                candidate = str(result.get("final_response") or "")
+                response = self._base_response(
+                    request,
+                    status="completed",
+                    execution_state="completed",
+                    presentation_state="correction_candidate_unvalidated",
+                    event_id=event_id,
+                    correction_attempt_id=attempt_id,
+                    conversation_instance_id=self.conversation_instance_id,
+                    render_candidate=_bounded_candidate(candidate),
+                    timing_ms=_timing_ms(started, model_and_tools=int((time.monotonic() - started) * 1000)),
+                )
+                record["corrected_candidate"] = candidate
+                record["corrected_candidate_sha256"] = _candidate_hash(candidate)
+                record["presentation_state"] = "correction_candidate_unvalidated"
+            except ToolFreeTurnUnavailable as exc:
+                response = self._correction_failure(
+                    request, "TOOL_FREE_CORRECTION_UNAVAILABLE", str(exc), "correction_failed"
+                )
+                record["presentation_state"] = "correction_failed"
+            except Exception as exc:
+                response = self._correction_failure(
+                    request, "CORRECTION_FAILED", str(exc), "correction_failed"
+                )
+                record["presentation_state"] = "correction_failed"
+            finally:
+                self._conversation_lock.release()
+
+        record["correction_response"] = response
+        record["updated_at"] = _iso(_utcnow())
+        _atomic_json(path, record)
+        self._log_terminal_response("render_correction_completed", request, response)
+        return response
+
+    def _correction_failure(
+        self,
+        request: dict[str, Any],
+        code: str,
+        message: str,
+        presentation_state: str,
+    ) -> dict[str, Any]:
+        return self._base_response(
+            request,
+            status="failed",
+            execution_state="completed",
+            presentation_state=presentation_state,
+            event_id=request.get("event_id"),
+            correction_attempt_id=request.get("correction_attempt_id"),
+            error={"code": code, "message": message[:500], "retryable": False},
+            timing_ms=_timing_ms(request["_started_at"]),
+        )
+
     def _interrupt_agent(self) -> None:
         session = getattr(self._agent, "_codex_session", None)
         if session is not None:
@@ -830,15 +1076,22 @@ class PersistentSpecialistWorker:
             "target": {"chat_id": int(envelope["chat_id"])},
             "render": {"text": f"{self.agent_id} conversation context reset."},
         }
-        return self._base_response(
-            request,
-            status="completed",
-            execution_state="completed",
-            event_id=request["event_id"],
-            conversation_instance_id=self.conversation_instance_id,
-            render_payloads=[payload],
-            timing_ms=timing_ms,
-        )
+        fields: dict[str, Any] = {
+            "status": "completed",
+            "execution_state": "completed",
+            "event_id": request["event_id"],
+            "conversation_instance_id": self.conversation_instance_id,
+            "timing_ms": timing_ms,
+        }
+        if request["protocol_version"] == PROTOCOL_V2:
+            candidate = json.dumps([payload], ensure_ascii=False, separators=(",", ":"))
+            fields.update(
+                presentation_state="candidate_unvalidated",
+                render_candidate=_bounded_candidate(candidate),
+            )
+        else:
+            fields["render_payloads"] = [payload]
+        return self._base_response(request, **fields)
 
 
 async def _main_async(args: argparse.Namespace) -> int:
