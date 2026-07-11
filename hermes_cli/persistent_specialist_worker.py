@@ -22,7 +22,8 @@ from typing import Any, Callable
 from agent.render_correction_companion import (
     CorrectionCompanionTimeout,
     CorrectionCompanionUnavailable,
-    resolve_companion_config,
+    resolve_companion_credentials,
+    resolve_companion_descriptor,
     run_companion_subprocess,
 )
 
@@ -35,6 +36,9 @@ LEDGER_RETENTION = timedelta(days=30)
 TERMINAL_STATES = {"completed", "failed", "outcome_unknown"}
 TIMING_PHASES = ("queue", "initialization", "retirement", "model_and_tools", "render_preparation")
 MODEL_QUIESCE_TIMEOUT_SECONDS = 5.0
+RFC3339_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
 _UNQUIESCED_WORKERS: set[Any] = set()
 
 
@@ -163,7 +167,7 @@ def _validate_v2_request(request: dict[str, Any]) -> None:
         raise ValueError("invalid event id")
     if not isinstance(conversation_id, str) or not re.fullmatch(r"conv_[0-9a-f]{64}", conversation_id):
         raise ValueError("invalid conversation id")
-    if not isinstance(deadline, str):
+    if not isinstance(deadline, str) or RFC3339_RE.fullmatch(deadline) is None:
         raise ValueError("invalid deadline")
     try:
         parsed_deadline = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
@@ -310,6 +314,7 @@ class PersistentSpecialistWorker:
         idle_conversation_seconds: float = 21600,
         agent_factory: Callable[[], Any] | None = None,
         correction_companion_resolver: Callable[[], dict[str, str] | None] | None = None,
+        correction_companion_credentials_resolver: Callable[[dict[str, str]], dict[str, str]] | None = None,
         correction_companion_runner: Callable[[dict[str, str], dict[str, Any], float], str] | None = None,
     ) -> None:
         self.profile_root = profile_root.resolve()
@@ -320,11 +325,14 @@ class PersistentSpecialistWorker:
         self.queue_limit = max(1, int(queue_limit))
         self.idle_conversation_seconds = max(60.0, float(idle_conversation_seconds))
         self.agent_factory = agent_factory or self._default_agent_factory
-        resolver = correction_companion_resolver or resolve_companion_config
+        resolver = correction_companion_resolver or resolve_companion_descriptor
         try:
-            self._correction_companion_config = resolver()
+            self._correction_companion_descriptor = resolver()
         except Exception:
-            self._correction_companion_config = None
+            self._correction_companion_descriptor = None
+        self._correction_companion_credentials_resolver = (
+            correction_companion_credentials_resolver or resolve_companion_credentials
+        )
         self._correction_companion_runner = correction_companion_runner or run_companion_subprocess
         self.runtime_instance_id = f"runtime_{uuid.uuid4().hex}"
         self.conversation_instance_id = f"thread_{uuid.uuid4().hex}"
@@ -593,7 +601,7 @@ class PersistentSpecialistWorker:
             capabilities = [
                 "turn", "reset", "health", "shutdown", "durable_event_ledger", "render_candidate",
             ]
-            if self._correction_companion_config is not None:
+            if self._correction_companion_descriptor is not None:
                 capabilities.append("tool_free_render_correction")
             await self._write(writer, {
                 "protocol_version": hello["protocol_version"],
@@ -621,7 +629,11 @@ class PersistentSpecialistWorker:
                     writer,
                     self._protocol_failure_response(
                         request_id=str((request or hello or {}).get("request_id") or "req_error"),
-                        operation=str((request or hello or {}).get("operation") or "health"),
+                        operation=(
+                            "health"
+                            if str((request or hello or {}).get("protocol_version") or "") == PROTOCOL_V2
+                            else str((request or hello or {}).get("operation") or "health")
+                        ),
                         protocol_version=str((request or hello or {}).get("protocol_version") or PROTOCOL),
                     ),
                 )
@@ -1112,7 +1124,7 @@ class PersistentSpecialistWorker:
             record["presentation_state"] = "correction_failed"
         else:
             try:
-                if self._correction_companion_config is None:
+                if self._correction_companion_descriptor is None:
                     raise CorrectionCompanionUnavailable(
                         "isolated render correction companion is not configured"
                     )
@@ -1121,9 +1133,13 @@ class PersistentSpecialistWorker:
                     "validation_errors": request["validation_errors"],
                     "target_constraints": request["target_constraints"],
                 }
+                correction_config = await asyncio.to_thread(
+                    self._correction_companion_credentials_resolver,
+                    self._correction_companion_descriptor,
+                )
                 candidate = await asyncio.to_thread(
                     self._correction_companion_runner,
-                    self._correction_companion_config,
+                    correction_config,
                     repair,
                     min(self.turn_timeout, timeout),
                 )

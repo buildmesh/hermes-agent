@@ -9,6 +9,7 @@ import time
 import types
 from pathlib import Path
 
+import jsonschema
 import pytest
 
 import hermes_cli.persistent_specialist_worker as persistent_worker
@@ -238,13 +239,19 @@ class SlowCorrectionAgent(CorrectionAgent):
         return super().run_conversation(prompt)
 
 
-def companion_config() -> dict:
+def companion_descriptor() -> dict:
     return {
         "provider": "openai-codex",
         "api_mode": "codex_responses",
         "model": "gpt-test",
+    }
+
+
+def companion_config(token: str = "test-token") -> dict:
+    return {
+        **companion_descriptor(),
         "base_url": "https://chatgpt.example/backend-api/codex",
-        "api_key": "test-token",
+        "api_key": token,
     }
 
 
@@ -333,7 +340,7 @@ def test_default_agent_factory_does_not_mutate_environment(monkeypatch: pytest.M
     assert "HERMES_ACCEPT_HOOKS" not in os.environ
 
 
-def test_app_server_companion_resolution_reuses_parent_model_and_codex_credentials(
+def test_app_server_companion_descriptor_does_not_retain_startup_token_and_refreshes_for_correction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from agent import render_correction_companion as companion
@@ -345,22 +352,42 @@ def test_app_server_companion_resolution_reuses_parent_model_and_codex_credentia
             "openai_runtime": "codex_app_server",
         },
     })
-    monkeypatch.setattr(companion, "resolve_runtime_provider", lambda **kwargs: {
-        "provider": "openai-codex",
-        "api_mode": "codex_app_server",
-        "base_url": "https://chatgpt.com/backend-api/codex",
-        "api_key": "resolved-parent-token",
-    })
+    runtimes = iter([
+        {
+            "provider": "openai-codex",
+            "api_mode": "codex_app_server",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "expired-startup-token",
+        },
+        {
+            "provider": "openai-codex",
+            "api_mode": "codex_app_server",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "rotated-correction-token",
+        },
+    ])
+    monkeypatch.setattr(companion, "resolve_runtime_provider", lambda **kwargs: next(runtimes))
+    health_configs: list[dict] = []
+    monkeypatch.setattr(companion, "_direct_responses_client", lambda config: (
+        health_configs.append(dict(config))
+        or types.SimpleNamespace(close=lambda: None)
+    ))
 
-    resolved = companion.resolve_companion_config()
+    descriptor = companion.resolve_companion_descriptor()
+    correction_config = companion.resolve_companion_credentials(descriptor)
 
-    assert resolved == {
+    assert descriptor == {
         "provider": "openai-codex",
         "api_mode": "codex_responses",
         "model": "gpt-5.4",
-        "base_url": "https://chatgpt.com/backend-api/codex",
-        "api_key": "resolved-parent-token",
     }
+    assert correction_config == {
+        **descriptor,
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "rotated-correction-token",
+    }
+    assert health_configs[0]["api_key"] == "expired-startup-token"
+    assert "expired-startup-token" not in json.dumps(descriptor)
 
 
 def test_companion_model_call_has_no_tools_or_parent_context(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -609,7 +636,8 @@ async def test_v2_app_server_correction_uses_isolated_companion_once_and_is_dura
         socket_path=tmp_path / "state/runtime/worker.sock",
         agent_id="hello_world",
         agent_factory=lambda: agent,
-        correction_companion_resolver=companion_config,
+        correction_companion_resolver=companion_descriptor,
+        correction_companion_credentials_resolver=lambda _descriptor: companion_config("rotated-token"),
         correction_companion_runner=companion,
     )
     await worker.start()
@@ -642,10 +670,11 @@ async def test_v2_app_server_correction_uses_isolated_companion_once_and_is_dura
     assert agent.executed_tools == 0
     assert len(companion.calls) == 1
     config, repair, _timeout = companion.calls[0]
-    assert config == companion_config()
+    assert config == companion_config("rotated-token")
     assert set(repair) == {"candidate", "validation_errors", "target_constraints"}
     assert repair["candidate"] == original["render_candidate"]["content"]
     assert "Envelope JSON" not in json.dumps(repair)
+    assert "rotated-token" not in json.dumps(worker.__dict__, default=str)
 
     ledger = json.loads(
         worker._ledger_path("conv_" + "1" * 64, "completed-malformed").read_text(encoding="utf-8")
@@ -707,7 +736,8 @@ async def test_v2_concurrent_correction_replay_waits_for_one_terminal_result(tmp
         socket_path=tmp_path / "state/runtime/worker.sock",
         agent_id="hello_world",
         agent_factory=CorrectionAgent,
-        correction_companion_resolver=companion_config,
+        correction_companion_resolver=companion_descriptor,
+        correction_companion_credentials_resolver=lambda _descriptor: companion_config(),
         correction_companion_runner=companion,
     )
     await worker.start()
@@ -796,7 +826,8 @@ async def test_v2_correction_timeout_quiesces_companion_before_rejecting_prequeu
         agent_id="hello_world",
         turn_timeout=0.01,
         agent_factory=lambda: agent,
-        correction_companion_resolver=companion_config,
+        correction_companion_resolver=companion_descriptor,
+        correction_companion_credentials_resolver=lambda _descriptor: companion_config(),
         correction_companion_runner=timed_out_companion,
     )
     await worker.start()
@@ -1135,11 +1166,23 @@ async def test_socket_invalid_protocol_response_and_log_have_terminal_contract(t
 @pytest.mark.parametrize(
     ("mutate", "expected_request_id", "expected_operation"),
     [
-        (lambda value: value.update({"unexpected": True}), "req_strict_v2", "turn"),
-        (lambda value: value.update({"conversation_id": "not-a-conversation-id"}), "req_strict_v2", "turn"),
-        (lambda value: value.update({"deadline": "not-a-date"}), "req_strict_v2", "turn"),
-        (lambda value: value.update({"request_id": "malformed"}), "req_error", "turn"),
+        (lambda value: value.update({"unexpected": True}), "req_strict_v2", "health"),
+        (lambda value: value.update({"conversation_id": "not-a-conversation-id"}), "req_strict_v2", "health"),
+        (lambda value: value.update({"deadline": "not-a-date"}), "req_strict_v2", "health"),
+        (lambda value: value.update({"deadline": "2099-01-01 00:00:00+00:00"}), "req_strict_v2", "health"),
+        (lambda value: value.update({"deadline": "2099-01-01T00:00:00"}), "req_strict_v2", "health"),
+        (lambda value: value.update({"request_id": "malformed"}), "req_error", "health"),
         (lambda value: value.update({"operation": "unsupported"}), "req_strict_v2", "health"),
+        (
+            lambda value: value.update({
+                "operation": "correct_render",
+                "correction_attempt_id": "malformed",
+                "validation_errors": [],
+                "target_constraints": {},
+            }) or value.pop("envelope"),
+            "req_strict_v2",
+            "health",
+        ),
     ],
 )
 async def test_socket_rejects_closed_or_malformed_v2_requests_with_stable_error(
@@ -1188,6 +1231,11 @@ async def test_socket_rejects_closed_or_malformed_v2_requests_with_stable_error(
         "message": "invalid protocol request",
         "retryable": False,
     }
+    response_schema = json.loads(
+        (Path(__file__).parents[1] / "fixtures/telegram.bridge.persistent_service_response.v2.schema.json")
+        .read_text(encoding="utf-8")
+    )
+    jsonschema.Draft202012Validator(response_schema).validate(response)
     assert worker._agent is None
 
 

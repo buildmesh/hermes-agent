@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol_version", "request_id", "operation", "status"],
+  "properties": {
+    "protocol_version": {"const": "telegram.bridge.persistent_service.v2"},
+    "request_id": {"type": "string", "pattern": "^req_[A-Za-z0-9._:-]{1,200}$"},
+    "operation": {"enum": ["hello", "turn", "reset", "correct_render", "health", "shutdown"]},
+    "status": {"enum": ["ready", "completed", "failed", "running", "stopping"]},
+    "execution_state": {"enum": ["not_started", "in_flight", "completed", "outcome_unknown"]},
+    "presentation_state": {"enum": ["candidate_unvalidated", "render_invalid", "correction_in_flight", "correction_candidate_unvalidated", "corrected", "correction_failed"]},
+    "event_id": {"type": "string", "minLength": 1, "maxLength": 240},
+    "correction_attempt_id": {"type": "string", "pattern": "^corr_[A-Za-z0-9._:-]{1,200}$"},
+    "runtime_instance_id": {"type": "string", "minLength": 1, "maxLength": 200},
+    "conversation_instance_id": {"type": "string", "minLength": 1, "maxLength": 200},
+    "trace_id": {"type": "string", "minLength": 1, "maxLength": 200},
+    "framework": {"type": "string", "minLength": 1, "maxLength": 64},
+    "profile": {"type": "string", "minLength": 1, "maxLength": 128},
+    "supported_protocol_versions": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "capabilities": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "render_candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["content", "sha256", "truncated"],
+      "properties": {
+        "content": {"type": "string", "maxLength": 524288},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "truncated": {"type": "boolean"}
+      }
+    },
+    "timing_ms": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 0}},
+    "health": {"type": "object"},
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{1,63}$"},
+        "message": {"type": "string", "minLength": 1, "maxLength": 500},
+        "retryable": {"type": "boolean"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"operation": {"const": "hello"}}},
+      "then": {"required": ["runtime_instance_id", "supported_protocol_versions", "capabilities"]}
+    },
+    {
+      "if": {
+        "properties": {"operation": {"enum": ["turn", "reset"]}, "status": {"const": "completed"}},
+        "required": ["operation", "status"]
+      },
+      "then": {"required": ["execution_state", "presentation_state", "event_id", "render_candidate"]}
+    },
+    {
+      "if": {"properties": {"operation": {"const": "correct_render"}}, "required": ["operation"]},
+      "then": {"required": ["execution_state", "presentation_state", "event_id", "correction_attempt_id"]}
+    },
+    {
+      "if": {
+        "properties": {"operation": {"const": "correct_render"}, "status": {"const": "completed"}},
+        "required": ["operation", "status"]
+      },
+      "then": {
+        "required": ["render_candidate"],
+        "properties": {
+          "execution_state": {"const": "completed"},
+          "presentation_state": {"const": "correction_candidate_unvalidated"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"status": {"const": "failed"}}, "required": ["status"]},
+      "then": {"required": ["error"]}
+    }
+  ]
+}

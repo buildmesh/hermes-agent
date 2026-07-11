@@ -33,16 +33,7 @@ def _configured_model(config: dict[str, Any]) -> str:
     return ""
 
 
-def resolve_companion_config() -> dict[str, str] | None:
-    """Map an app-server parent to Hermes' direct Codex Responses precedent."""
-    config = load_config()
-    model = _configured_model(config)
-    if not model:
-        return None
-    try:
-        runtime = resolve_runtime_provider(target_model=model)
-    except Exception:
-        return None
+def _direct_runtime_config(runtime: dict[str, Any], model: str) -> dict[str, str] | None:
     if runtime.get("api_mode") != "codex_app_server":
         return None
     if runtime.get("provider") not in {"openai", "openai-codex"}:
@@ -56,13 +47,48 @@ def resolve_companion_config() -> dict[str, str] | None:
     }
     if not result["base_url"] or not result["api_key"]:
         return None
+    return result
+
+
+def resolve_companion_descriptor() -> dict[str, str] | None:
+    """Probe app-server correction locally and return only non-secret capability data."""
+    config = load_config()
+    model = _configured_model(config)
+    if not model:
+        return None
+    try:
+        runtime = resolve_runtime_provider(target_model=model)
+    except Exception:
+        return None
+    direct_config = _direct_runtime_config(runtime, model)
+    if direct_config is None:
+        return None
     try:
         from agent.auxiliary_client import CodexAuxiliaryClient  # noqa: F401
-        client = _direct_responses_client(result)
+        client = _direct_responses_client(direct_config)
         client.close()
     except Exception:
         return None
-    return result
+    return {
+        "provider": direct_config["provider"],
+        "api_mode": direct_config["api_mode"],
+        "model": direct_config["model"],
+    }
+
+
+def resolve_companion_credentials(descriptor: dict[str, str]) -> dict[str, str]:
+    """Resolve and refresh the bearer immediately before one correction."""
+    model = str(descriptor.get("model") or "").strip()
+    if descriptor.get("api_mode") != "codex_responses" or not model:
+        raise CorrectionCompanionUnavailable("invalid render correction companion descriptor")
+    try:
+        runtime = resolve_runtime_provider(target_model=model)
+    except Exception as exc:
+        raise CorrectionCompanionUnavailable("render correction credentials are unavailable") from exc
+    direct_config = _direct_runtime_config(runtime, model)
+    if direct_config is None or direct_config["provider"] != descriptor.get("provider"):
+        raise CorrectionCompanionUnavailable("render correction runtime is no longer available")
+    return direct_config
 
 
 def _direct_responses_client(config: dict[str, str]) -> Any:
