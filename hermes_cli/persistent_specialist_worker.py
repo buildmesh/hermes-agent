@@ -233,33 +233,42 @@ class PersistentSpecialistWorker:
                 accepted = _parse_time(record["accepted_at"])
             except Exception:
                 continue
+            recovered = False
             if record.get("state") == "in_flight":
+                recovered = True
                 record["state"] = "outcome_unknown"
                 record["updated_at"] = _iso(now)
-                record["error"] = {
-                    "code": "WORKER_RESTARTED_IN_FLIGHT",
-                    "message": "The prior worker stopped while this turn was running.",
-                    "retryable": False,
-                }
+                record["response"] = self._recovered_failure_response(
+                    record,
+                    "WORKER_RESTARTED_IN_FLIGHT",
+                    "The prior worker stopped while this turn was running.",
+                    False,
+                    "outcome_unknown",
+                )
                 _atomic_json(path, record)
             elif record.get("state") == "accepted":
+                recovered = True
                 record["state"] = "failed"
                 record["updated_at"] = _iso(now)
-                record["response"] = {
-                    "protocol_version": PROTOCOL,
-                    "request_id": record["request_id"],
-                    "operation": record["operation"],
-                    "status": "failed",
-                    "execution_state": "not_started",
-                    "event_id": record["event_id"],
-                    "runtime_instance_id": self.runtime_instance_id,
-                    "error": {
-                        "code": "WORKER_RESTARTED_BEFORE_START",
-                        "message": "The worker restarted before this queued turn began.",
-                        "retryable": True,
-                    },
-                }
+                record["response"] = self._recovered_failure_response(
+                    record,
+                    "WORKER_RESTARTED_BEFORE_START",
+                    "The worker restarted before this queued turn began.",
+                    True,
+                    "not_started",
+                )
                 _atomic_json(path, record)
+            response = record.get("response")
+            if recovered and response is not None:
+                self._log_event(
+                    "turn_recovered",
+                    event_id=record.get("event_id", ""),
+                    operation=record.get("operation", "turn"),
+                    trace_id=response.get("trace_id"),
+                    execution_state=response.get("execution_state"),
+                    code=(response.get("error") or {}).get("code"),
+                    timing_ms=response.get("timing_ms"),
+                )
             if now >= accepted + LEDGER_RETENTION and record.get("state") in TERMINAL_STATES:
                 path.unlink(missing_ok=True)
 
@@ -296,8 +305,12 @@ class PersistentSpecialistWorker:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
-        self.socket_path.unlink(missing_ok=True)
-        await self._retire_agent()
+        await self._conversation_lock.acquire()
+        try:
+            self.socket_path.unlink(missing_ok=True)
+            await self._retire_agent()
+        finally:
+            self._conversation_lock.release()
         if self._instance_lock is not None:
             with contextlib.suppress(OSError):
                 fcntl.flock(self._instance_lock.fileno(), fcntl.LOCK_UN)
@@ -357,6 +370,7 @@ class PersistentSpecialistWorker:
         await writer.drain()
 
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        hello: dict[str, Any] | None = None
         try:
             hello = await self._read(reader)
             if hello.get("protocol_version") != PROTOCOL or hello.get("operation") != "hello":
@@ -379,16 +393,15 @@ class PersistentSpecialistWorker:
                 self.acknowledge_shutdown()
         except (asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError):
             pass
-        except Exception as exc:
+        except Exception:
             with contextlib.suppress(Exception):
-                await self._write(writer, {
-                    "protocol_version": PROTOCOL,
-                    "request_id": "req_error",
-                    "operation": "health",
-                    "status": "failed",
-                    "execution_state": "not_started",
-                    "error": {"code": "PROTOCOL_ERROR", "message": str(exc)[:500], "retryable": False},
-                })
+                await self._write(
+                    writer,
+                    self._protocol_failure_response(
+                        request_id=str((hello or {}).get("request_id") or "req_error"),
+                        operation=str((hello or {}).get("operation") or "health"),
+                    ),
+                )
         finally:
             writer.close()
             with contextlib.suppress(Exception):
@@ -404,6 +417,55 @@ class PersistentSpecialistWorker:
             "trace_id": request.get("_trace_id"),
             **extra,
         }
+
+    def _recovered_failure_response(
+        self,
+        record: dict[str, Any],
+        code: str,
+        message: str,
+        retryable: bool,
+        state: str,
+    ) -> dict[str, Any]:
+        started = time.monotonic()
+        return {
+            "protocol_version": PROTOCOL,
+            "request_id": record.get("request_id") or f"req_recovered_{record['event_id']}",
+            "operation": record["operation"],
+            "status": "failed",
+            "execution_state": state,
+            "event_id": record["event_id"],
+            "runtime_instance_id": self.runtime_instance_id,
+            "trace_id": f"trace_{uuid.uuid4().hex}",
+            "error": {"code": code, "message": message, "retryable": retryable},
+            "timing_ms": _timing_ms(started),
+        }
+
+    def _protocol_failure_response(self, *, request_id: str, operation: str) -> dict[str, Any]:
+        started = time.monotonic()
+        response = {
+            "protocol_version": PROTOCOL,
+            "request_id": request_id,
+            "operation": operation,
+            "status": "failed",
+            "execution_state": "not_started",
+            "trace_id": f"trace_{uuid.uuid4().hex}",
+            "error": {
+                "code": "PROTOCOL_ERROR",
+                "message": "invalid protocol request",
+                "retryable": False,
+            },
+            "timing_ms": _timing_ms(started),
+        }
+        self._log_event(
+            "protocol_failed",
+            event_id="",
+            operation=operation,
+            trace_id=response["trace_id"],
+            execution_state=response["execution_state"],
+            code=response["error"]["code"],
+            timing_ms=response["timing_ms"],
+        )
+        return response
 
     def _log_terminal_response(self, event: str, request: dict[str, Any], response: dict[str, Any]) -> None:
         self._log_event(
@@ -423,7 +485,10 @@ class PersistentSpecialistWorker:
             "_started_at": time.monotonic(),
         }
         if request.get("protocol_version") != PROTOCOL:
-            raise ValueError("unsupported protocol_version")
+            return self._protocol_failure_response(
+                request_id=str(request.get("request_id") or "req_error"),
+                operation=str(request.get("operation") or "health"),
+            )
         operation = request.get("operation")
         if operation == "health":
             return self._base_response(
@@ -434,6 +499,7 @@ class PersistentSpecialistWorker:
             )
         if operation == "shutdown":
             self._stopping = True
+            self._reset_generation += 1
             response = self._base_response(
                 request,
                 status="stopping",
@@ -469,7 +535,9 @@ class PersistentSpecialistWorker:
                 self._log_terminal_response("turn_failed", request, response)
                 return response
             if record.get("response"):
-                return record["response"]
+                response = record["response"]
+                self._log_terminal_response("turn_replayed", request, response)
+                return response
             state = "outcome_unknown" if record.get("state") == "outcome_unknown" else "in_flight"
             response = self._failure(request, "DUPLICATE_IN_FLIGHT", "the event has already been accepted", False, state)
             self._log_terminal_response("turn_failed", request, response)
@@ -512,6 +580,7 @@ class PersistentSpecialistWorker:
         now = _utcnow()
         record = {
             "schema_version": "telegram.bridge.persistent_event_record.v1",
+            "request_id": request["request_id"],
             "conversation_id": conversation_id,
             "event_id": event_id,
             "fingerprint": fingerprint,
