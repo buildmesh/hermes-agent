@@ -1,6 +1,7 @@
 """Tests for Hermes Telegram adapter integration with the Telegram bridge."""
 
 import asyncio
+import os
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -228,6 +229,8 @@ async def test_bridge_persistent_worker_lifecycle(tmp_path, monkeypatch):
     process = Process()
     create = AsyncMock(return_value=process)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    monkeypatch.setenv("HERMES_HOME", str(profile_root))
+    monkeypatch.setenv("TERMINAL_CWD", str(profile_root))
 
     await adapter._start_telegram_bridge_persistent_workers()
 
@@ -237,6 +240,11 @@ async def test_bridge_persistent_worker_lifecycle(tmp_path, monkeypatch):
         "-m",
         "hermes_cli.persistent_specialist_worker",
     )
+    assert create.await_args.kwargs["cwd"] == str(specialist)
+    assert create.await_args.kwargs["env"]["HERMES_HOME"] == str(specialist)
+    assert create.await_args.kwargs["env"]["TERMINAL_CWD"] == str(specialist)
+    assert os.environ["HERMES_HOME"] == str(profile_root)
+    assert os.environ["TERMINAL_CWD"] == str(profile_root)
 
     await adapter._stop_telegram_bridge_persistent_workers()
 

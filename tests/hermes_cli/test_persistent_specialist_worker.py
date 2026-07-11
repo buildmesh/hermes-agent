@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import stat
 import threading
 from pathlib import Path
@@ -40,9 +41,33 @@ class FakeAgent:
         self.turns = 0
         self.closed = False
         self._codex_session = None
+        self.session_cwd = None
+        self.prompts: list[str] = []
+        self.effective_cwds: list[tuple[str, str, str]] = []
+        self.loaded_profile_context: list[tuple[str, ...]] = []
 
     def run_conversation(self, prompt: str) -> dict:
         self.turns += 1
+        self.prompts.append(prompt)
+        from agent.runtime_cwd import resolve_agent_cwd, resolve_context_cwd
+
+        self.effective_cwds.append((
+            str(resolve_agent_cwd()),
+            str(resolve_context_cwd()),
+            os.getcwd(),
+        ))
+        context_root = resolve_context_cwd()
+        self.loaded_profile_context.append(tuple(
+            str(path.relative_to(context_root))
+            for path in (
+                context_root / "SOUL.md",
+                context_root / "memories/USER.md",
+                context_root / "memories/MEMORY.md",
+                context_root / "AGENTS.md",
+                context_root / "skills/index.md",
+            )
+            if path.exists()
+        ))
         envelope = json.loads(prompt.split("Envelope JSON:\n", 1)[1])
         payload = [{
             "schema_version": "telegram.bridge.render_payload.v1",
@@ -110,6 +135,9 @@ async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> No
         assert second["render_payloads"][0]["render"]["text"] == "turn 2"
         assert duplicate == first
         assert len(agents) == 1
+        assert len(agents[0].prompts) == 2
+        assert agents[0].prompts[0].count('"event_id": "event1"') == 1
+        assert agents[0].prompts[1].count('"event_id": "event2"') == 1
         assert "turn_completed" in (tmp_path / "logs/persistent-specialist.jsonl").read_text()
 
         old_thread = second["conversation_instance_id"]
@@ -126,6 +154,67 @@ async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> No
         assert len(agents) == 2
     finally:
         await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_worker_constructs_and_runs_agent_in_profile_context_with_phase_timing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_root = tmp_path / "profiles" / "hello-world"
+    profile_root.mkdir(parents=True)
+    for relative_path in ("SOUL.md", "memories/USER.md", "memories/MEMORY.md", "AGENTS.md", "skills/index.md"):
+        path = profile_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(relative_path, encoding="utf-8")
+    bridge_cwd = tmp_path / "profiles" / "telegram-bridge"
+    bridge_cwd.mkdir(parents=True)
+    monkeypatch.chdir(bridge_cwd)
+    monkeypatch.setenv("HERMES_HOME", str(bridge_cwd))
+    monkeypatch.setenv("TERMINAL_CWD", str(bridge_cwd))
+    agents: list[FakeAgent] = []
+    constructed_in: list[tuple[str, str, str]] = []
+
+    def factory() -> FakeAgent:
+        constructed_in.append((os.getcwd(), os.environ["HERMES_HOME"], os.environ["TERMINAL_CWD"]))
+        agent = FakeAgent()
+        agents.append(agent)
+        return agent
+
+    worker = PersistentSpecialistWorker(
+        profile_root=profile_root,
+        socket_path=profile_root / "w.sock",
+        agent_id="hello_world",
+        agent_factory=factory,
+    )
+    await worker.start()
+    try:
+        response = await worker.handle_request(request("profile-context"))
+    finally:
+        await worker.stop()
+
+    assert constructed_in == [(str(profile_root), str(profile_root), str(profile_root))]
+    assert (os.getcwd(), os.environ["HERMES_HOME"], os.environ["TERMINAL_CWD"]) == (
+        str(bridge_cwd), str(bridge_cwd), str(bridge_cwd)
+    )
+    assert agents[0].session_cwd == str(profile_root)
+    assert agents[0].effective_cwds == [(str(profile_root), str(profile_root), str(profile_root))]
+    assert agents[0].loaded_profile_context == [
+        ("SOUL.md", "memories/USER.md", "memories/MEMORY.md", "AGENTS.md", "skills/index.md")
+    ]
+    assert response["trace_id"].startswith("trace_")
+    assert set(response["timing_ms"]) == {
+        "queue",
+        "initialization",
+        "model_and_tools",
+        "render_preparation",
+        "total",
+    }
+    assert all(duration >= 0 for duration in response["timing_ms"].values())
+    assert sum(
+        response["timing_ms"][phase]
+        for phase in ("queue", "initialization", "model_and_tools", "render_preparation")
+    ) <= response["timing_ms"]["total"]
 
 
 @pytest.mark.asyncio

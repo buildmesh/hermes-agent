@@ -198,6 +198,31 @@ class PersistentSpecialistWorker:
 
         return create_noninteractive_agent()
 
+    def _run_in_profile_context(self, callback: Callable[..., Any], *args: Any) -> Any:
+        """Run agent work with an isolated specialist runtime context."""
+        previous_cwd = Path.cwd()
+        previous_env = {key: os.environ.get(key) for key in ("HERMES_HOME", "TERMINAL_CWD")}
+        try:
+            os.chdir(self.profile_root)
+            os.environ["HERMES_HOME"] = str(self.profile_root)
+            os.environ["TERMINAL_CWD"] = str(self.profile_root)
+            from agent.runtime_cwd import clear_session_cwd
+
+            clear_session_cwd()
+            return callback(*args)
+        finally:
+            os.chdir(previous_cwd)
+            for key, value in previous_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def _construct_agent(self) -> Any:
+        agent = self._run_in_profile_context(self.agent_factory)
+        agent.session_cwd = str(self.profile_root)
+        return agent
+
     def _ledger_path(self, conversation_id: str, event_id: str) -> Path:
         return self._ledger_dir / f"{_ledger_key(conversation_id, event_id)}.json"
 
@@ -364,10 +389,12 @@ class PersistentSpecialistWorker:
             "operation": request["operation"],
             "request_id": request["request_id"],
             "runtime_instance_id": self.runtime_instance_id,
+            "trace_id": request.get("_trace_id"),
             **extra,
         }
 
     async def handle_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        request = {**request, "_trace_id": f"trace_{uuid.uuid4().hex}"}
         if request.get("protocol_version") != PROTOCOL:
             raise ValueError("unsupported protocol_version")
         operation = request.get("operation")
@@ -454,6 +481,7 @@ class PersistentSpecialistWorker:
             self._log_event("turn_failed", event_id=event_id, code=code, execution_state="not_started")
             return response
         try:
+            queue_ms = int((time.monotonic() - started) * 1000)
             if queued:
                 self._queued_turns -= 1
                 if generation != self._reset_generation:
@@ -467,7 +495,12 @@ class PersistentSpecialistWorker:
             record["state"] = "in_flight"
             record["updated_at"] = _iso(_utcnow())
             _atomic_json(path, record)
-            self._log_event("turn_started", event_id=event_id, operation=request["operation"])
+            self._log_event(
+                "turn_started",
+                event_id=event_id,
+                operation=request["operation"],
+                trace_id=request["_trace_id"],
+            )
             try:
                 if request["operation"] == "reset":
                     remaining = max(0.1, self.reset_timeout - (time.monotonic() - started))
@@ -475,16 +508,23 @@ class PersistentSpecialistWorker:
                     self.conversation_instance_id = f"thread_{uuid.uuid4().hex}"
                     response = self._reset_response(request, started)
                 else:
+                    initialization_started = time.monotonic()
                     if self._agent is None:
-                        self._agent = await asyncio.to_thread(self.agent_factory)
+                        self._agent = await asyncio.to_thread(self._construct_agent)
+                    initialization_ms = int((time.monotonic() - initialization_started) * 1000)
                     prompt = _bridge_prompt(request["envelope"])
+                    model_started = time.monotonic()
                     result = await asyncio.wait_for(
-                        asyncio.to_thread(self._agent.run_conversation, prompt),
+                        asyncio.to_thread(self._run_in_profile_context, self._agent.run_conversation, prompt),
                         timeout=self.turn_timeout,
                     )
+                    model_and_tools_ms = int((time.monotonic() - model_started) * 1000)
                     if not result.get("completed", True) or result.get("partial"):
                         raise RuntimeError(result.get("error") or "model turn did not complete")
+                    render_started = time.monotonic()
                     payloads = _extract_render_payloads(result.get("final_response") or "")
+                    render_preparation_ms = int((time.monotonic() - render_started) * 1000)
+                    total_ms = int((time.monotonic() - started) * 1000)
                     response = self._base_response(
                         request,
                         status="completed",
@@ -492,7 +532,13 @@ class PersistentSpecialistWorker:
                         event_id=event_id,
                         conversation_instance_id=self.conversation_instance_id,
                         render_payloads=payloads,
-                        timing_ms={"queue": 0, "model_and_tools": int((time.monotonic() - started) * 1000), "render_preparation": 0, "total": int((time.monotonic() - started) * 1000)},
+                        timing_ms={
+                            "queue": queue_ms,
+                            "initialization": initialization_ms,
+                            "model_and_tools": model_and_tools_ms,
+                            "render_preparation": render_preparation_ms,
+                            "total": total_ms,
+                        },
                     )
                 self.last_success_at = _iso(_utcnow())
                 self._last_conversation_activity = time.monotonic()
@@ -502,7 +548,8 @@ class PersistentSpecialistWorker:
                     "turn_completed",
                     event_id=event_id,
                     operation=request["operation"],
-                    total_ms=int((time.monotonic() - started) * 1000),
+                    trace_id=request["_trace_id"],
+                    timing_ms=response.get("timing_ms"),
                 )
             except asyncio.TimeoutError:
                 self._unhealthy = True
@@ -565,7 +612,9 @@ class PersistentSpecialistWorker:
 
 async def _main_async(args: argparse.Namespace) -> int:
     profile_root = Path(args.profile_root).resolve()
+    os.chdir(profile_root)
     os.environ["HERMES_HOME"] = str(profile_root)
+    os.environ["TERMINAL_CWD"] = str(profile_root)
     socket_path = (profile_root / args.socket).resolve()
     worker = PersistentSpecialistWorker(
         profile_root=profile_root,

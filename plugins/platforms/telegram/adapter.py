@@ -7542,6 +7542,7 @@ class TelegramAdapter(BasePlatformAdapter):
             for spec in specs:
                 env = dict(os.environ)
                 env["HERMES_HOME"] = spec["profile_root"]
+                env["TERMINAL_CWD"] = spec["profile_root"]
                 process = await asyncio.create_subprocess_exec(
                     sys.executable,
                     "-m",
@@ -7561,6 +7562,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "--idle-conversation-seconds",
                     str(spec["idle_conversation_seconds"]),
                     env=env,
+                    cwd=spec["profile_root"],
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
