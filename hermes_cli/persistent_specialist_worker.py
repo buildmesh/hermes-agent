@@ -25,6 +25,8 @@ MAX_LINE_BYTES = 1024 * 1024
 LEDGER_RETENTION = timedelta(days=30)
 TERMINAL_STATES = {"completed", "failed", "outcome_unknown"}
 TIMING_PHASES = ("queue", "initialization", "retirement", "model_and_tools", "render_preparation")
+MODEL_QUIESCE_TIMEOUT_SECONDS = 5.0
+_UNQUIESCED_WORKERS: set[Any] = set()
 
 
 def _utcnow() -> datetime:
@@ -184,6 +186,7 @@ class PersistentSpecialistWorker:
         self.last_success_at: str | None = None
         self.last_error_code: str | None = None
         self._agent: Any | None = None
+        self._active_model_task: asyncio.Task[Any] | None = None
         self._conversation_id: str | None = None
         self._conversation_lock = asyncio.Lock()
         self._resetting = False
@@ -193,6 +196,7 @@ class PersistentSpecialistWorker:
         self._server: asyncio.AbstractServer | None = None
         self._instance_lock: Any | None = None
         self._stopping = False
+        self._quiesce_failed = False
         self._shutdown_event = asyncio.Event()
         self._unhealthy = False
         self._ledger_dir = self.profile_root / "state/persistent-runtime/ledger"
@@ -306,11 +310,20 @@ class PersistentSpecialistWorker:
             await self._server.wait_closed()
             self._server = None
         await self._conversation_lock.acquire()
+        quiesced = False
         try:
             self.socket_path.unlink(missing_ok=True)
-            await self._retire_agent()
+            quiesced = await self._retire_agent(quiesce_timeout=MODEL_QUIESCE_TIMEOUT_SECONDS)
         finally:
             self._conversation_lock.release()
+        if not quiesced:
+            self._unhealthy = True
+            self._quiesce_failed = True
+            _UNQUIESCED_WORKERS.add(self)
+            self.last_error_code = "MODEL_QUIESCE_TIMEOUT"
+            self._log_event("worker_quiesce_timeout", timeout_seconds=MODEL_QUIESCE_TIMEOUT_SECONDS)
+            return
+        _UNQUIESCED_WORKERS.discard(self)
         if self._instance_lock is not None:
             with contextlib.suppress(OSError):
                 fcntl.flock(self._instance_lock.fileno(), fcntl.LOCK_UN)
@@ -335,7 +348,28 @@ class PersistentSpecialistWorker:
     async def wait_for_shutdown(self) -> None:
         await self._shutdown_event.wait()
 
-    async def _retire_agent(self) -> None:
+    async def _await_active_model_task(self, *, timeout: float | None = None) -> bool:
+        task = self._active_model_task
+        if task is None:
+            return True
+        try:
+            if timeout is None:
+                await asyncio.shield(task)
+            else:
+                await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        except Exception:
+            # A completed model task may fail after its protocol response timed out.
+            pass
+        finally:
+            if task.done() and self._active_model_task is task:
+                self._active_model_task = None
+        return task.done()
+
+    async def _retire_agent(self, *, quiesce_timeout: float | None = None) -> bool:
+        if not await self._await_active_model_task(timeout=quiesce_timeout):
+            return False
         agent, self._agent = self._agent, None
         if agent is not None:
             session = getattr(agent, "_codex_session", None)
@@ -343,11 +377,13 @@ class PersistentSpecialistWorker:
                 await asyncio.to_thread(session.close)
                 agent._codex_session = None
             await asyncio.to_thread(agent.close)
+        return True
 
     def health(self) -> dict[str, Any]:
         return {
             "ready": not self._stopping and not self._unhealthy,
             "unhealthy": self._unhealthy,
+            "quiesce_failed": self._quiesce_failed,
             "uptime_seconds": max(0, int((_utcnow() - self.started_at).total_seconds())),
             "resident_conversations": 1 if self._conversation_id else 0,
             "active_turns": 1 if self._conversation_lock.locked() else 0,
@@ -674,13 +710,20 @@ class PersistentSpecialistWorker:
                         initialization_ms = int((time.monotonic() - initialization_started) * 1000)
                     prompt = _bridge_prompt(request["envelope"])
                     model_started = time.monotonic()
+                    model_task: asyncio.Task[Any] | None = None
                     try:
+                        model_task = asyncio.create_task(
+                            asyncio.to_thread(self._agent.run_conversation, prompt)
+                        )
+                        self._active_model_task = model_task
                         result = await asyncio.wait_for(
-                            asyncio.to_thread(self._agent.run_conversation, prompt),
+                            asyncio.shield(model_task),
                             timeout=self.turn_timeout,
                         )
                     finally:
                         model_and_tools_ms = int((time.monotonic() - model_started) * 1000)
+                        if model_task is not None and model_task.done() and self._active_model_task is model_task:
+                            self._active_model_task = None
                     if not result.get("completed", True) or result.get("partial"):
                         raise RuntimeError(result.get("error") or "model turn did not complete")
                     render_started = time.monotonic()

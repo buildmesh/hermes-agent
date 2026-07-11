@@ -656,6 +656,126 @@ async def test_main_shutdown_waits_for_active_socket_turn_before_retiring_agent(
 
 
 @pytest.mark.asyncio
+async def test_main_shutdown_waits_for_timed_out_model_thread_before_retiring_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    agents: list[ClosingBlockingAgent] = []
+    workers: list[PersistentSpecialistWorker] = []
+    profile_root = tmp_path / "profile"
+    profile_root.mkdir()
+    socket_path = profile_root / "w.sock"
+
+    class TestWorker(PersistentSpecialistWorker):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(
+                **kwargs,
+                agent_factory=lambda: agents.append(ClosingBlockingAgent(entered, release)) or agents[-1],
+            )
+            workers.append(self)
+
+    monkeypatch.setattr(persistent_worker, "PersistentSpecialistWorker", TestWorker)
+    main_task = asyncio.create_task(persistent_worker._main_async(types.SimpleNamespace(
+        profile_root=str(profile_root),
+        socket="w.sock",
+        agent_id="hello_world",
+        turn_timeout=0.01,
+        reset_timeout=2,
+        queue_limit=1,
+        idle_conversation_seconds=3600,
+    )))
+    while not socket_path.exists():
+        await asyncio.sleep(0.01)
+    active_reader, active_writer = await asyncio.open_unix_connection(str(socket_path))
+    active_writer.write(json.dumps({
+        "protocol_version": PROTOCOL,
+        "request_id": "req_hello_timeout",
+        "operation": "hello",
+        "client": {"name": "test", "revision": "test"},
+    }).encode() + b"\n")
+    await active_writer.drain()
+    await active_reader.readline()
+    active_writer.write(json.dumps(request("timeout-shutdown")).encode() + b"\n")
+    await active_writer.drain()
+    assert await asyncio.to_thread(entered.wait, 1)
+    timed_out = json.loads(await active_reader.readline())
+    assert timed_out["error"]["code"] == "TURN_TIMEOUT"
+
+    shutdown_reader, shutdown_writer = await asyncio.open_unix_connection(str(socket_path))
+    shutdown_writer.write(json.dumps({
+        "protocol_version": PROTOCOL,
+        "request_id": "req_hello_shutdown",
+        "operation": "hello",
+        "client": {"name": "test", "revision": "test"},
+    }).encode() + b"\n")
+    await shutdown_writer.drain()
+    await shutdown_reader.readline()
+    shutdown_writer.write(json.dumps({
+        "protocol_version": PROTOCOL,
+        "request_id": "req_shutdown",
+        "operation": "shutdown",
+    }).encode() + b"\n")
+    await shutdown_writer.drain()
+    try:
+        assert json.loads(await shutdown_reader.readline())["status"] == "stopping"
+        rejected = await workers[0].handle_request(request("after-timeout-shutdown"))
+        assert rejected["error"]["code"] == "WORKER_STOPPING"
+        await asyncio.sleep(0.05)
+        assert agents[0].close_called.is_set() is False
+
+        release.set()
+        await asyncio.wait_for(main_task, timeout=2)
+        assert agents[0].close_before_release is False
+        assert agents[0].close_called.is_set() is True
+    finally:
+        release.set()
+        if not main_task.done():
+            await asyncio.wait_for(main_task, timeout=2)
+        active_writer.close()
+        shutdown_writer.close()
+        await active_writer.wait_closed()
+        await shutdown_writer.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_stop_quiescence_timeout_keeps_profile_locked_without_closing_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    agents: list[ClosingBlockingAgent] = []
+    monkeypatch.setattr(persistent_worker, "MODEL_QUIESCE_TIMEOUT_SECONDS", 0.01)
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "w.sock",
+        agent_id="hello_world",
+        turn_timeout=0.01,
+        agent_factory=lambda: agents.append(ClosingBlockingAgent(entered, release)) or agents[-1],
+    )
+    await worker.start()
+    try:
+        timed_out = await worker.handle_request(request("bounded-stop"))
+        assert timed_out["error"]["code"] == "TURN_TIMEOUT"
+        await worker.stop()
+        assert agents[0].close_called.is_set() is False
+        assert worker.health()["quiesce_failed"] is True
+        assert worker._instance_lock is not None
+
+        release.set()
+        await worker._await_active_model_task()
+        await worker.stop()
+        assert agents[0].close_called.is_set() is True
+        assert worker._instance_lock is None
+    finally:
+        release.set()
+        if worker._instance_lock is not None:
+            await worker.stop()
+
+
+@pytest.mark.asyncio
 async def test_reset_waits_for_active_turn_and_blocks_new_admission(tmp_path: Path) -> None:
     entered = threading.Event()
     release = threading.Event()
