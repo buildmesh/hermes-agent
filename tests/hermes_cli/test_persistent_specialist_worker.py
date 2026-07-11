@@ -223,6 +223,19 @@ class CorrectionAgent:
         self.closed = True
 
 
+class SlowCorrectionAgent(CorrectionAgent):
+    def __init__(self, entered: threading.Event, release: threading.Event) -> None:
+        super().__init__()
+        self.entered = entered
+        self.release = release
+
+    def run_conversation(self, prompt: str) -> dict:
+        if self.turns:
+            self.entered.set()
+            self.release.wait(timeout=2)
+        return super().run_conversation(prompt)
+
+
 def assert_complete_timing(response: dict) -> None:
     assert response["trace_id"].startswith("trace_")
     assert set(response["timing_ms"]) == {
@@ -510,6 +523,36 @@ async def test_v2_in_flight_correction_recovers_failed_without_model_replay(tmp_
     assert response["presentation_state"] == "correction_failed"
     assert response["error"]["code"] == "WORKER_RESTARTED_DURING_CORRECTION"
     assert replacement_agent.turns == 0
+
+
+@pytest.mark.asyncio
+async def test_v2_correction_timeout_makes_conversation_unhealthy_until_model_quiesces(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    agent = SlowCorrectionAgent(entered, release)
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        turn_timeout=0.01,
+        agent_factory=lambda: agent,
+    )
+    await worker.start()
+    try:
+        await worker.handle_request(v2_request("completed-malformed"))
+        response = await worker.handle_request(correction_request("completed-malformed"))
+        assert await asyncio.to_thread(entered.wait, 1)
+        later = await worker.handle_request(v2_request("later-domain-turn"))
+    finally:
+        release.set()
+        await worker.stop()
+
+    assert response["status"] == "failed"
+    assert response["execution_state"] == "completed"
+    assert response["presentation_state"] == "correction_failed"
+    assert response["error"]["code"] == "CORRECTION_TIMEOUT"
+    assert later["error"]["code"] == "CONVERSATION_UNHEALTHY"
+    assert agent.turns == 2
 
 
 @pytest.mark.asyncio

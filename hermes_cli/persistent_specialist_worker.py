@@ -1005,6 +1005,17 @@ class PersistentSpecialistWorker:
                 record["corrected_candidate"] = candidate
                 record["corrected_candidate_sha256"] = _candidate_hash(candidate)
                 record["presentation_state"] = "correction_candidate_unvalidated"
+            except asyncio.TimeoutError:
+                self._unhealthy = True
+                self.last_error_code = "CORRECTION_TIMEOUT"
+                self._interrupt_agent()
+                response = self._correction_failure(
+                    request,
+                    "CORRECTION_TIMEOUT",
+                    "the tool-free correction model turn did not stop before its deadline",
+                    "correction_failed",
+                )
+                record["presentation_state"] = "correction_failed"
             except ToolFreeTurnUnavailable as exc:
                 response = self._correction_failure(
                     request, "TOOL_FREE_CORRECTION_UNAVAILABLE", str(exc), "correction_failed"
