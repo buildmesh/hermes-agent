@@ -24,6 +24,7 @@ PROTOCOL = "telegram.bridge.persistent_service.v1"
 MAX_LINE_BYTES = 1024 * 1024
 LEDGER_RETENTION = timedelta(days=30)
 TERMINAL_STATES = {"completed", "failed", "outcome_unknown"}
+TIMING_PHASES = ("queue", "initialization", "retirement", "model_and_tools", "render_preparation")
 
 
 def _utcnow() -> datetime:
@@ -138,6 +139,24 @@ def _bridge_prompt(envelope: dict[str, Any]) -> str:
     )
 
 
+def _timing_ms(started: float, **phases: int) -> dict[str, int]:
+    timing = {phase: max(0, int(phases.get(phase, 0))) for phase in TIMING_PHASES}
+    timing["total"] = max(0, int((time.monotonic() - started) * 1000))
+    return timing
+
+
+def _initialize_worker_process_context(profile_root: Path) -> None:
+    """Bind this dedicated worker process to its installed specialist profile."""
+    os.chdir(profile_root)
+    os.environ["HERMES_HOME"] = str(profile_root)
+    os.environ["TERMINAL_CWD"] = str(profile_root)
+    os.environ.setdefault("HERMES_YOLO_MODE", "1")
+    os.environ.setdefault("HERMES_ACCEPT_HOOKS", "1")
+    from agent.runtime_cwd import clear_session_cwd
+
+    clear_session_cwd()
+
+
 class PersistentSpecialistWorker:
     def __init__(
         self,
@@ -174,6 +193,7 @@ class PersistentSpecialistWorker:
         self._server: asyncio.AbstractServer | None = None
         self._instance_lock: Any | None = None
         self._stopping = False
+        self._shutdown_event = asyncio.Event()
         self._unhealthy = False
         self._ledger_dir = self.profile_root / "state/persistent-runtime/ledger"
         self._log_path = self.profile_root / "logs/persistent-specialist.jsonl"
@@ -192,34 +212,12 @@ class PersistentSpecialistWorker:
             stream.write(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
 
     def _default_agent_factory(self) -> Any:
-        os.environ.setdefault("HERMES_YOLO_MODE", "1")
-        os.environ.setdefault("HERMES_ACCEPT_HOOKS", "1")
         from hermes_cli.oneshot import create_noninteractive_agent
 
         return create_noninteractive_agent()
 
-    def _run_in_profile_context(self, callback: Callable[..., Any], *args: Any) -> Any:
-        """Run agent work with an isolated specialist runtime context."""
-        previous_cwd = Path.cwd()
-        previous_env = {key: os.environ.get(key) for key in ("HERMES_HOME", "TERMINAL_CWD")}
-        try:
-            os.chdir(self.profile_root)
-            os.environ["HERMES_HOME"] = str(self.profile_root)
-            os.environ["TERMINAL_CWD"] = str(self.profile_root)
-            from agent.runtime_cwd import clear_session_cwd
-
-            clear_session_cwd()
-            return callback(*args)
-        finally:
-            os.chdir(previous_cwd)
-            for key, value in previous_env.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
-
     def _construct_agent(self) -> Any:
-        agent = self._run_in_profile_context(self.agent_factory)
+        agent = self.agent_factory()
         agent.session_cwd = str(self.profile_root)
         return agent
 
@@ -293,6 +291,7 @@ class PersistentSpecialistWorker:
 
     async def stop(self) -> None:
         self._stopping = True
+        self._shutdown_event.set()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -311,6 +310,17 @@ class PersistentSpecialistWorker:
             raise RuntimeError("worker is not started")
         async with self._server:
             await self._server.serve_forever()
+
+    @property
+    def shutdown_requested(self) -> bool:
+        return self._shutdown_event.is_set()
+
+    def acknowledge_shutdown(self) -> None:
+        """Notify the main owner after the shutdown response is written."""
+        self._shutdown_event.set()
+
+    async def wait_for_shutdown(self) -> None:
+        await self._shutdown_event.wait()
 
     async def _retire_agent(self) -> None:
         agent, self._agent = self._agent, None
@@ -365,6 +375,8 @@ class PersistentSpecialistWorker:
             request = await self._read(reader)
             response = await self.handle_request(request)
             await self._write(writer, response)
+            if request.get("operation") == "shutdown":
+                self.acknowledge_shutdown()
         except (asyncio.IncompleteReadError, BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:
@@ -393,21 +405,59 @@ class PersistentSpecialistWorker:
             **extra,
         }
 
+    def _log_terminal_response(self, event: str, request: dict[str, Any], response: dict[str, Any]) -> None:
+        self._log_event(
+            event,
+            event_id=request.get("event_id"),
+            operation=request["operation"],
+            trace_id=response.get("trace_id"),
+            execution_state=response.get("execution_state"),
+            code=(response.get("error") or {}).get("code"),
+            timing_ms=response.get("timing_ms"),
+        )
+
     async def handle_request(self, request: dict[str, Any]) -> dict[str, Any]:
-        request = {**request, "_trace_id": f"trace_{uuid.uuid4().hex}"}
+        request = {
+            **request,
+            "_trace_id": f"trace_{uuid.uuid4().hex}",
+            "_started_at": time.monotonic(),
+        }
         if request.get("protocol_version") != PROTOCOL:
             raise ValueError("unsupported protocol_version")
         operation = request.get("operation")
         if operation == "health":
-            return self._base_response(request, status="ready", health=self.health())
+            return self._base_response(
+                request,
+                status="ready" if not self._stopping else "stopping",
+                health=self.health(),
+                timing_ms=_timing_ms(request["_started_at"]),
+            )
         if operation == "shutdown":
             self._stopping = True
-            return self._base_response(request, status="stopping")
+            response = self._base_response(
+                request,
+                status="stopping",
+                execution_state="not_started",
+                timing_ms=_timing_ms(request["_started_at"]),
+            )
+            self._log_terminal_response("worker_shutdown_requested", request, response)
+            return response
         if operation not in {"turn", "reset"}:
             raise ValueError("unsupported operation")
+        if self._stopping:
+            response = self._failure(
+                request,
+                "WORKER_STOPPING",
+                "the specialist worker is stopping",
+                False,
+                "not_started",
+            )
+            self._log_terminal_response("turn_failed", request, response)
+            return response
         return await self._handle_turn_or_reset(request)
 
     async def _handle_turn_or_reset(self, request: dict[str, Any]) -> dict[str, Any]:
+        started = request["_started_at"]
         conversation_id = request["conversation_id"]
         event_id = request["event_id"]
         fingerprint = _fingerprint(request)
@@ -415,13 +465,19 @@ class PersistentSpecialistWorker:
         if path.exists():
             record = json.loads(path.read_text(encoding="utf-8"))
             if record["fingerprint"] != fingerprint:
-                return self._failure(request, "IDEMPOTENCY_CONFLICT", "event_id was reused with different content", False, "not_started")
+                response = self._failure(request, "IDEMPOTENCY_CONFLICT", "event_id was reused with different content", False, "not_started")
+                self._log_terminal_response("turn_failed", request, response)
+                return response
             if record.get("response"):
                 return record["response"]
             state = "outcome_unknown" if record.get("state") == "outcome_unknown" else "in_flight"
-            return self._failure(request, "DUPLICATE_IN_FLIGHT", "the event has already been accepted", False, state)
+            response = self._failure(request, "DUPLICATE_IN_FLIGHT", "the event has already been accepted", False, state)
+            self._log_terminal_response("turn_failed", request, response)
+            return response
         if self._unhealthy:
-            return self._failure(request, "CONVERSATION_UNHEALTHY", "the specialist conversation requires recovery", False, "not_started")
+            response = self._failure(request, "CONVERSATION_UNHEALTHY", "the specialist conversation requires recovery", False, "not_started")
+            self._log_terminal_response("turn_failed", request, response)
+            return response
         if (
             self._conversation_id not in {None, conversation_id}
             and not self._conversation_lock.locked()
@@ -432,15 +488,21 @@ class PersistentSpecialistWorker:
             self.conversation_instance_id = f"thread_{uuid.uuid4().hex}"
             self._log_event("conversation_evicted", reason="idle")
         if self._conversation_id not in {None, conversation_id}:
-            return self._failure(request, "CONVERSATION_LIMIT", "this v1 worker already owns another conversation", True, "not_started")
+            response = self._failure(request, "CONVERSATION_LIMIT", "this v1 worker already owns another conversation", True, "not_started")
+            self._log_terminal_response("turn_failed", request, response)
+            return response
         queued = False
         generation = self._reset_generation
         if request["operation"] == "turn":
             if self._resetting:
-                return self._failure(request, "RESET_IN_PROGRESS", "the specialist conversation is resetting", True, "not_started")
+                response = self._failure(request, "RESET_IN_PROGRESS", "the specialist conversation is resetting", True, "not_started")
+                self._log_terminal_response("turn_failed", request, response)
+                return response
             if self._conversation_lock.locked():
                 if self._queued_turns >= self.queue_limit:
-                    return self._failure(request, "QUEUE_FULL", "the specialist conversation queue is full", True, "not_started")
+                    response = self._failure(request, "QUEUE_FULL", "the specialist conversation queue is full", True, "not_started")
+                    self._log_terminal_response("turn_failed", request, response)
+                    return response
                 self._queued_turns += 1
                 queued = True
         else:
@@ -459,7 +521,7 @@ class PersistentSpecialistWorker:
             "updated_at": _iso(now),
         }
         _atomic_json(path, record)
-        started = time.monotonic()
+        queue_started = time.monotonic()
         wait_timeout = self.reset_timeout if request["operation"] == "reset" else max(
             0.1, (_parse_time(request["deadline"]) - _utcnow()).total_seconds()
         )
@@ -473,23 +535,38 @@ class PersistentSpecialistWorker:
                 self._unhealthy = True
                 self._resetting = False
             self.last_error_code = code
-            response = self._failure(request, code, "the specialist request did not start before its deadline", False, "not_started")
+            response = self._failure(
+                request,
+                code,
+                "the specialist request did not start before its deadline",
+                False,
+                "not_started",
+                timing_ms=_timing_ms(started, queue=int((time.monotonic() - queue_started) * 1000)),
+            )
             record["state"] = "failed"
             record["response"] = response
             record["updated_at"] = _iso(_utcnow())
             _atomic_json(path, record)
-            self._log_event("turn_failed", event_id=event_id, code=code, execution_state="not_started")
+            self._log_terminal_response("turn_failed", request, response)
             return response
         try:
-            queue_ms = int((time.monotonic() - started) * 1000)
+            queue_ms = int((time.monotonic() - queue_started) * 1000)
             if queued:
                 self._queued_turns -= 1
                 if generation != self._reset_generation:
-                    response = self._failure(request, "RESET", "the queued turn was canceled by reset", False, "not_started")
+                    response = self._failure(
+                        request,
+                        "RESET",
+                        "the queued turn was canceled by reset",
+                        False,
+                        "not_started",
+                        timing_ms=_timing_ms(started, queue=queue_ms),
+                    )
                     record["state"] = "failed"
                     record["response"] = response
                     record["updated_at"] = _iso(_utcnow())
                     _atomic_json(path, record)
+                    self._log_terminal_response("turn_failed", request, response)
                     return response
             self._conversation_id = conversation_id
             record["state"] = "in_flight"
@@ -502,29 +579,44 @@ class PersistentSpecialistWorker:
                 trace_id=request["_trace_id"],
             )
             try:
+                initialization_ms = 0
+                retirement_started = time.monotonic()
+                model_started = time.monotonic()
                 if request["operation"] == "reset":
+                    retirement_started = time.monotonic()
                     remaining = max(0.1, self.reset_timeout - (time.monotonic() - started))
                     await asyncio.wait_for(self._retire_agent(), timeout=remaining)
+                    retirement_ms = int((time.monotonic() - retirement_started) * 1000)
                     self.conversation_instance_id = f"thread_{uuid.uuid4().hex}"
-                    response = self._reset_response(request, started)
+                    render_started = time.monotonic()
+                    response = self._reset_response(
+                        request,
+                        _timing_ms(
+                            started,
+                            queue=queue_ms,
+                            retirement=retirement_ms,
+                            render_preparation=int((time.monotonic() - render_started) * 1000),
+                        ),
+                    )
                 else:
                     initialization_started = time.monotonic()
                     if self._agent is None:
                         self._agent = await asyncio.to_thread(self._construct_agent)
-                    initialization_ms = int((time.monotonic() - initialization_started) * 1000)
+                        initialization_ms = int((time.monotonic() - initialization_started) * 1000)
                     prompt = _bridge_prompt(request["envelope"])
                     model_started = time.monotonic()
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(self._run_in_profile_context, self._agent.run_conversation, prompt),
-                        timeout=self.turn_timeout,
-                    )
-                    model_and_tools_ms = int((time.monotonic() - model_started) * 1000)
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.to_thread(self._agent.run_conversation, prompt),
+                            timeout=self.turn_timeout,
+                        )
+                    finally:
+                        model_and_tools_ms = int((time.monotonic() - model_started) * 1000)
                     if not result.get("completed", True) or result.get("partial"):
                         raise RuntimeError(result.get("error") or "model turn did not complete")
                     render_started = time.monotonic()
                     payloads = _extract_render_payloads(result.get("final_response") or "")
                     render_preparation_ms = int((time.monotonic() - render_started) * 1000)
-                    total_ms = int((time.monotonic() - started) * 1000)
                     response = self._base_response(
                         request,
                         status="completed",
@@ -532,39 +624,58 @@ class PersistentSpecialistWorker:
                         event_id=event_id,
                         conversation_instance_id=self.conversation_instance_id,
                         render_payloads=payloads,
-                        timing_ms={
-                            "queue": queue_ms,
-                            "initialization": initialization_ms,
-                            "model_and_tools": model_and_tools_ms,
-                            "render_preparation": render_preparation_ms,
-                            "total": total_ms,
-                        },
+                        timing_ms=_timing_ms(
+                            started,
+                            queue=queue_ms,
+                            initialization=initialization_ms,
+                            model_and_tools=model_and_tools_ms,
+                            render_preparation=render_preparation_ms,
+                        ),
                     )
                 self.last_success_at = _iso(_utcnow())
                 self._last_conversation_activity = time.monotonic()
                 record["state"] = "completed"
                 record["response"] = response
-                self._log_event(
-                    "turn_completed",
-                    event_id=event_id,
-                    operation=request["operation"],
-                    trace_id=request["_trace_id"],
-                    timing_ms=response.get("timing_ms"),
-                )
+                self._log_terminal_response("turn_completed", request, response)
             except asyncio.TimeoutError:
                 self._unhealthy = True
                 self.last_error_code = "TURN_TIMEOUT" if request["operation"] == "turn" else "RESET_UNCONFIRMED"
                 self._interrupt_agent()
-                response = self._failure(request, self.last_error_code, "the specialist did not stop before its deadline", False, "outcome_unknown")
+                response = self._failure(
+                    request,
+                    self.last_error_code,
+                    "the specialist did not stop before its deadline",
+                    False,
+                    "outcome_unknown",
+                    timing_ms=_timing_ms(
+                        started,
+                        queue=queue_ms,
+                        retirement=(int((time.monotonic() - retirement_started) * 1000) if request["operation"] == "reset" else 0),
+                        model_and_tools=(int((time.monotonic() - model_started) * 1000) if request["operation"] == "turn" else 0),
+                    ),
+                )
                 record["state"] = "outcome_unknown"
                 record["response"] = response
-                self._log_event("turn_failed", event_id=event_id, code=self.last_error_code, execution_state="outcome_unknown")
+                self._log_terminal_response("turn_failed", request, response)
             except Exception as exc:
                 self.last_error_code = "TURN_FAILED"
-                response = self._failure(request, "TURN_FAILED", str(exc)[:500], False, "outcome_unknown")
+                response = self._failure(
+                    request,
+                    "TURN_FAILED",
+                    str(exc)[:500],
+                    False,
+                    "outcome_unknown",
+                    timing_ms=_timing_ms(
+                        started,
+                        queue=queue_ms,
+                        initialization=initialization_ms if request["operation"] == "turn" else 0,
+                        retirement=(int((time.monotonic() - retirement_started) * 1000) if request["operation"] == "reset" else 0),
+                        model_and_tools=(int((time.monotonic() - model_started) * 1000) if request["operation"] == "turn" else 0),
+                    ),
+                )
                 record["state"] = "outcome_unknown"
                 record["response"] = response
-                self._log_event("turn_failed", event_id=event_id, code="TURN_FAILED", execution_state="outcome_unknown")
+                self._log_terminal_response("turn_failed", request, response)
             record["updated_at"] = _iso(_utcnow())
             _atomic_json(path, record)
             return response
@@ -579,16 +690,25 @@ class PersistentSpecialistWorker:
             with contextlib.suppress(Exception):
                 session.request_interrupt()
 
-    def _failure(self, request: dict[str, Any], code: str, message: str, retryable: bool, state: str) -> dict[str, Any]:
+    def _failure(
+        self,
+        request: dict[str, Any],
+        code: str,
+        message: str,
+        retryable: bool,
+        state: str,
+        timing_ms: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
         return self._base_response(
             request,
             status="failed",
             execution_state=state,
             event_id=request.get("event_id"),
             error={"code": code, "message": message[:500], "retryable": retryable},
+            timing_ms=timing_ms or _timing_ms(request["_started_at"]),
         )
 
-    def _reset_response(self, request: dict[str, Any], started: float) -> dict[str, Any]:
+    def _reset_response(self, request: dict[str, Any], timing_ms: dict[str, int]) -> dict[str, Any]:
         envelope = request["envelope"]
         payload = {
             "schema_version": "telegram.bridge.render_payload.v1",
@@ -598,7 +718,6 @@ class PersistentSpecialistWorker:
             "target": {"chat_id": int(envelope["chat_id"])},
             "render": {"text": f"{self.agent_id} conversation context reset."},
         }
-        elapsed = int((time.monotonic() - started) * 1000)
         return self._base_response(
             request,
             status="completed",
@@ -606,15 +725,13 @@ class PersistentSpecialistWorker:
             event_id=request["event_id"],
             conversation_instance_id=self.conversation_instance_id,
             render_payloads=[payload],
-            timing_ms={"queue": 0, "model_and_tools": 0, "render_preparation": elapsed, "total": elapsed},
+            timing_ms=timing_ms,
         )
 
 
 async def _main_async(args: argparse.Namespace) -> int:
     profile_root = Path(args.profile_root).resolve()
-    os.chdir(profile_root)
-    os.environ["HERMES_HOME"] = str(profile_root)
-    os.environ["TERMINAL_CWD"] = str(profile_root)
+    _initialize_worker_process_context(profile_root)
     socket_path = (profile_root / args.socket).resolve()
     worker = PersistentSpecialistWorker(
         profile_root=profile_root,
@@ -633,14 +750,16 @@ async def _main_async(args: argparse.Namespace) -> int:
             loop.add_signal_handler(signum, stop.set)
     serve = asyncio.create_task(worker.serve_forever())
     wait = asyncio.create_task(stop.wait())
-    done, _ = await asyncio.wait({serve, wait}, return_when=asyncio.FIRST_COMPLETED)
+    shutdown = asyncio.create_task(worker.wait_for_shutdown())
+    done, _ = await asyncio.wait({serve, wait, shutdown}, return_when=asyncio.FIRST_COMPLETED)
     if serve in done and not serve.cancelled():
         exception = serve.exception()
         if exception and not isinstance(exception, asyncio.CancelledError):
             raise exception
     serve.cancel()
     wait.cancel()
-    await asyncio.gather(serve, wait, return_exceptions=True)
+    shutdown.cancel()
+    await asyncio.gather(serve, wait, shutdown, return_exceptions=True)
     await worker.stop()
     return 0
 

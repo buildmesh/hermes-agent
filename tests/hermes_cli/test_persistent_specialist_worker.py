@@ -2,7 +2,9 @@ import asyncio
 import json
 import os
 import stat
+import sys
 import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ import pytest
 from hermes_cli.persistent_specialist_worker import (
     PROTOCOL,
     PersistentSpecialistWorker,
+    _initialize_worker_process_context,
     _extract_render_payloads,
 )
 
@@ -56,7 +59,7 @@ class FakeAgent:
             str(resolve_context_cwd()),
             os.getcwd(),
         ))
-        context_root = resolve_context_cwd()
+        context_root = resolve_context_cwd() or Path.cwd()
         self.loaded_profile_context.append(tuple(
             str(path.relative_to(context_root))
             for path in (
@@ -91,6 +94,23 @@ class FakeCodexSession:
         self.closed = True
 
 
+class FailingAgent(FakeAgent):
+    def run_conversation(self, prompt: str) -> dict:
+        raise RuntimeError("model failure")
+
+
+class BlockingAgent(FakeAgent):
+    def __init__(self, entered: threading.Event, release: threading.Event) -> None:
+        super().__init__()
+        self.entered = entered
+        self.release = release
+
+    def run_conversation(self, prompt: str) -> dict:
+        self.entered.set()
+        self.release.wait(timeout=2)
+        return super().run_conversation(prompt)
+
+
 def request(event_id: str, operation: str = "turn") -> dict:
     return {
         "protocol_version": PROTOCOL,
@@ -107,6 +127,61 @@ def request(event_id: str, operation: str = "turn") -> dict:
             "message": {"command": {"mode": "reset"}} if operation == "reset" else {"text": "hello"},
         },
     }
+
+
+def assert_complete_timing(response: dict) -> None:
+    assert response["trace_id"].startswith("trace_")
+    assert set(response["timing_ms"]) == {
+        "queue",
+        "initialization",
+        "retirement",
+        "model_and_tools",
+        "render_preparation",
+        "total",
+    }
+    assert all(duration >= 0 for duration in response["timing_ms"].values())
+    assert sum(
+        response["timing_ms"][phase]
+        for phase in ("queue", "initialization", "retirement", "model_and_tools", "render_preparation")
+    ) <= response["timing_ms"]["total"]
+
+
+def test_worker_process_initialization_sets_profile_context_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    profile_root = tmp_path / "profile"
+    profile_root.mkdir()
+    bridge_cwd = tmp_path / "bridge"
+    bridge_cwd.mkdir()
+    monkeypatch.chdir(bridge_cwd)
+    monkeypatch.setenv("HERMES_HOME", str(bridge_cwd))
+    monkeypatch.setenv("TERMINAL_CWD", str(bridge_cwd))
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_ACCEPT_HOOKS", raising=False)
+
+    _initialize_worker_process_context(profile_root)
+
+    assert (os.getcwd(), os.environ["HERMES_HOME"], os.environ["TERMINAL_CWD"]) == (
+        str(profile_root), str(profile_root), str(profile_root)
+    )
+    assert os.environ["HERMES_YOLO_MODE"] == "1"
+    assert os.environ["HERMES_ACCEPT_HOOKS"] == "1"
+
+
+def test_default_agent_factory_does_not_mutate_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    sentinel = object()
+    oneshot = types.ModuleType("hermes_cli.oneshot")
+    oneshot.create_noninteractive_agent = lambda: sentinel
+    monkeypatch.setitem(sys.modules, "hermes_cli.oneshot", oneshot)
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_ACCEPT_HOOKS", raising=False)
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "w.sock",
+        agent_id="hello_world",
+    )
+
+    assert worker._default_agent_factory() is sentinel
+    assert "HERMES_YOLO_MODE" not in os.environ
+    assert "HERMES_ACCEPT_HOOKS" not in os.environ
 
 
 @pytest.mark.asyncio
@@ -145,6 +220,13 @@ async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> No
         agents[0]._codex_session = codex_session
         reset = await worker.handle_request(request("reset1", "reset"))
         assert reset["status"] == "completed"
+        assert_complete_timing(reset)
+        assert reset["timing_ms"]["retirement"] >= 0
+        assert reset["timing_ms"]["model_and_tools"] == 0
+        events = [json.loads(line) for line in (tmp_path / "logs/persistent-specialist.jsonl").read_text().splitlines()]
+        reset_event = [event for event in events if event.get("event_id") == "reset1"][-1]
+        assert reset_event["trace_id"] == reset["trace_id"]
+        assert reset_event["timing_ms"] == reset["timing_ms"]
         assert reset["conversation_instance_id"] != old_thread
         assert agents[0].closed is True
         assert codex_session.closed is True
@@ -157,16 +239,12 @@ async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_worker_constructs_and_runs_agent_in_profile_context_with_phase_timing(
+async def test_worker_callbacks_do_not_mutate_process_context_and_set_agent_session_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     profile_root = tmp_path / "profiles" / "hello-world"
     profile_root.mkdir(parents=True)
-    for relative_path in ("SOUL.md", "memories/USER.md", "memories/MEMORY.md", "AGENTS.md", "skills/index.md"):
-        path = profile_root / relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(relative_path, encoding="utf-8")
     bridge_cwd = tmp_path / "profiles" / "telegram-bridge"
     bridge_cwd.mkdir(parents=True)
     monkeypatch.chdir(bridge_cwd)
@@ -193,28 +271,176 @@ async def test_worker_constructs_and_runs_agent_in_profile_context_with_phase_ti
     finally:
         await worker.stop()
 
-    assert constructed_in == [(str(profile_root), str(profile_root), str(profile_root))]
+    assert constructed_in == [(str(bridge_cwd), str(bridge_cwd), str(bridge_cwd))]
     assert (os.getcwd(), os.environ["HERMES_HOME"], os.environ["TERMINAL_CWD"]) == (
         str(bridge_cwd), str(bridge_cwd), str(bridge_cwd)
     )
     assert agents[0].session_cwd == str(profile_root)
-    assert agents[0].effective_cwds == [(str(profile_root), str(profile_root), str(profile_root))]
-    assert agents[0].loaded_profile_context == [
-        ("SOUL.md", "memories/USER.md", "memories/MEMORY.md", "AGENTS.md", "skills/index.md")
+    assert agents[0].effective_cwds == [(str(bridge_cwd), str(bridge_cwd), str(bridge_cwd))]
+    assert_complete_timing(response)
+
+
+@pytest.mark.asyncio
+async def test_worker_callback_threads_do_not_cross_contaminate_process_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge_cwd = tmp_path / "bridge"
+    bridge_cwd.mkdir()
+    monkeypatch.chdir(bridge_cwd)
+    monkeypatch.setenv("HERMES_HOME", str(bridge_cwd))
+    monkeypatch.setenv("TERMINAL_CWD", str(bridge_cwd))
+    barrier = threading.Barrier(2)
+    observed: list[tuple[str, str, str]] = []
+
+    def factory() -> FakeAgent:
+        barrier.wait(timeout=1)
+        observed.append((os.getcwd(), os.environ["HERMES_HOME"], os.environ["TERMINAL_CWD"]))
+        return FakeAgent()
+
+    workers = [
+        PersistentSpecialistWorker(
+            profile_root=tmp_path / name,
+            socket_path=tmp_path / name / "w.sock",
+            agent_id=name,
+            agent_factory=factory,
+        )
+        for name in ("first", "second")
     ]
-    assert response["trace_id"].startswith("trace_")
-    assert set(response["timing_ms"]) == {
-        "queue",
-        "initialization",
-        "model_and_tools",
-        "render_preparation",
-        "total",
-    }
-    assert all(duration >= 0 for duration in response["timing_ms"].values())
-    assert sum(
-        response["timing_ms"][phase]
-        for phase in ("queue", "initialization", "model_and_tools", "render_preparation")
-    ) <= response["timing_ms"]["total"]
+    for worker in workers:
+        worker.profile_root.mkdir()
+        await worker.start()
+    try:
+        await asyncio.gather(*(worker.handle_request(request(f"race-{worker.agent_id}")) for worker in workers))
+    finally:
+        await asyncio.gather(*(worker.stop() for worker in workers))
+
+    assert observed == [(str(bridge_cwd), str(bridge_cwd), str(bridge_cwd))] * 2
+    assert (os.getcwd(), os.environ["HERMES_HOME"], os.environ["TERMINAL_CWD"]) == (
+        str(bridge_cwd), str(bridge_cwd), str(bridge_cwd)
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_queued_turn_reports_actual_queue_wait(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "w.sock",
+        agent_id="hello_world",
+        agent_factory=lambda: BlockingAgent(entered, release),
+    )
+    await worker.start()
+    try:
+        active = asyncio.create_task(worker.handle_request(request("active-queue")))
+        assert await asyncio.to_thread(entered.wait, 1)
+        queued = asyncio.create_task(worker.handle_request(request("queued-wait")))
+        await asyncio.sleep(0.05)
+        release.set()
+        assert (await active)["status"] == "completed"
+        queued_response = await queued
+    finally:
+        release.set()
+        await worker.stop()
+
+    assert_complete_timing(queued_response)
+    assert queued_response["timing_ms"]["queue"] >= 40
+
+
+def test_profile_context_loaders_read_specialist_soul_and_agents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent.prompt_builder import build_context_files_prompt, load_soul_md
+
+    profile_root = tmp_path / "profile"
+    profile_root.mkdir()
+    (profile_root / "SOUL.md").write_text("Specialist identity", encoding="utf-8")
+    (profile_root / "AGENTS.md").write_text("Specialist operating instructions", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile_root))
+    monkeypatch.setenv("TERMINAL_CWD", str(profile_root))
+
+    assert load_soul_md() == "Specialist identity"
+    assert "Specialist operating instructions" in build_context_files_prompt(
+        cwd=profile_root,
+        skip_soul=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_failure_responses_and_logs_include_complete_timing(tmp_path: Path) -> None:
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "w.sock",
+        agent_id="hello_world",
+        agent_factory=FailingAgent,
+    )
+    await worker.start()
+    try:
+        response = await worker.handle_request(request("failure"))
+    finally:
+        await worker.stop()
+
+    assert response["error"]["code"] == "TURN_FAILED"
+    assert_complete_timing(response)
+    events = [json.loads(line) for line in (tmp_path / "logs/persistent-specialist.jsonl").read_text().splitlines()]
+    failure = next(event for event in events if event["event"] == "turn_failed")
+    assert failure["trace_id"] == response["trace_id"]
+    assert failure["timing_ms"] == response["timing_ms"]
+
+
+@pytest.mark.asyncio
+async def test_worker_timeout_response_and_log_include_complete_timing(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "w.sock",
+        agent_id="hello_world",
+        turn_timeout=0.01,
+        agent_factory=lambda: BlockingAgent(entered, release),
+    )
+    await worker.start()
+    try:
+        response = await worker.handle_request(request("timeout"))
+    finally:
+        release.set()
+        await worker.stop()
+
+    assert response["error"]["code"] == "TURN_TIMEOUT"
+    assert_complete_timing(response)
+    events = [json.loads(line) for line in (tmp_path / "logs/persistent-specialist.jsonl").read_text().splitlines()]
+    failure = next(event for event in events if event["event"] == "turn_failed")
+    assert failure["trace_id"] == response["trace_id"]
+    assert failure["timing_ms"] == response["timing_ms"]
+
+
+@pytest.mark.asyncio
+async def test_worker_shutdown_rejects_subsequent_turns(tmp_path: Path) -> None:
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "w.sock",
+        agent_id="hello_world",
+        agent_factory=FakeAgent,
+    )
+    await worker.start()
+    try:
+        wait_for_owner = asyncio.create_task(worker.wait_for_shutdown())
+        shutdown = await worker.handle_request({
+            "protocol_version": PROTOCOL,
+            "request_id": "req_shutdown",
+            "operation": "shutdown",
+        })
+        assert worker.shutdown_requested is False
+        worker.acknowledge_shutdown()
+        await asyncio.wait_for(wait_for_owner, timeout=1)
+        rejected = await worker.handle_request(request("after-shutdown"))
+    finally:
+        await worker.stop()
+
+    assert shutdown["status"] == "stopping"
+    assert_complete_timing(shutdown)
+    assert worker.shutdown_requested is True
+    assert rejected["error"]["code"] == "WORKER_STOPPING"
+    assert_complete_timing(rejected)
 
 
 @pytest.mark.asyncio
