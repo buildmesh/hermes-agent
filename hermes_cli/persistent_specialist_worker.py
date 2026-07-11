@@ -19,6 +19,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from agent.render_correction_companion import (
+    CorrectionCompanionTimeout,
+    CorrectionCompanionUnavailable,
+    resolve_companion_config,
+    run_companion_subprocess,
+)
+
 
 PROTOCOL = "telegram.bridge.persistent_service.v1"
 PROTOCOL_V2 = "telegram.bridge.persistent_service.v2"
@@ -117,19 +124,94 @@ def _correction_fingerprint(request: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _correction_prompt(record: dict[str, Any], request: dict[str, Any]) -> str:
-    return (
-        "Correct only the formatting of the completed Telegram Bridge response below. "
-        "Do not repeat, continue, or verify the domain task. Return only a JSON array of "
-        "telegram.bridge.render_payload.v1 objects satisfying the immutable constraints and "
-        "validation feedback. No tools are available.\n\n"
-        "Immutable constraints:\n"
-        + json.dumps(request["target_constraints"], ensure_ascii=False, sort_keys=True)
-        + "\n\nValidation feedback:\n"
-        + json.dumps(request["validation_errors"], ensure_ascii=False, sort_keys=True)
-        + "\n\nOriginal render candidate:\n"
-        + str(record["render_candidate"])
-    )
+def _validate_v2_request(request: dict[str, Any]) -> None:
+    """Validate the closed v2 wire shape without importing TBA schemas."""
+    if request.get("protocol_version") != PROTOCOL_V2:
+        raise ValueError("invalid protocol version")
+    operation = request.get("operation")
+    shapes = {
+        "hello": {"protocol_version", "request_id", "operation", "client"},
+        "turn": {"protocol_version", "request_id", "operation", "event_id", "conversation_id", "deadline", "envelope"},
+        "reset": {"protocol_version", "request_id", "operation", "event_id", "conversation_id", "deadline", "envelope"},
+        "correct_render": {
+            "protocol_version", "request_id", "operation", "event_id", "conversation_id", "deadline",
+            "correction_attempt_id", "validation_errors", "target_constraints",
+        },
+        "health": {"protocol_version", "request_id", "operation"},
+        "shutdown": {"protocol_version", "request_id", "operation"},
+    }
+    expected = shapes.get(operation)
+    if expected is None or set(request) != expected:
+        raise ValueError("invalid closed request shape")
+    request_id = request.get("request_id")
+    if not isinstance(request_id, str) or not re.fullmatch(r"req_[A-Za-z0-9._:-]{1,200}", request_id):
+        raise ValueError("invalid request id")
+    if operation == "hello":
+        client = request.get("client")
+        if not isinstance(client, dict) or set(client) != {"name", "revision"}:
+            raise ValueError("invalid hello client")
+        revision = client.get("revision")
+        if client.get("name") != "telegram-bridge" or not isinstance(revision, str) or not 1 <= len(revision) <= 80:
+            raise ValueError("invalid hello client")
+        return
+    if operation in {"health", "shutdown"}:
+        return
+    event_id = request.get("event_id")
+    conversation_id = request.get("conversation_id")
+    deadline = request.get("deadline")
+    if not isinstance(event_id, str) or not 1 <= len(event_id) <= 240:
+        raise ValueError("invalid event id")
+    if not isinstance(conversation_id, str) or not re.fullmatch(r"conv_[0-9a-f]{64}", conversation_id):
+        raise ValueError("invalid conversation id")
+    if not isinstance(deadline, str):
+        raise ValueError("invalid deadline")
+    try:
+        parsed_deadline = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("invalid deadline") from exc
+    if parsed_deadline.tzinfo is None:
+        raise ValueError("invalid deadline")
+    if operation in {"turn", "reset"}:
+        if not isinstance(request.get("envelope"), dict):
+            raise ValueError("invalid envelope")
+        return
+    attempt_id = request.get("correction_attempt_id")
+    if not isinstance(attempt_id, str) or not re.fullmatch(r"corr_[A-Za-z0-9._:-]{1,200}", attempt_id):
+        raise ValueError("invalid correction attempt id")
+    errors = request.get("validation_errors")
+    if not isinstance(errors, list) or not 1 <= len(errors) <= 16:
+        raise ValueError("invalid validation errors")
+    for error in errors:
+        if not isinstance(error, dict) or set(error) != {"code", "path", "message"}:
+            raise ValueError("invalid validation error")
+        code, path, message = error.get("code"), error.get("path"), error.get("message")
+        if not isinstance(code, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", code):
+            raise ValueError("invalid validation error code")
+        if not isinstance(path, str) or not 1 <= len(path) <= 240:
+            raise ValueError("invalid validation error path")
+        if not isinstance(message, str) or not 1 <= len(message) <= 240:
+            raise ValueError("invalid validation error message")
+    constraints = request.get("target_constraints")
+    required = {"correlation_id", "chat_id", "authorized_telegram_message_ids", "callback_namespace"}
+    allowed = required | {"callback_query_id"}
+    if not isinstance(constraints, dict) or not required.issubset(constraints) or not set(constraints).issubset(allowed):
+        raise ValueError("invalid target constraints")
+    if not isinstance(constraints.get("correlation_id"), str) or not 1 <= len(constraints["correlation_id"]) <= 240:
+        raise ValueError("invalid correlation constraint")
+    if type(constraints.get("chat_id")) is not int:
+        raise ValueError("invalid chat constraint")
+    message_ids = constraints.get("authorized_telegram_message_ids")
+    if (
+        not isinstance(message_ids, list) or len(message_ids) > 64
+        or any(type(value) is not int for value in message_ids) or len(message_ids) != len(set(message_ids))
+    ):
+        raise ValueError("invalid authorized message constraints")
+    namespace = constraints.get("callback_namespace")
+    if not isinstance(namespace, str) or not 1 <= len(namespace) <= 64:
+        raise ValueError("invalid callback namespace")
+    callback_id = constraints.get("callback_query_id")
+    if callback_id is not None and (not isinstance(callback_id, str) or not 1 <= len(callback_id) <= 240):
+        raise ValueError("invalid callback query constraint")
 
 
 def _extract_render_payloads(text: str) -> list[dict[str, Any]]:
@@ -227,6 +309,8 @@ class PersistentSpecialistWorker:
         queue_limit: int = 4,
         idle_conversation_seconds: float = 21600,
         agent_factory: Callable[[], Any] | None = None,
+        correction_companion_resolver: Callable[[], dict[str, str] | None] | None = None,
+        correction_companion_runner: Callable[[dict[str, str], dict[str, Any], float], str] | None = None,
     ) -> None:
         self.profile_root = profile_root.resolve()
         self.socket_path = socket_path.resolve()
@@ -236,6 +320,12 @@ class PersistentSpecialistWorker:
         self.queue_limit = max(1, int(queue_limit))
         self.idle_conversation_seconds = max(60.0, float(idle_conversation_seconds))
         self.agent_factory = agent_factory or self._default_agent_factory
+        resolver = correction_companion_resolver or resolve_companion_config
+        try:
+            self._correction_companion_config = resolver()
+        except Exception:
+            self._correction_companion_config = None
+        self._correction_companion_runner = correction_companion_runner or run_companion_subprocess
         self.runtime_instance_id = f"runtime_{uuid.uuid4().hex}"
         self.conversation_instance_id = f"thread_{uuid.uuid4().hex}"
         self.started_at = _utcnow()
@@ -245,6 +335,8 @@ class PersistentSpecialistWorker:
         self._active_model_task: asyncio.Task[Any] | None = None
         self._conversation_id: str | None = None
         self._conversation_lock = asyncio.Lock()
+        self._correction_state_lock = asyncio.Lock()
+        self._correction_events: dict[Path, asyncio.Event] = {}
         self._resetting = False
         self._queued_turns = 0
         self._reset_generation = 0
@@ -491,10 +583,18 @@ class PersistentSpecialistWorker:
 
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         hello: dict[str, Any] | None = None
+        request: dict[str, Any] | None = None
         try:
             hello = await self._read(reader)
             if hello.get("protocol_version") not in {PROTOCOL, PROTOCOL_V2} or hello.get("operation") != "hello":
                 raise ValueError("hello negotiation required")
+            if hello["protocol_version"] == PROTOCOL_V2:
+                _validate_v2_request(hello)
+            capabilities = [
+                "turn", "reset", "health", "shutdown", "durable_event_ledger", "render_candidate",
+            ]
+            if self._correction_companion_config is not None:
+                capabilities.append("tool_free_render_correction")
             await self._write(writer, {
                 "protocol_version": hello["protocol_version"],
                 "request_id": hello["request_id"],
@@ -504,12 +604,11 @@ class PersistentSpecialistWorker:
                 "framework": "hermes",
                 "profile": self.profile_root.name,
                 "supported_protocol_versions": [PROTOCOL, PROTOCOL_V2],
-                "capabilities": [
-                    "turn", "reset", "health", "shutdown", "durable_event_ledger",
-                    "render_candidate", "tool_free_render_correction",
-                ],
+                "capabilities": capabilities,
             })
             request = await self._read(reader)
+            if request.get("protocol_version") == PROTOCOL_V2:
+                _validate_v2_request(request)
             response = await self.handle_request(request)
             await self._write(writer, response)
             if request.get("operation") == "shutdown":
@@ -521,8 +620,9 @@ class PersistentSpecialistWorker:
                 await self._write(
                     writer,
                     self._protocol_failure_response(
-                        request_id=str((hello or {}).get("request_id") or "req_error"),
-                        operation=str((hello or {}).get("operation") or "health"),
+                        request_id=str((request or hello or {}).get("request_id") or "req_error"),
+                        operation=str((request or hello or {}).get("operation") or "health"),
+                        protocol_version=str((request or hello or {}).get("protocol_version") or PROTOCOL),
                     ),
                 )
         finally:
@@ -563,10 +663,16 @@ class PersistentSpecialistWorker:
             "timing_ms": _timing_ms(started),
         }
 
-    def _protocol_failure_response(self, *, request_id: str, operation: str) -> dict[str, Any]:
+    def _protocol_failure_response(
+        self,
+        *,
+        request_id: str,
+        operation: str,
+        protocol_version: str = PROTOCOL,
+    ) -> dict[str, Any]:
         started = time.monotonic()
         response = {
-            "protocol_version": PROTOCOL,
+            "protocol_version": protocol_version if protocol_version in {PROTOCOL, PROTOCOL_V2} else PROTOCOL,
             "request_id": request_id,
             "operation": operation,
             "status": "failed",
@@ -765,6 +871,21 @@ class PersistentSpecialistWorker:
                     _atomic_json(path, record)
                     self._log_terminal_response("turn_failed", request, response)
                     return response
+            if self._unhealthy:
+                response = self._failure(
+                    request,
+                    "CONVERSATION_UNHEALTHY",
+                    "the specialist conversation requires recovery",
+                    False,
+                    "not_started",
+                    timing_ms=_timing_ms(started, queue=queue_ms),
+                )
+                record["state"] = "failed"
+                record["response"] = response
+                record["updated_at"] = _iso(_utcnow())
+                _atomic_json(path, record)
+                self._log_terminal_response("turn_failed", request, response)
+                return response
             self._conversation_id = conversation_id
             record["state"] = "in_flight"
             record["updated_at"] = _iso(_utcnow())
@@ -912,62 +1033,69 @@ class PersistentSpecialistWorker:
                 self._resetting = False
 
     async def _handle_correct_render(self, request: dict[str, Any]) -> dict[str, Any]:
-        from agent.tool_free_turn import ToolFreeTurnUnavailable, run_tool_free_conversation
-
         conversation_id = request["conversation_id"]
         event_id = request["event_id"]
         path = self._ledger_path(conversation_id, event_id)
-        if not path.exists():
-            return self._correction_failure(
-                request, "ORIGINAL_EVENT_NOT_FOUND", "accepted completed event was not found",
-                "correction_failed",
-            )
-        record = json.loads(path.read_text(encoding="utf-8"))
-        if record.get("execution_state") != "completed" or not isinstance(record.get("render_candidate"), str):
-            return self._correction_failure(
-                request, "ORIGINAL_EVENT_NOT_COMPLETED", "render correction requires completed domain execution",
-                "correction_failed",
-            )
-
         attempt_id = request["correction_attempt_id"]
         fingerprint = _correction_fingerprint(request)
-        existing_attempt = record.get("correction_attempt_id")
-        if existing_attempt:
-            if existing_attempt == attempt_id and record.get("correction_fingerprint") == fingerprint:
-                return record["correction_response"]
-            return self._correction_failure(
-                request,
-                "CORRECTION_ALREADY_ATTEMPTED",
-                "the completed event already used its one render correction attempt",
-                str(record.get("presentation_state") or "correction_failed"),
-            )
-        if self._conversation_id != conversation_id or self._agent is None:
-            response = self._correction_failure(
-                request,
-                "SAME_CONVERSATION_UNAVAILABLE",
-                "the original specialist conversation is not resident",
-                "correction_failed",
-            )
-            record.update(
-                correction_attempt_id=attempt_id,
-                correction_attempt_count=1,
-                correction_fingerprint=fingerprint,
-                correction_response=response,
-                presentation_state="correction_failed",
-                updated_at=_iso(_utcnow()),
-            )
-            _atomic_json(path, record)
-            return response
+        wait_for_terminal: asyncio.Event | None = None
+        async with self._correction_state_lock:
+            if not path.exists():
+                return self._correction_failure(
+                    request, "ORIGINAL_EVENT_NOT_FOUND", "accepted completed event was not found",
+                    "correction_failed",
+                )
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if record.get("execution_state") != "completed" or not isinstance(record.get("render_candidate"), str):
+                return self._correction_failure(
+                    request, "ORIGINAL_EVENT_NOT_COMPLETED", "render correction requires completed domain execution",
+                    "correction_failed",
+                )
+            existing_attempt = record.get("correction_attempt_id")
+            if existing_attempt:
+                if existing_attempt != attempt_id or record.get("correction_fingerprint") != fingerprint:
+                    return self._correction_failure(
+                        request,
+                        "CORRECTION_ALREADY_ATTEMPTED",
+                        "the completed event already used its one render correction attempt",
+                        str(record.get("presentation_state") or "correction_failed"),
+                    )
+                if isinstance(record.get("correction_response"), dict):
+                    return record["correction_response"]
+                wait_for_terminal = self._correction_events.get(path)
+                if wait_for_terminal is None:
+                    return self._correction_failure(
+                        request,
+                        "CORRECTION_STATE_UNAVAILABLE",
+                        "the durable correction attempt has no active owner",
+                        "correction_failed",
+                    )
+            else:
+                record.update(
+                    correction_attempt_id=attempt_id,
+                    correction_attempt_count=1,
+                    correction_fingerprint=fingerprint,
+                    correction_request_id=request["request_id"],
+                    presentation_state="correction_in_flight",
+                    updated_at=_iso(_utcnow()),
+                )
+                _atomic_json(path, record)
+                self._correction_events[path] = asyncio.Event()
 
-        record.update(
-            correction_attempt_id=attempt_id,
-            correction_attempt_count=1,
-            correction_fingerprint=fingerprint,
-            correction_request_id=request["request_id"],
-            presentation_state="correction_in_flight",
-            updated_at=_iso(_utcnow()),
-        )
-        _atomic_json(path, record)
+        if wait_for_terminal is not None:
+            await wait_for_terminal.wait()
+            async with self._correction_state_lock:
+                replay_record = json.loads(path.read_text(encoding="utf-8"))
+                response = replay_record.get("correction_response")
+                if not isinstance(response, dict):
+                    return self._correction_failure(
+                        request,
+                        "CORRECTION_STATE_UNAVAILABLE",
+                        "the durable correction result is unavailable",
+                        "correction_failed",
+                    )
+                return response
+
         timeout = max(0.1, (_parse_time(request["deadline"]) - _utcnow()).total_seconds())
         started = request["_started_at"]
         try:
@@ -980,17 +1108,21 @@ class PersistentSpecialistWorker:
             record["presentation_state"] = "correction_failed"
         else:
             try:
-                prompt = _correction_prompt(record, request)
-                task = asyncio.create_task(
-                    asyncio.to_thread(run_tool_free_conversation, self._agent, prompt)
+                if self._correction_companion_config is None:
+                    raise CorrectionCompanionUnavailable(
+                        "isolated render correction companion is not configured"
+                    )
+                repair = {
+                    "candidate": record["render_candidate"],
+                    "validation_errors": request["validation_errors"],
+                    "target_constraints": request["target_constraints"],
+                }
+                candidate = await asyncio.to_thread(
+                    self._correction_companion_runner,
+                    self._correction_companion_config,
+                    repair,
+                    min(self.turn_timeout, timeout),
                 )
-                self._active_model_task = task
-                try:
-                    result = await asyncio.wait_for(asyncio.shield(task), timeout=min(self.turn_timeout, timeout))
-                finally:
-                    if task.done() and self._active_model_task is task:
-                        self._active_model_task = None
-                candidate = str(result.get("final_response") or "")
                 response = self._base_response(
                     request,
                     status="completed",
@@ -1005,10 +1137,9 @@ class PersistentSpecialistWorker:
                 record["corrected_candidate"] = candidate
                 record["corrected_candidate_sha256"] = _candidate_hash(candidate)
                 record["presentation_state"] = "correction_candidate_unvalidated"
-            except asyncio.TimeoutError:
+            except CorrectionCompanionTimeout:
                 self._unhealthy = True
                 self.last_error_code = "CORRECTION_TIMEOUT"
-                self._interrupt_agent()
                 response = self._correction_failure(
                     request,
                     "CORRECTION_TIMEOUT",
@@ -1016,7 +1147,7 @@ class PersistentSpecialistWorker:
                     "correction_failed",
                 )
                 record["presentation_state"] = "correction_failed"
-            except ToolFreeTurnUnavailable as exc:
+            except CorrectionCompanionUnavailable as exc:
                 response = self._correction_failure(
                     request, "TOOL_FREE_CORRECTION_UNAVAILABLE", str(exc), "correction_failed"
                 )
@@ -1031,7 +1162,11 @@ class PersistentSpecialistWorker:
 
         record["correction_response"] = response
         record["updated_at"] = _iso(_utcnow())
-        _atomic_json(path, record)
+        async with self._correction_state_lock:
+            _atomic_json(path, record)
+            terminal_event = self._correction_events.pop(path, None)
+            if terminal_event is not None:
+                terminal_event.set()
         self._log_terminal_response("render_correction_completed", request, response)
         return response
 

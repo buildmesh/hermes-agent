@@ -7685,6 +7685,11 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         return True
 
+    @staticmethod
+    def _telegram_bridge_delivery_outcome_unknown(error: Exception) -> bool:
+        """Recognize TBA's cross-module ambiguous-delivery marker by contract."""
+        return getattr(error, "delivery_outcome_unknown", False) is True
+
     async def _await_telegram_bridge_dispatch(self, typing_chat_id: int, fn: Any, *args: Any, **kwargs: Any) -> Any:
         async def refresh_typing() -> None:
             while True:
@@ -7736,6 +7741,8 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 await self._render_telegram_bridge_payloads(dispatcher, result.payloads, result.bridge_config)
             except Exception as exc:
+                if self._telegram_bridge_delivery_outcome_unknown(exc):
+                    return True
                 repaired = await self._rerender_telegram_bridge_with_repair(
                     dispatcher,
                     profile_root,
@@ -7793,6 +7800,8 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 await self._render_telegram_bridge_payloads(dispatcher, result.payloads, result.bridge_config)
             except Exception as exc:
+                if self._telegram_bridge_delivery_outcome_unknown(exc):
+                    return True
                 repaired = await self._rerender_telegram_bridge_with_repair(
                     dispatcher,
                     profile_root,
@@ -7849,6 +7858,8 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 await self._render_telegram_bridge_payloads(dispatcher, result.payloads, result.bridge_config)
             except Exception as exc:
+                if self._telegram_bridge_delivery_outcome_unknown(exc):
+                    return True
                 repaired = await self._rerender_telegram_bridge_with_repair(
                     dispatcher,
                     profile_root,

@@ -1,9 +1,11 @@
 import asyncio
 import json
 import os
+import signal
 import stat
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 
@@ -236,6 +238,39 @@ class SlowCorrectionAgent(CorrectionAgent):
         return super().run_conversation(prompt)
 
 
+def companion_config() -> dict:
+    return {
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+        "model": "gpt-test",
+        "base_url": "https://chatgpt.example/backend-api/codex",
+        "api_key": "test-token",
+    }
+
+
+class FakeCorrectionCompanion:
+    def __init__(self, *, entered: threading.Event | None = None, release: threading.Event | None = None) -> None:
+        self.calls: list[tuple[dict, dict, float]] = []
+        self.entered = entered
+        self.release = release
+
+    def __call__(self, config: dict, repair: dict, timeout: float) -> str:
+        self.calls.append((config, repair, timeout))
+        if self.entered is not None:
+            self.entered.set()
+        if self.release is not None:
+            self.release.wait(timeout=2)
+        payload = [{
+            "schema_version": "telegram.bridge.render_payload.v1",
+            "message_id": "msg_corrected",
+            "correlation_id": "completed-malformed",
+            "action": "send",
+            "target": {"chat_id": 123},
+            "render": {"text": "corrected without rerunning domain work"},
+        }]
+        return json.dumps(payload)
+
+
 def assert_complete_timing(response: dict) -> None:
     assert response["trace_id"].startswith("trace_")
     assert set(response["timing_ms"]) == {
@@ -296,6 +331,128 @@ def test_default_agent_factory_does_not_mutate_environment(monkeypatch: pytest.M
     assert worker._default_agent_factory() is sentinel
     assert "HERMES_YOLO_MODE" not in os.environ
     assert "HERMES_ACCEPT_HOOKS" not in os.environ
+
+
+def test_app_server_companion_resolution_reuses_parent_model_and_codex_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent import render_correction_companion as companion
+
+    monkeypatch.setattr(companion, "load_config", lambda: {
+        "model": {
+            "default": "gpt-5.4",
+            "provider": "openai-codex",
+            "openai_runtime": "codex_app_server",
+        },
+    })
+    monkeypatch.setattr(companion, "resolve_runtime_provider", lambda **kwargs: {
+        "provider": "openai-codex",
+        "api_mode": "codex_app_server",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "resolved-parent-token",
+    })
+
+    resolved = companion.resolve_companion_config()
+
+    assert resolved == {
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+        "model": "gpt-5.4",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "resolved-parent-token",
+    }
+
+
+def test_companion_model_call_has_no_tools_or_parent_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent import render_correction_companion as companion
+
+    calls: list[dict] = []
+
+    class Completions:
+        def create(self, **kwargs: object) -> object:
+            calls.append(dict(kwargs))
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(message=types.SimpleNamespace(content='[{"ok":true}]'))]
+            )
+
+    client = types.SimpleNamespace(
+        chat=types.SimpleNamespace(completions=Completions()),
+        close=lambda: None,
+    )
+    monkeypatch.setattr(companion, "_direct_responses_client", lambda _config: client)
+    repair = {
+        "candidate": "not-json",
+        "validation_errors": [{"code": "RENDER_JSON_INVALID", "path": "$", "message": "invalid"}],
+        "target_constraints": {
+            "correlation_id": "evt_1",
+            "chat_id": 123,
+            "authorized_telegram_message_ids": [],
+            "callback_namespace": "hello",
+        },
+    }
+
+    result = companion.run_companion_model_call(companion_config(), repair, timeout=3)
+
+    assert result == '[{"ok":true}]'
+    assert len(calls) == 1
+    assert calls[0]["model"] == "gpt-test"
+    assert calls[0]["tools"] == []
+    assert calls[0]["tool_choice"] == "none"
+    assert len(calls[0]["messages"]) == 2
+    assert json.loads(calls[0]["messages"][1]["content"]) == repair
+    assert "Envelope JSON" not in json.dumps(calls[0])
+
+
+def test_companion_timeout_kills_and_reaps_sanitized_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent import render_correction_companion as companion
+
+    observed: dict[str, object] = {}
+
+    class Process:
+        pid = 4242
+        returncode = None
+
+        def communicate(self, payload: str | None = None, timeout: float | None = None):
+            observed.setdefault("communicate", []).append((payload, timeout))
+            if len(observed["communicate"]) == 1:
+                raise companion.subprocess.TimeoutExpired("companion", timeout)
+            self.returncode = -9
+            return "", None
+
+        def kill(self) -> None:
+            observed["process_kill"] = True
+
+        def wait(self) -> int:
+            observed["waited"] = True
+            return int(self.returncode or 0)
+
+    def popen(*args: object, **kwargs: object) -> Process:
+        observed["popen_args"] = args
+        observed["popen_kwargs"] = kwargs
+        return Process()
+
+    monkeypatch.setenv("HERMES_HOME", "/private/profile")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-inherited")
+    monkeypatch.setattr(companion.subprocess, "Popen", popen)
+    monkeypatch.setattr(companion.os, "killpg", lambda pid, sig: observed.update(killpg=(pid, sig)))
+
+    with pytest.raises(companion.CorrectionCompanionTimeout):
+        companion.run_companion_subprocess(
+            companion_config(),
+            {"candidate": "bad", "validation_errors": [], "target_constraints": {}},
+            0.1,
+        )
+
+    kwargs = observed["popen_kwargs"]
+    assert kwargs["start_new_session"] is True
+    assert kwargs["close_fds"] is True
+    assert Path(kwargs["cwd"]).name.startswith("hermes-render-correction-")
+    assert "HERMES_HOME" not in kwargs["env"]
+    assert "OPENAI_API_KEY" not in kwargs["env"]
+    assert observed["killpg"] == (4242, signal.SIGKILL)
+    assert observed["waited"] is True
 
 
 @pytest.mark.asyncio
@@ -406,13 +563,16 @@ async def test_v2_reset_uses_render_candidate_contract(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_v2_correction_is_same_conversation_tool_free_once_and_durable(tmp_path: Path) -> None:
+async def test_v2_app_server_correction_uses_isolated_companion_once_and_is_durable(tmp_path: Path) -> None:
     agent = CorrectionAgent()
+    companion = FakeCorrectionCompanion()
     worker = PersistentSpecialistWorker(
         profile_root=tmp_path,
         socket_path=tmp_path / "state/runtime/worker.sock",
         agent_id="hello_world",
         agent_factory=lambda: agent,
+        correction_companion_resolver=companion_config,
+        correction_companion_runner=companion,
     )
     await worker.start()
     try:
@@ -438,11 +598,16 @@ async def test_v2_correction_is_same_conversation_tool_free_once_and_durable(tmp
     assert second_attempt["execution_state"] == "completed"
     assert second_attempt["presentation_state"] == "correction_candidate_unvalidated"
     assert second_attempt["error"]["code"] == "CORRECTION_ALREADY_ATTEMPTED"
-    assert agent.turns == 2
+    assert agent.turns == 1
+    assert agent.tool_snapshots == [agent.tool_snapshots[0]]
     assert agent.tool_snapshots[0]
-    assert agent.tool_snapshots[1] == []
-    assert agent.denied_execution is True
     assert agent.executed_tools == 0
+    assert len(companion.calls) == 1
+    config, repair, _timeout = companion.calls[0]
+    assert config == companion_config()
+    assert set(repair) == {"candidate", "validation_errors", "target_constraints"}
+    assert repair["candidate"] == original["render_candidate"]["content"]
+    assert "Envelope JSON" not in json.dumps(repair)
 
     ledger = json.loads(
         worker._ledger_path("conv_" + "1" * 64, "completed-malformed").read_text(encoding="utf-8")
@@ -454,20 +619,35 @@ async def test_v2_correction_is_same_conversation_tool_free_once_and_durable(tmp
 
 
 @pytest.mark.asyncio
-async def test_v2_correction_rejects_runtime_without_tool_free_enforcement(tmp_path: Path) -> None:
+async def test_v2_correction_capability_is_not_advertised_when_companion_is_unavailable(tmp_path: Path) -> None:
     agent = CorrectionAgent(api_mode="codex_app_server")
     worker = PersistentSpecialistWorker(
         profile_root=tmp_path,
         socket_path=tmp_path / "state/runtime/worker.sock",
         agent_id="hello_world",
         agent_factory=lambda: agent,
+        correction_companion_resolver=lambda: None,
     )
     await worker.start()
+    serve = asyncio.create_task(worker.serve_forever())
     try:
         await worker.handle_request(v2_request("completed-malformed"))
         response = await worker.handle_request(correction_request("completed-malformed"))
         replay = await worker.handle_request(correction_request("completed-malformed"))
+        reader, writer = await asyncio.open_unix_connection(str(worker.socket_path))
+        writer.write(json.dumps({
+            "protocol_version": PROTOCOL_V2,
+            "request_id": "req_hello_unavailable",
+            "operation": "hello",
+            "client": {"name": "telegram-bridge", "revision": "test"},
+        }).encode() + b"\n")
+        await writer.drain()
+        hello = json.loads(await reader.readline())
+        writer.close()
+        await writer.wait_closed()
     finally:
+        serve.cancel()
+        await asyncio.gather(serve, return_exceptions=True)
         await worker.stop()
 
     assert response == replay
@@ -475,7 +655,40 @@ async def test_v2_correction_rejects_runtime_without_tool_free_enforcement(tmp_p
     assert response["execution_state"] == "completed"
     assert response["presentation_state"] == "correction_failed"
     assert response["error"]["code"] == "TOOL_FREE_CORRECTION_UNAVAILABLE"
+    assert "tool_free_render_correction" not in hello["capabilities"]
     assert agent.turns == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_concurrent_correction_replay_waits_for_one_terminal_result(tmp_path: Path) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    companion = FakeCorrectionCompanion(entered=entered, release=release)
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=CorrectionAgent,
+        correction_companion_resolver=companion_config,
+        correction_companion_runner=companion,
+    )
+    await worker.start()
+    try:
+        await worker.handle_request(v2_request("completed-malformed"))
+        first = asyncio.create_task(worker.handle_request(correction_request("completed-malformed")))
+        assert await asyncio.to_thread(entered.wait, 1)
+        replay = asyncio.create_task(worker.handle_request(correction_request("completed-malformed")))
+        await asyncio.sleep(0.05)
+        assert replay.done() is False
+        release.set()
+        first_response, replay_response = await asyncio.gather(first, replay)
+    finally:
+        release.set()
+        await worker.stop()
+
+    assert first_response == replay_response
+    assert first_response["status"] == "completed"
+    assert len(companion.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -526,25 +739,36 @@ async def test_v2_in_flight_correction_recovers_failed_without_model_replay(tmp_
 
 
 @pytest.mark.asyncio
-async def test_v2_correction_timeout_makes_conversation_unhealthy_until_model_quiesces(tmp_path: Path) -> None:
+async def test_v2_correction_timeout_quiesces_companion_before_rejecting_prequeued_turn(tmp_path: Path) -> None:
     entered = threading.Event()
-    release = threading.Event()
-    agent = SlowCorrectionAgent(entered, release)
+    terminated = threading.Event()
+    joined = threading.Event()
+    agent = CorrectionAgent()
+
+    def timed_out_companion(_config: dict, _repair: dict, _timeout: float) -> str:
+        entered.set()
+        time.sleep(0.05)
+        terminated.set()
+        joined.set()
+        raise persistent_worker.CorrectionCompanionTimeout("companion timed out")
+
     worker = PersistentSpecialistWorker(
         profile_root=tmp_path,
         socket_path=tmp_path / "state/runtime/worker.sock",
         agent_id="hello_world",
         turn_timeout=0.01,
         agent_factory=lambda: agent,
+        correction_companion_resolver=companion_config,
+        correction_companion_runner=timed_out_companion,
     )
     await worker.start()
     try:
         await worker.handle_request(v2_request("completed-malformed"))
-        response = await worker.handle_request(correction_request("completed-malformed"))
+        correction = asyncio.create_task(worker.handle_request(correction_request("completed-malformed")))
         assert await asyncio.to_thread(entered.wait, 1)
-        later = await worker.handle_request(v2_request("later-domain-turn"))
+        queued = asyncio.create_task(worker.handle_request(v2_request("queued-before-timeout")))
+        response, later = await asyncio.gather(correction, queued)
     finally:
-        release.set()
         await worker.stop()
 
     assert response["status"] == "failed"
@@ -552,7 +776,9 @@ async def test_v2_correction_timeout_makes_conversation_unhealthy_until_model_qu
     assert response["presentation_state"] == "correction_failed"
     assert response["error"]["code"] == "CORRECTION_TIMEOUT"
     assert later["error"]["code"] == "CONVERSATION_UNHEALTHY"
-    assert agent.turns == 2
+    assert later["execution_state"] == "not_started"
+    assert terminated.is_set() and joined.is_set()
+    assert agent.turns == 1
 
 
 @pytest.mark.asyncio
@@ -865,6 +1091,60 @@ async def test_socket_invalid_protocol_response_and_log_have_terminal_contract(t
     assert response["error"]["code"] == "PROTOCOL_ERROR"
     assert_complete_timing(response)
     assert_terminal_log(tmp_path, response, "", "protocol_failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.update({"unexpected": True}),
+        lambda value: value.update({"conversation_id": "not-a-conversation-id"}),
+        lambda value: value.update({"deadline": "not-a-date"}),
+    ],
+)
+async def test_socket_rejects_closed_or_malformed_v2_requests_with_stable_error(
+    tmp_path: Path,
+    mutate,
+) -> None:
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "w.sock",
+        agent_id="hello_world",
+        agent_factory=FakeAgent,
+        correction_companion_resolver=lambda: None,
+    )
+    await worker.start()
+    serve = asyncio.create_task(worker.serve_forever())
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(worker.socket_path))
+        hello = {
+            "protocol_version": PROTOCOL_V2,
+            "request_id": "req_hello_strict",
+            "operation": "hello",
+            "client": {"name": "telegram-bridge", "revision": "test"},
+        }
+        writer.write(json.dumps(hello).encode() + b"\n")
+        await writer.drain()
+        assert json.loads(await reader.readline())["status"] == "ready"
+        invalid = v2_request("strict_v2")
+        mutate(invalid)
+        writer.write(json.dumps(invalid).encode() + b"\n")
+        await writer.drain()
+        response = json.loads(await reader.readline())
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        serve.cancel()
+        await asyncio.gather(serve, return_exceptions=True)
+        await worker.stop()
+
+    assert response["protocol_version"] == PROTOCOL_V2
+    assert response["error"] == {
+        "code": "PROTOCOL_ERROR",
+        "message": "invalid protocol request",
+        "retryable": False,
+    }
+    assert worker._agent is None
 
 
 @pytest.mark.asyncio

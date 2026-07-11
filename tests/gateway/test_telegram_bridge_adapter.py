@@ -21,6 +21,10 @@ def _make_adapter():
     return adapter
 
 
+class DeliveryOutcomeUnknown(RuntimeError):
+    delivery_outcome_unknown = True
+
+
 def test_telegram_menu_commands_uses_bridge_registry_when_installed(tmp_path):
     adapter = _make_adapter()
     profile_root = tmp_path / "profiles" / "telegram-bridge"
@@ -250,3 +254,93 @@ async def test_bridge_persistent_worker_lifecycle(tmp_path, monkeypatch):
 
     assert process.terminated is True
     assert adapter._telegram_bridge_persistent_workers == {}
+
+
+@pytest.mark.asyncio
+async def test_bridge_command_does_not_repair_or_send_after_ambiguous_delivery(tmp_path):
+    adapter = _make_adapter()
+    result = SimpleNamespace(
+        handled=True,
+        payloads=[{"action": "send", "message_id": "msg_command"}],
+        bridge_config={},
+        envelope={"event_id": "evt_command"},
+        reason="specialist",
+    )
+    dispatcher = MagicMock()
+    dispatcher.can_handle_command.return_value = True
+    dispatcher.dispatch_command.return_value = result
+    adapter._load_telegram_bridge_dispatcher = MagicMock(return_value=dispatcher)
+    adapter._telegram_bridge_paths = MagicMock(return_value=(tmp_path / "bridge", tmp_path))
+    adapter._render_telegram_bridge_payloads = AsyncMock(side_effect=DeliveryOutcomeUnknown())
+    adapter._rerender_telegram_bridge_with_repair = AsyncMock()
+    adapter.send = AsyncMock()
+    msg = SimpleNamespace(
+        text="/hello",
+        chat_id=123,
+        message_id=456,
+        from_user=SimpleNamespace(id=789),
+        chat=SimpleNamespace(id=123),
+    )
+
+    assert await adapter._maybe_handle_telegram_bridge_command(SimpleNamespace(update_id=1), msg)
+    adapter._rerender_telegram_bridge_with_repair.assert_not_awaited()
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bridge_text_does_not_repair_or_send_after_ambiguous_delivery(tmp_path):
+    adapter = _make_adapter()
+    result = SimpleNamespace(
+        handled=True,
+        payloads=[{"action": "send", "message_id": "msg_text"}],
+        bridge_config={},
+        envelope={"event_id": "evt_text"},
+        reason="specialist_text",
+    )
+    dispatcher = MagicMock(dispatch_text=MagicMock(return_value=result))
+    adapter._load_telegram_bridge_dispatcher = MagicMock(return_value=dispatcher)
+    adapter._telegram_bridge_paths = MagicMock(return_value=(tmp_path / "bridge", tmp_path))
+    adapter._clean_bot_trigger_text = MagicMock(return_value="hello")
+    adapter._render_telegram_bridge_payloads = AsyncMock(side_effect=DeliveryOutcomeUnknown())
+    adapter._rerender_telegram_bridge_with_repair = AsyncMock()
+    adapter.send = AsyncMock()
+    msg = SimpleNamespace(
+        text="hello",
+        chat_id=123,
+        message_id=456,
+        from_user=SimpleNamespace(id=789),
+        chat=SimpleNamespace(id=123),
+        reply_to_message=None,
+    )
+
+    assert await adapter._maybe_handle_telegram_bridge_text(SimpleNamespace(update_id=2), msg)
+    adapter._rerender_telegram_bridge_with_repair.assert_not_awaited()
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bridge_callback_does_not_repair_or_answer_after_ambiguous_delivery(tmp_path):
+    adapter = _make_adapter()
+    result = SimpleNamespace(
+        handled=True,
+        payloads=[{"action": "answer_callback", "message_id": "msg_callback"}],
+        bridge_config={},
+        envelope={"event_id": "evt_callback"},
+        reason="specialist_callback",
+    )
+    dispatcher = MagicMock(dispatch_callback=MagicMock(return_value=result))
+    adapter._load_telegram_bridge_dispatcher = MagicMock(return_value=dispatcher)
+    adapter._telegram_bridge_paths = MagicMock(return_value=(tmp_path / "bridge", tmp_path))
+    adapter._render_telegram_bridge_payloads = AsyncMock(side_effect=DeliveryOutcomeUnknown())
+    adapter._rerender_telegram_bridge_with_repair = AsyncMock()
+    query = SimpleNamespace(
+        id="cbq_1",
+        data="hello.action",
+        from_user=SimpleNamespace(id=789),
+        message=SimpleNamespace(chat_id=123, message_id=456, text="button"),
+        answer=AsyncMock(),
+    )
+
+    assert await adapter._maybe_handle_telegram_bridge_callback(SimpleNamespace(update_id=3), query)
+    adapter._rerender_telegram_bridge_with_repair.assert_not_awaited()
+    query.answer.assert_not_awaited()
