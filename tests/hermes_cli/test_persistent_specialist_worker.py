@@ -455,6 +455,44 @@ def test_companion_timeout_kills_and_reaps_sanitized_subprocess(
     assert observed["waited"] is True
 
 
+def test_companion_timeout_falls_back_to_child_kill_when_process_group_kill_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent import render_correction_companion as companion
+
+    killed = threading.Event()
+    waited = threading.Event()
+
+    class Process:
+        pid = 4243
+        returncode = None
+
+        def communicate(self, _payload: str | None = None, timeout: float | None = None):
+            if not killed.is_set():
+                raise companion.subprocess.TimeoutExpired("companion", timeout)
+            self.returncode = -9
+            return "", None
+
+        def kill(self) -> None:
+            killed.set()
+
+        def wait(self) -> int:
+            waited.set()
+            return int(self.returncode or 0)
+
+    monkeypatch.setattr(companion.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setattr(companion.os, "killpg", lambda _pid, _sig: (_ for _ in ()).throw(PermissionError()))
+
+    with pytest.raises(companion.CorrectionCompanionTimeout):
+        companion.run_companion_subprocess(
+            companion_config(),
+            {"candidate": "bad", "validation_errors": [], "target_constraints": {}},
+            0.1,
+        )
+
+    assert killed.is_set() and waited.is_set()
+
+
 @pytest.mark.asyncio
 async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> None:
     agents: list[FakeAgent] = []
@@ -1095,16 +1133,20 @@ async def test_socket_invalid_protocol_response_and_log_have_terminal_contract(t
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mutate",
+    ("mutate", "expected_request_id", "expected_operation"),
     [
-        lambda value: value.update({"unexpected": True}),
-        lambda value: value.update({"conversation_id": "not-a-conversation-id"}),
-        lambda value: value.update({"deadline": "not-a-date"}),
+        (lambda value: value.update({"unexpected": True}), "req_strict_v2", "turn"),
+        (lambda value: value.update({"conversation_id": "not-a-conversation-id"}), "req_strict_v2", "turn"),
+        (lambda value: value.update({"deadline": "not-a-date"}), "req_strict_v2", "turn"),
+        (lambda value: value.update({"request_id": "malformed"}), "req_error", "turn"),
+        (lambda value: value.update({"operation": "unsupported"}), "req_strict_v2", "health"),
     ],
 )
 async def test_socket_rejects_closed_or_malformed_v2_requests_with_stable_error(
     tmp_path: Path,
     mutate,
+    expected_request_id: str,
+    expected_operation: str,
 ) -> None:
     worker = PersistentSpecialistWorker(
         profile_root=tmp_path,
@@ -1139,6 +1181,8 @@ async def test_socket_rejects_closed_or_malformed_v2_requests_with_stable_error(
         await worker.stop()
 
     assert response["protocol_version"] == PROTOCOL_V2
+    assert response["request_id"] == expected_request_id
+    assert response["operation"] == expected_operation
     assert response["error"] == {
         "code": "PROTOCOL_ERROR",
         "message": "invalid protocol request",

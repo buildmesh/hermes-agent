@@ -161,7 +161,7 @@ def run_companion_subprocess(
         except subprocess.TimeoutExpired as exc:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except OSError:
                 process.kill()
             process.communicate()
             process.wait()

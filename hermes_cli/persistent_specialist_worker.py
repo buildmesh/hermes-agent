@@ -671,6 +671,10 @@ class PersistentSpecialistWorker:
         protocol_version: str = PROTOCOL,
     ) -> dict[str, Any]:
         started = time.monotonic()
+        if not re.fullmatch(r"req_[A-Za-z0-9._:-]{1,200}", request_id):
+            request_id = "req_error"
+        if operation not in {"hello", "turn", "reset", "correct_render", "health", "shutdown"}:
+            operation = "health"
         response = {
             "protocol_version": protocol_version if protocol_version in {PROTOCOL, PROTOCOL_V2} else PROTOCOL,
             "request_id": request_id,
