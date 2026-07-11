@@ -10,9 +10,11 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.config import load_config
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -51,45 +53,116 @@ def _direct_runtime_config(runtime: dict[str, Any], model: str) -> dict[str, str
     return result
 
 
-def resolve_companion_descriptor() -> dict[str, str] | None:
-    """Probe app-server correction locally and return only non-secret capability data."""
-    config = load_config()
-    model = _configured_model(config)
-    if not model:
-        return None
+def _validated_profile_root(value: Any, expected: Path | None = None) -> Path:
+    if not isinstance(value, (str, Path)) or not str(value).strip():
+        raise CorrectionCompanionUnavailable("render correction profile root is missing")
+    path = Path(value)
+    if not path.is_absolute():
+        raise CorrectionCompanionUnavailable("render correction profile root must be absolute")
     try:
-        runtime = resolve_runtime_provider(target_model=model)
-    except Exception:
-        return None
-    direct_config = _direct_runtime_config(runtime, model)
-    if direct_config is None:
-        return None
-    try:
-        from agent.auxiliary_client import CodexAuxiliaryClient  # noqa: F401
-        client = _direct_responses_client(direct_config)
-        client.close()
-    except Exception:
-        return None
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise CorrectionCompanionUnavailable("render correction profile root is unavailable") from exc
+    if resolved != path or not resolved.is_dir():
+        raise CorrectionCompanionUnavailable("render correction profile root is not canonical")
+    if expected is not None and resolved != expected.resolve(strict=True):
+        raise CorrectionCompanionUnavailable("render correction profile root does not match worker profile")
+    return resolved
+
+
+def validate_companion_descriptor(
+    descriptor: dict[str, str],
+    expected_profile_root: Path | None = None,
+) -> dict[str, str]:
+    if not isinstance(descriptor, dict) or set(descriptor) != {
+        "provider", "api_mode", "model", "profile_root",
+    }:
+        raise CorrectionCompanionUnavailable("invalid render correction companion descriptor")
+    provider = str(descriptor.get("provider") or "").strip()
+    model = str(descriptor.get("model") or "").strip()
+    if provider not in {"openai", "openai-codex"} or descriptor.get("api_mode") != "codex_responses" or not model:
+        raise CorrectionCompanionUnavailable("invalid render correction companion descriptor")
+    profile_root = _validated_profile_root(descriptor.get("profile_root"), expected_profile_root)
     return {
+        "provider": provider,
+        "api_mode": "codex_responses",
+        "model": model,
+        "profile_root": str(profile_root),
+    }
+
+
+@contextmanager
+def _profile_scope(profile_root: Path):
+    token = set_hermes_home_override(profile_root)
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
+
+
+def resolve_companion_descriptor(profile_root: Path) -> dict[str, str] | None:
+    """Probe app-server correction locally and return only non-secret capability data."""
+    root = _validated_profile_root(profile_root)
+    with _profile_scope(root):
+        config = load_config()
+        model = _configured_model(config)
+        if not model:
+            return None
+        try:
+            runtime = resolve_runtime_provider(target_model=model)
+        except Exception:
+            return None
+        direct_config = _direct_runtime_config(runtime, model)
+        if direct_config is None:
+            return None
+        try:
+            from agent.auxiliary_client import CodexAuxiliaryClient  # noqa: F401
+            client = _direct_responses_client(direct_config)
+            client.close()
+        except Exception:
+            return None
+    return validate_companion_descriptor({
         "provider": direct_config["provider"],
         "api_mode": direct_config["api_mode"],
         "model": direct_config["model"],
-    }
+        "profile_root": str(root),
+    }, root)
 
 
 def resolve_companion_credentials(descriptor: dict[str, str]) -> dict[str, str]:
     """Resolve and refresh the bearer immediately before one correction."""
-    model = str(descriptor.get("model") or "").strip()
-    if descriptor.get("api_mode") != "codex_responses" or not model:
-        raise CorrectionCompanionUnavailable("invalid render correction companion descriptor")
-    try:
-        runtime = resolve_runtime_provider(target_model=model)
-    except Exception as exc:
-        raise CorrectionCompanionUnavailable("render correction credentials are unavailable") from exc
-    direct_config = _direct_runtime_config(runtime, model)
-    if direct_config is None or direct_config["provider"] != descriptor.get("provider"):
-        raise CorrectionCompanionUnavailable("render correction runtime is no longer available")
+    descriptor = validate_companion_descriptor(descriptor)
+    model = descriptor["model"]
+    with _profile_scope(Path(descriptor["profile_root"])):
+        if _configured_model(load_config()) != model:
+            raise CorrectionCompanionUnavailable("render correction model no longer matches specialist profile")
+        try:
+            runtime = resolve_runtime_provider(target_model=model)
+        except Exception as exc:
+            raise CorrectionCompanionUnavailable("render correction credentials are unavailable") from exc
+        direct_config = _direct_runtime_config(runtime, model)
+    if direct_config is None or direct_config["provider"] != descriptor["provider"]:
+        raise CorrectionCompanionUnavailable("render correction runtime is no longer bound to configured provider")
     return direct_config
+
+
+def _validated_model_config(config: Any, descriptor: dict[str, str] | None = None) -> dict[str, str]:
+    if not isinstance(config, dict) or set(config) != {
+        "provider", "api_mode", "model", "base_url", "api_key",
+    }:
+        raise CorrectionCompanionUnavailable("invalid render correction model config")
+    result = {key: str(config.get(key) or "").strip() for key in config}
+    if (
+        result["provider"] not in {"openai", "openai-codex"}
+        or result["api_mode"] != "codex_responses"
+        or not all(result[key] for key in ("model", "base_url", "api_key"))
+    ):
+        raise CorrectionCompanionUnavailable("invalid render correction model config")
+    if descriptor is not None and (
+        result["provider"] != descriptor["provider"] or result["model"] != descriptor["model"]
+    ):
+        raise CorrectionCompanionUnavailable("render correction model config changed provider binding")
+    return result
 
 
 def _direct_responses_client(config: dict[str, str]) -> Any:
@@ -163,17 +236,51 @@ def _sanitized_environment() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name in allowed}
 
 
+def resolve_companion_credentials_subprocess(descriptor: dict[str, str]) -> dict[str, str]:
+    """Resolve and durably refresh profile credentials without a hard timeout."""
+    descriptor = validate_companion_descriptor(descriptor)
+    profile_root = Path(descriptor["profile_root"])
+    payload = json.dumps({"descriptor": descriptor})
+    with tempfile.TemporaryDirectory(prefix="hermes-render-credentials-") as directory:
+        os.chmod(directory, 0o700)
+        environment = _sanitized_environment()
+        environment["HERMES_HOME"] = str(profile_root)
+        process = subprocess.Popen(
+            [sys.executable, "-m", "agent.render_correction_companion", "--credentials-child"],
+            cwd=directory,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            close_fds=True,
+        )
+        stdout, _ = process.communicate(payload)
+        process.wait()
+    if process.returncode != 0:
+        raise CorrectionCompanionUnavailable("render correction credential bootstrap failed")
+    try:
+        response = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise CorrectionCompanionUnavailable("render correction credential bootstrap returned invalid output") from exc
+    config = response.get("config") if isinstance(response, dict) else None
+    if not isinstance(response, dict) or response.get("status") != "completed":
+        raise CorrectionCompanionUnavailable("render correction credential bootstrap did not complete")
+    return _validated_model_config(config, descriptor)
+
+
 def run_companion_subprocess(
-    descriptor: dict[str, str],
+    config: dict[str, str],
     repair: dict[str, Any],
     timeout: float,
 ) -> str:
-    """Run credential refresh and one correction in a killable child."""
+    """Run one stateless model correction in a killable child."""
+    config = _validated_model_config(config)
     if timeout <= 0:
         raise CorrectionCompanionTimeout("render correction companion exceeded its hard timeout")
     monotonic_deadline = time.monotonic() + timeout
     payload = json.dumps({
-        "descriptor": descriptor,
+        "config": config,
         "repair": repair,
         "deadline": time.time() + timeout,
     })
@@ -182,7 +289,7 @@ def run_companion_subprocess(
         if time.monotonic() >= monotonic_deadline:
             raise CorrectionCompanionTimeout("render correction companion exceeded its hard timeout")
         process = subprocess.Popen(
-            [sys.executable, "-m", "agent.render_correction_companion", "--child"],
+            [sys.executable, "-m", "agent.render_correction_companion", "--model-child"],
             cwd=directory,
             env=_sanitized_environment(),
             stdin=subprocess.PIPE,
@@ -234,17 +341,29 @@ def run_companion_subprocess(
     return candidate
 
 
-def _child_main() -> int:
+def _credentials_child_main() -> int:
+    try:
+        request = json.load(sys.stdin)
+        descriptor = validate_companion_descriptor(request["descriptor"])
+        environment_root = _validated_profile_root(os.environ.get("HERMES_HOME"))
+        if Path(descriptor["profile_root"]) != environment_root:
+            raise CorrectionCompanionUnavailable("credential bootstrap profile environment mismatch")
+        config = resolve_companion_credentials(descriptor)
+        json.dump({"status": "completed", "config": config}, sys.stdout)
+        sys.stdout.flush()
+        return 0
+    except Exception:
+        return 1
+
+
+def _model_child_main() -> int:
     try:
         request = json.load(sys.stdin)
         deadline = float(request["deadline"])
         remaining = deadline - time.time()
         if remaining <= 0:
-            raise CorrectionCompanionTimeout("render correction deadline expired before credential refresh")
-        config = resolve_companion_credentials(request["descriptor"])
-        remaining = deadline - time.time()
-        if remaining <= 0:
             raise CorrectionCompanionTimeout("render correction deadline expired before model launch")
+        config = _validated_model_config(request["config"])
         candidate = run_companion_model_call(
             config,
             request["repair"],
@@ -261,11 +380,11 @@ def _child_main() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--child", action="store_true")
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--credentials-child", action="store_true")
+    modes.add_argument("--model-child", action="store_true")
     args = parser.parse_args(argv)
-    if not args.child:
-        parser.error("the render correction companion is internal-only")
-    return _child_main()
+    return _credentials_child_main() if args.credentials_child else _model_child_main()
 
 
 if __name__ == "__main__":

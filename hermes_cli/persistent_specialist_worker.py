@@ -23,7 +23,9 @@ from agent.render_correction_companion import (
     CorrectionCompanionTimeout,
     CorrectionCompanionUnavailable,
     resolve_companion_descriptor,
+    resolve_companion_credentials_subprocess,
     run_companion_subprocess,
+    validate_companion_descriptor,
 )
 
 
@@ -35,6 +37,7 @@ LEDGER_RETENTION = timedelta(days=30)
 TERMINAL_STATES = {"completed", "failed", "outcome_unknown"}
 TIMING_PHASES = ("queue", "initialization", "retirement", "model_and_tools", "render_preparation")
 MODEL_QUIESCE_TIMEOUT_SECONDS = 5.0
+CORRECTION_CREDENTIAL_PREFLIGHT_SECONDS = 5.0
 RFC3339_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -312,7 +315,8 @@ class PersistentSpecialistWorker:
         queue_limit: int = 4,
         idle_conversation_seconds: float = 21600,
         agent_factory: Callable[[], Any] | None = None,
-        correction_companion_resolver: Callable[[], dict[str, str] | None] | None = None,
+        correction_companion_resolver: Callable[[Path], dict[str, str] | None] | None = None,
+        correction_companion_credentials_resolver: Callable[[dict[str, str]], dict[str, str]] | None = None,
         correction_companion_runner: Callable[[dict[str, str], dict[str, Any], float], str] | None = None,
     ) -> None:
         self.profile_root = profile_root.resolve()
@@ -325,9 +329,16 @@ class PersistentSpecialistWorker:
         self.agent_factory = agent_factory or self._default_agent_factory
         resolver = correction_companion_resolver or resolve_companion_descriptor
         try:
-            self._correction_companion_descriptor = resolver()
+            descriptor = resolver(self.profile_root)
+            self._correction_companion_descriptor = (
+                validate_companion_descriptor(descriptor, self.profile_root)
+                if descriptor is not None else None
+            )
         except Exception:
             self._correction_companion_descriptor = None
+        self._correction_companion_credentials_resolver = (
+            correction_companion_credentials_resolver or resolve_companion_credentials_subprocess
+        )
         self._correction_companion_runner = correction_companion_runner or run_companion_subprocess
         self.runtime_instance_id = f"runtime_{uuid.uuid4().hex}"
         self.conversation_instance_id = f"thread_{uuid.uuid4().hex}"
@@ -1112,80 +1123,86 @@ class PersistentSpecialistWorker:
                 return response
 
         started = request["_started_at"]
-        remaining = (correction_deadline - _utcnow()).total_seconds()
+        conversation_lock_acquired = False
         try:
+            if self._correction_companion_descriptor is None:
+                raise CorrectionCompanionUnavailable(
+                    "isolated render correction companion is not configured"
+                )
+            repair = {
+                "candidate": record["render_candidate"],
+                "validation_errors": request["validation_errors"],
+                "target_constraints": request["target_constraints"],
+            }
+            remaining = (correction_deadline - _utcnow()).total_seconds()
+            if remaining < CORRECTION_CREDENTIAL_PREFLIGHT_SECONDS:
+                raise asyncio.TimeoutError
+
+            # OAuth refresh may rotate a single-use token remotely. Once admitted,
+            # let it persist and quiesce even if the correction deadline elapses.
+            correction_config = await asyncio.to_thread(
+                self._correction_companion_credentials_resolver,
+                self._correction_companion_descriptor,
+            )
+            remaining = (correction_deadline - _utcnow()).total_seconds()
             if remaining <= 0:
                 raise asyncio.TimeoutError
+
             await asyncio.wait_for(self._conversation_lock.acquire(), timeout=remaining)
-        except asyncio.TimeoutError:
+            conversation_lock_acquired = True
+            remaining = (correction_deadline - _utcnow()).total_seconds()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            candidate = await asyncio.to_thread(
+                self._correction_companion_runner,
+                correction_config,
+                repair,
+                remaining,
+            )
+            response = self._base_response(
+                request,
+                status="completed",
+                execution_state="completed",
+                presentation_state="correction_candidate_unvalidated",
+                event_id=event_id,
+                correction_attempt_id=attempt_id,
+                conversation_instance_id=self.conversation_instance_id,
+                render_candidate=_bounded_candidate(candidate),
+                timing_ms=_timing_ms(started, model_and_tools=int((time.monotonic() - started) * 1000)),
+            )
+            record["corrected_candidate"] = candidate
+            record["corrected_candidate_sha256"] = _candidate_hash(candidate)
+            record["presentation_state"] = "correction_candidate_unvalidated"
+        except CorrectionCompanionTimeout:
+            self._unhealthy = True
+            self.last_error_code = "CORRECTION_TIMEOUT"
             response = self._correction_failure(
-                request, "CORRECTION_DEADLINE_EXPIRED", "correction did not start before its deadline",
+                request,
+                "CORRECTION_TIMEOUT",
+                "the tool-free correction model turn did not stop before its deadline",
                 "correction_failed",
             )
             record["presentation_state"] = "correction_failed"
-        else:
-            try:
-                if self._correction_companion_descriptor is None:
-                    raise CorrectionCompanionUnavailable(
-                        "isolated render correction companion is not configured"
-                    )
-                repair = {
-                    "candidate": record["render_candidate"],
-                    "validation_errors": request["validation_errors"],
-                    "target_constraints": request["target_constraints"],
-                }
-                remaining = (correction_deadline - _utcnow()).total_seconds()
-                if remaining <= 0:
-                    raise asyncio.TimeoutError
-                candidate = await asyncio.to_thread(
-                    self._correction_companion_runner,
-                    self._correction_companion_descriptor,
-                    repair,
-                    remaining,
-                )
-                response = self._base_response(
-                    request,
-                    status="completed",
-                    execution_state="completed",
-                    presentation_state="correction_candidate_unvalidated",
-                    event_id=event_id,
-                    correction_attempt_id=attempt_id,
-                    conversation_instance_id=self.conversation_instance_id,
-                    render_candidate=_bounded_candidate(candidate),
-                    timing_ms=_timing_ms(started, model_and_tools=int((time.monotonic() - started) * 1000)),
-                )
-                record["corrected_candidate"] = candidate
-                record["corrected_candidate_sha256"] = _candidate_hash(candidate)
-                record["presentation_state"] = "correction_candidate_unvalidated"
-            except CorrectionCompanionTimeout:
-                self._unhealthy = True
-                self.last_error_code = "CORRECTION_TIMEOUT"
-                response = self._correction_failure(
-                    request,
-                    "CORRECTION_TIMEOUT",
-                    "the tool-free correction model turn did not stop before its deadline",
-                    "correction_failed",
-                )
-                record["presentation_state"] = "correction_failed"
-            except asyncio.TimeoutError:
-                response = self._correction_failure(
-                    request,
-                    "CORRECTION_DEADLINE_EXPIRED",
-                    "correction did not start before its deadline",
-                    "correction_failed",
-                )
-                record["presentation_state"] = "correction_failed"
-            except CorrectionCompanionUnavailable as exc:
-                response = self._correction_failure(
-                    request, "TOOL_FREE_CORRECTION_UNAVAILABLE", str(exc), "correction_failed"
-                )
-                record["presentation_state"] = "correction_failed"
-            except Exception as exc:
-                response = self._correction_failure(
-                    request, "CORRECTION_FAILED", str(exc), "correction_failed"
-                )
-                record["presentation_state"] = "correction_failed"
-            finally:
+        except asyncio.TimeoutError:
+            response = self._correction_failure(
+                request,
+                "CORRECTION_DEADLINE_EXPIRED",
+                "correction did not start before its deadline",
+                "correction_failed",
+            )
+            record["presentation_state"] = "correction_failed"
+        except CorrectionCompanionUnavailable as exc:
+            response = self._correction_failure(
+                request, "TOOL_FREE_CORRECTION_UNAVAILABLE", str(exc), "correction_failed"
+            )
+            record["presentation_state"] = "correction_failed"
+        except Exception as exc:
+            response = self._correction_failure(
+                request, "CORRECTION_FAILED", str(exc), "correction_failed"
+            )
+            record["presentation_state"] = "correction_failed"
+        finally:
+            if conversation_lock_acquired:
                 self._conversation_lock.release()
 
         record["correction_response"] = response
