@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import os
 import signal
@@ -7,6 +8,7 @@ import sys
 import threading
 import time
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import jsonschema
@@ -430,6 +432,56 @@ def test_companion_model_call_has_no_tools_or_parent_context(monkeypatch: pytest
     assert "Envelope JSON" not in json.dumps(calls[0])
 
 
+def test_companion_child_does_not_spawn_model_after_credential_refresh_exhausts_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent import render_correction_companion as companion
+
+    resolver_entered = threading.Event()
+    model_calls: list[float] = []
+    request = {
+        "descriptor": companion_descriptor(),
+        "repair": {"candidate": "bad", "validation_errors": [], "target_constraints": {}},
+        "deadline": time.time() + 0.01,
+    }
+
+    def slow_resolver(_descriptor: dict[str, str]) -> dict[str, str]:
+        resolver_entered.set()
+        time.sleep(0.03)
+        return companion_config("refreshed-token")
+
+    def model_call(_config: dict, _repair: dict, *, timeout: float) -> str:
+        model_calls.append(timeout)
+        return "[]"
+
+    monkeypatch.setattr(companion.sys, "stdin", io.StringIO(json.dumps(request)))
+    monkeypatch.setattr(companion.sys, "stdout", io.StringIO())
+    monkeypatch.setattr(companion, "resolve_companion_credentials", slow_resolver)
+    monkeypatch.setattr(companion, "run_companion_model_call", model_call)
+
+    assert companion._child_main() == 124
+    assert resolver_entered.is_set()
+    assert model_calls == []
+
+
+def test_companion_does_not_spawn_subprocess_without_remaining_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent import render_correction_companion as companion
+
+    spawned: list[bool] = []
+    monkeypatch.setattr(companion.subprocess, "Popen", lambda *_args, **_kwargs: spawned.append(True))
+
+    with pytest.raises(companion.CorrectionCompanionTimeout):
+        companion.run_companion_subprocess(
+            companion_descriptor(),
+            {"candidate": "bad", "validation_errors": [], "target_constraints": {}},
+            0,
+        )
+
+    assert spawned == []
+
+
 def test_companion_timeout_kills_and_reaps_sanitized_subprocess(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -467,7 +519,7 @@ def test_companion_timeout_kills_and_reaps_sanitized_subprocess(
 
     with pytest.raises(companion.CorrectionCompanionTimeout):
         companion.run_companion_subprocess(
-            companion_config(),
+            companion_descriptor(),
             {"candidate": "bad", "validation_errors": [], "target_constraints": {}},
             0.1,
         )
@@ -512,12 +564,55 @@ def test_companion_timeout_falls_back_to_child_kill_when_process_group_kill_fail
 
     with pytest.raises(companion.CorrectionCompanionTimeout):
         companion.run_companion_subprocess(
-            companion_config(),
+            companion_descriptor(),
             {"candidate": "bad", "validation_errors": [], "target_constraints": {}},
             0.1,
         )
 
     assert killed.is_set() and waited.is_set()
+
+
+def test_companion_timeout_suppresses_kill_races_and_always_reaps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent import render_correction_companion as companion
+
+    drained = threading.Event()
+    waited = threading.Event()
+    direct_kill_attempted = threading.Event()
+
+    class Process:
+        pid = 4244
+        returncode = None
+
+        def communicate(self, _payload: str | None = None, timeout: float | None = None):
+            if timeout is not None:
+                raise companion.subprocess.TimeoutExpired("companion", timeout)
+            drained.set()
+            self.returncode = -9
+            return "", None
+
+        def kill(self) -> None:
+            direct_kill_attempted.set()
+            raise ProcessLookupError()
+
+        def wait(self) -> int:
+            waited.set()
+            return int(self.returncode or 0)
+
+    monkeypatch.setattr(companion.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setattr(companion.os, "killpg", lambda _pid, _sig: (_ for _ in ()).throw(PermissionError()))
+
+    with pytest.raises(companion.CorrectionCompanionTimeout, match="hard timeout"):
+        companion.run_companion_subprocess(
+            companion_descriptor(),
+            {"candidate": "bad", "validation_errors": [], "target_constraints": {}},
+            0.1,
+        )
+
+    assert direct_kill_attempted.is_set()
+    assert drained.is_set()
+    assert waited.is_set()
 
 
 @pytest.mark.asyncio
@@ -637,7 +732,6 @@ async def test_v2_app_server_correction_uses_isolated_companion_once_and_is_dura
         agent_id="hello_world",
         agent_factory=lambda: agent,
         correction_companion_resolver=companion_descriptor,
-        correction_companion_credentials_resolver=lambda _descriptor: companion_config("rotated-token"),
         correction_companion_runner=companion,
     )
     await worker.start()
@@ -669,8 +763,8 @@ async def test_v2_app_server_correction_uses_isolated_companion_once_and_is_dura
     assert agent.tool_snapshots[0]
     assert agent.executed_tools == 0
     assert len(companion.calls) == 1
-    config, repair, _timeout = companion.calls[0]
-    assert config == companion_config("rotated-token")
+    descriptor, repair, _timeout = companion.calls[0]
+    assert descriptor == companion_descriptor()
     assert set(repair) == {"candidate", "validation_errors", "target_constraints"}
     assert repair["candidate"] == original["render_candidate"]["content"]
     assert "Envelope JSON" not in json.dumps(repair)
@@ -737,7 +831,6 @@ async def test_v2_concurrent_correction_replay_waits_for_one_terminal_result(tmp
         agent_id="hello_world",
         agent_factory=CorrectionAgent,
         correction_companion_resolver=companion_descriptor,
-        correction_companion_credentials_resolver=lambda _descriptor: companion_config(),
         correction_companion_runner=companion,
     )
     await worker.start()
@@ -757,6 +850,41 @@ async def test_v2_concurrent_correction_replay_waits_for_one_terminal_result(tmp
     assert first_response == replay_response
     assert first_response["status"] == "completed"
     assert len(companion.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_correction_does_not_spawn_companion_after_lock_wait_exhausts_deadline(
+    tmp_path: Path,
+) -> None:
+    companion = FakeCorrectionCompanion()
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=CorrectionAgent,
+        correction_companion_resolver=companion_descriptor,
+        correction_companion_runner=companion,
+    )
+    await worker.start()
+    try:
+        await worker.handle_request(v2_request("completed-malformed"))
+        await worker._conversation_lock.acquire()
+        correction = correction_request("completed-malformed")
+        correction["deadline"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=0.03)
+        ).isoformat()
+        pending = asyncio.create_task(worker.handle_request(correction))
+        await asyncio.sleep(0.05)
+        worker._conversation_lock.release()
+        response = await pending
+    finally:
+        if worker._conversation_lock.locked():
+            worker._conversation_lock.release()
+        await worker.stop()
+
+    assert response["status"] == "failed"
+    assert response["error"]["code"] == "CORRECTION_DEADLINE_EXPIRED"
+    assert companion.calls == []
 
 
 @pytest.mark.asyncio
@@ -813,12 +941,14 @@ async def test_v2_correction_timeout_quiesces_companion_before_rejecting_prequeu
     joined = threading.Event()
     agent = CorrectionAgent()
 
-    def timed_out_companion(_config: dict, _repair: dict, _timeout: float) -> str:
+    model_spawned = threading.Event()
+
+    def timed_out_companion(_descriptor: dict, _repair: dict, _timeout: float) -> str:
         entered.set()
         time.sleep(0.05)
         terminated.set()
         joined.set()
-        raise persistent_worker.CorrectionCompanionTimeout("companion timed out")
+        raise persistent_worker.CorrectionCompanionTimeout("credential refresh timed out")
 
     worker = PersistentSpecialistWorker(
         profile_root=tmp_path,
@@ -827,7 +957,6 @@ async def test_v2_correction_timeout_quiesces_companion_before_rejecting_prequeu
         turn_timeout=0.01,
         agent_factory=lambda: agent,
         correction_companion_resolver=companion_descriptor,
-        correction_companion_credentials_resolver=lambda _descriptor: companion_config(),
         correction_companion_runner=timed_out_companion,
     )
     await worker.start()
@@ -847,6 +976,7 @@ async def test_v2_correction_timeout_quiesces_companion_before_rejecting_prequeu
     assert later["error"]["code"] == "CONVERSATION_UNHEALTHY"
     assert later["execution_state"] == "not_started"
     assert terminated.is_set() and joined.is_set()
+    assert model_spawned.is_set() is False
     assert agent.turns == 1
 
 

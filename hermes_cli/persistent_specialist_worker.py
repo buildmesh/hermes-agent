@@ -22,7 +22,6 @@ from typing import Any, Callable
 from agent.render_correction_companion import (
     CorrectionCompanionTimeout,
     CorrectionCompanionUnavailable,
-    resolve_companion_credentials,
     resolve_companion_descriptor,
     run_companion_subprocess,
 )
@@ -314,7 +313,6 @@ class PersistentSpecialistWorker:
         idle_conversation_seconds: float = 21600,
         agent_factory: Callable[[], Any] | None = None,
         correction_companion_resolver: Callable[[], dict[str, str] | None] | None = None,
-        correction_companion_credentials_resolver: Callable[[dict[str, str]], dict[str, str]] | None = None,
         correction_companion_runner: Callable[[dict[str, str], dict[str, Any], float], str] | None = None,
     ) -> None:
         self.profile_root = profile_root.resolve()
@@ -330,9 +328,6 @@ class PersistentSpecialistWorker:
             self._correction_companion_descriptor = resolver()
         except Exception:
             self._correction_companion_descriptor = None
-        self._correction_companion_credentials_resolver = (
-            correction_companion_credentials_resolver or resolve_companion_credentials
-        )
         self._correction_companion_runner = correction_companion_runner or run_companion_subprocess
         self.runtime_instance_id = f"runtime_{uuid.uuid4().hex}"
         self.conversation_instance_id = f"thread_{uuid.uuid4().hex}"
@@ -1049,6 +1044,10 @@ class PersistentSpecialistWorker:
                 self._resetting = False
 
     async def _handle_correct_render(self, request: dict[str, Any]) -> dict[str, Any]:
+        correction_deadline = min(
+            _parse_time(request["deadline"]),
+            _utcnow() + timedelta(seconds=self.turn_timeout),
+        )
         conversation_id = request["conversation_id"]
         event_id = request["event_id"]
         path = self._ledger_path(conversation_id, event_id)
@@ -1112,10 +1111,12 @@ class PersistentSpecialistWorker:
                     )
                 return response
 
-        timeout = max(0.1, (_parse_time(request["deadline"]) - _utcnow()).total_seconds())
         started = request["_started_at"]
+        remaining = (correction_deadline - _utcnow()).total_seconds()
         try:
-            await asyncio.wait_for(self._conversation_lock.acquire(), timeout=timeout)
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            await asyncio.wait_for(self._conversation_lock.acquire(), timeout=remaining)
         except asyncio.TimeoutError:
             response = self._correction_failure(
                 request, "CORRECTION_DEADLINE_EXPIRED", "correction did not start before its deadline",
@@ -1133,15 +1134,14 @@ class PersistentSpecialistWorker:
                     "validation_errors": request["validation_errors"],
                     "target_constraints": request["target_constraints"],
                 }
-                correction_config = await asyncio.to_thread(
-                    self._correction_companion_credentials_resolver,
-                    self._correction_companion_descriptor,
-                )
+                remaining = (correction_deadline - _utcnow()).total_seconds()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
                 candidate = await asyncio.to_thread(
                     self._correction_companion_runner,
-                    correction_config,
+                    self._correction_companion_descriptor,
                     repair,
-                    min(self.turn_timeout, timeout),
+                    remaining,
                 )
                 response = self._base_response(
                     request,
@@ -1164,6 +1164,14 @@ class PersistentSpecialistWorker:
                     request,
                     "CORRECTION_TIMEOUT",
                     "the tool-free correction model turn did not stop before its deadline",
+                    "correction_failed",
+                )
+                record["presentation_state"] = "correction_failed"
+            except asyncio.TimeoutError:
+                response = self._correction_failure(
+                    request,
+                    "CORRECTION_DEADLINE_EXPIRED",
+                    "correction did not start before its deadline",
                     "correction_failed",
                 )
                 record["presentation_state"] = "correction_failed"

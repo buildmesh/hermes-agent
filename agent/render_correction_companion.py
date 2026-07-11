@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -163,14 +164,23 @@ def _sanitized_environment() -> dict[str, str]:
 
 
 def run_companion_subprocess(
-    config: dict[str, str],
+    descriptor: dict[str, str],
     repair: dict[str, Any],
     timeout: float,
 ) -> str:
-    """Run one correction in a killable child and wait for process quiescence."""
-    payload = json.dumps({"config": config, "repair": repair, "timeout": timeout})
+    """Run credential refresh and one correction in a killable child."""
+    if timeout <= 0:
+        raise CorrectionCompanionTimeout("render correction companion exceeded its hard timeout")
+    monotonic_deadline = time.monotonic() + timeout
+    payload = json.dumps({
+        "descriptor": descriptor,
+        "repair": repair,
+        "deadline": time.time() + timeout,
+    })
     with tempfile.TemporaryDirectory(prefix="hermes-render-correction-") as directory:
         os.chmod(directory, 0o700)
+        if time.monotonic() >= monotonic_deadline:
+            raise CorrectionCompanionTimeout("render correction companion exceeded its hard timeout")
         process = subprocess.Popen(
             [sys.executable, "-m", "agent.render_correction_companion", "--child"],
             cwd=directory,
@@ -183,16 +193,35 @@ def run_companion_subprocess(
             start_new_session=True,
         )
         try:
-            stdout, _ = process.communicate(payload, timeout=max(0.1, timeout))
+            remaining = monotonic_deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("render correction companion", timeout)
+            stdout, _ = process.communicate(payload, timeout=remaining)
         except subprocess.TimeoutExpired as exc:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                process.kill()
-            process.communicate()
-            process.wait()
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+            finally:
+                try:
+                    process.communicate()
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    try:
+                        process.wait()
+                    except (ChildProcessError, OSError):
+                        pass
             raise CorrectionCompanionTimeout("render correction companion exceeded its hard timeout") from exc
         process.wait()
+    if process.returncode == 124:
+        raise CorrectionCompanionTimeout("render correction companion exceeded its hard timeout")
     if process.returncode != 0:
         raise CorrectionCompanionUnavailable("render correction companion failed")
     try:
@@ -208,14 +237,24 @@ def run_companion_subprocess(
 def _child_main() -> int:
     try:
         request = json.load(sys.stdin)
+        deadline = float(request["deadline"])
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise CorrectionCompanionTimeout("render correction deadline expired before credential refresh")
+        config = resolve_companion_credentials(request["descriptor"])
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise CorrectionCompanionTimeout("render correction deadline expired before model launch")
         candidate = run_companion_model_call(
-            request["config"],
+            config,
             request["repair"],
-            timeout=float(request["timeout"]),
+            timeout=remaining,
         )
         json.dump({"status": "completed", "candidate": candidate}, sys.stdout)
         sys.stdout.flush()
         return 0
+    except CorrectionCompanionTimeout:
+        return 124
     except Exception:
         return 1
 
