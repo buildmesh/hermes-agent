@@ -56,6 +56,21 @@ def test_telegram_menu_commands_uses_bridge_registry_when_installed(tmp_path):
     )
 
 
+def test_telegram_bridge_dispatcher_module_is_cached_per_adapter(tmp_path):
+    adapter = _make_adapter()
+    profile_root = tmp_path / "profiles/telegram-bridge"
+    dispatcher_path = profile_root / "bin/telegram_bridge_dispatch.py"
+    dispatcher_path.parent.mkdir(parents=True)
+    dispatcher_path.write_text("LOAD_MARKER = object()\n", encoding="utf-8")
+    adapter._telegram_bridge_paths = MagicMock(return_value=(profile_root, tmp_path))
+
+    first = adapter._load_telegram_bridge_dispatcher()
+    second = adapter._load_telegram_bridge_dispatcher()
+
+    assert first is second
+    assert first.LOAD_MARKER is second.LOAD_MARKER
+
+
 @pytest.mark.asyncio
 async def test_config_command_routes_through_bridge_and_passes_bridge_config(tmp_path):
     adapter = _make_adapter()

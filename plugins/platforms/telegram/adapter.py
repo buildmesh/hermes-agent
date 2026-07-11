@@ -7495,6 +7495,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         profile_root, _hermes_base = paths
         dispatcher = profile_root / "bin" / "telegram_bridge_dispatch.py"
+        cached = getattr(self, "_telegram_bridge_dispatcher_cache", None)
+        if cached is not None and cached[0] == dispatcher:
+            return cached[1]
         try:
             spec = importlib.util.spec_from_file_location(
                 "telegram_bridge_dispatch_live",
@@ -7505,6 +7508,7 @@ class TelegramAdapter(BasePlatformAdapter):
             module = importlib.util.module_from_spec(spec)
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
+            self._telegram_bridge_dispatcher_cache = (dispatcher, module)
             return module
         except Exception as exc:
             logger.error("[%s] Failed to load Telegram bridge dispatcher: %s", self.name, exc, exc_info=True)
