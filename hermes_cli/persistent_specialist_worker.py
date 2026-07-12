@@ -316,7 +316,7 @@ class PersistentSpecialistWorker:
         idle_conversation_seconds: float = 21600,
         agent_factory: Callable[[], Any] | None = None,
         correction_companion_resolver: Callable[[Path], dict[str, str] | None] | None = None,
-        correction_companion_credentials_resolver: Callable[[dict[str, str]], dict[str, str]] | None = None,
+        correction_companion_credentials_resolver: Callable[[dict[str, str], float], dict[str, str]] | None = None,
         correction_companion_runner: Callable[[dict[str, str], dict[str, Any], float], str] | None = None,
     ) -> None:
         self.profile_root = profile_root.resolve()
@@ -1109,7 +1109,30 @@ class PersistentSpecialistWorker:
                 self._correction_events[path] = asyncio.Event()
 
         if wait_for_terminal is not None:
-            await wait_for_terminal.wait()
+            remaining = (correction_deadline - _utcnow()).total_seconds()
+            try:
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                await asyncio.wait_for(wait_for_terminal.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                async with self._correction_state_lock:
+                    replay_record = json.loads(path.read_text(encoding="utf-8"))
+                    response = replay_record.get("correction_response")
+                    if not isinstance(response, dict):
+                        response = self._correction_failure(
+                            request,
+                            "CORRECTION_DEADLINE_EXPIRED",
+                            "correction did not complete before its deadline",
+                            "correction_failed",
+                        )
+                        replay_record["presentation_state"] = "correction_failed"
+                        replay_record["correction_response"] = response
+                        replay_record["updated_at"] = _iso(_utcnow())
+                        _atomic_json(path, replay_record)
+                    terminal_event = self._correction_events.pop(path, None)
+                    if terminal_event is not None:
+                        terminal_event.set()
+                    return response
             async with self._correction_state_lock:
                 replay_record = json.loads(path.read_text(encoding="utf-8"))
                 response = replay_record.get("correction_response")
@@ -1138,12 +1161,16 @@ class PersistentSpecialistWorker:
             if remaining < CORRECTION_CREDENTIAL_PREFLIGHT_SECONDS:
                 raise asyncio.TimeoutError
 
-            # OAuth refresh may rotate a single-use token remotely. Once admitted,
-            # let it persist and quiesce even if the correction deadline elapses.
-            correction_config = await asyncio.to_thread(
-                self._correction_companion_credentials_resolver,
-                self._correction_companion_descriptor,
-            )
+            # The isolated resolver returns only after any credential rotation is
+            # durably persisted, and its hard timeout is the correction deadline.
+            try:
+                correction_config = await asyncio.to_thread(
+                    self._correction_companion_credentials_resolver,
+                    self._correction_companion_descriptor,
+                    remaining,
+                )
+            except CorrectionCompanionTimeout as exc:
+                raise asyncio.TimeoutError from exc
             remaining = (correction_deadline - _utcnow()).total_seconds()
             if remaining <= 0:
                 raise asyncio.TimeoutError
@@ -1205,10 +1232,16 @@ class PersistentSpecialistWorker:
             if conversation_lock_acquired:
                 self._conversation_lock.release()
 
-        record["correction_response"] = response
-        record["updated_at"] = _iso(_utcnow())
         async with self._correction_state_lock:
-            _atomic_json(path, record)
+            persisted_record = json.loads(path.read_text(encoding="utf-8"))
+            persisted_response = persisted_record.get("correction_response")
+            if isinstance(persisted_response, dict):
+                response = persisted_response
+                record = persisted_record
+            else:
+                record["correction_response"] = response
+                record["updated_at"] = _iso(_utcnow())
+                _atomic_json(path, record)
             terminal_event = self._correction_events.pop(path, None)
             if terminal_event is not None:
                 terminal_event.set()

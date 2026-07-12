@@ -491,8 +491,9 @@ def test_credential_bootstrap_child_is_profile_scoped_and_separate_from_model(
     class Process:
         returncode = 0
 
-        def communicate(self, payload: str):
+        def communicate(self, payload: str, timeout: float | None = None):
             observed["payload"] = json.loads(payload)
+            observed["timeout"] = timeout
             return json.dumps({"status": "completed", "config": companion_config("profile-token")}), None
 
         def wait(self) -> int:
@@ -506,11 +507,53 @@ def test_credential_bootstrap_child_is_profile_scoped_and_separate_from_model(
     monkeypatch.setenv("HERMES_HOME", "/global/home")
     monkeypatch.setattr(companion.subprocess, "Popen", popen)
 
-    config = companion.resolve_companion_credentials_subprocess(descriptor)
+    config = companion.resolve_companion_credentials_subprocess(descriptor, 1.5)
 
     assert config["api_key"] == "profile-token"
     assert observed["payload"] == {"descriptor": descriptor}
     assert observed["kwargs"]["env"]["HERMES_HOME"] == str(profile_root)
+    assert observed["kwargs"]["start_new_session"] is True
+    assert observed["timeout"] <= 1.5
+    assert observed["waited"] is True
+
+
+def test_credential_bootstrap_timeout_kills_and_reaps_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent import render_correction_companion as companion
+
+    observed: dict[str, object] = {}
+
+    class Process:
+        pid = 4241
+        returncode = None
+
+        def communicate(self, _payload: str | None = None, timeout: float | None = None):
+            observed.setdefault("communicate", []).append(timeout)
+            if timeout is not None:
+                raise companion.subprocess.TimeoutExpired("credentials", timeout)
+            self.returncode = -9
+            return "", None
+
+        def kill(self) -> None:
+            observed["process_kill"] = True
+
+        def wait(self) -> int:
+            observed["waited"] = True
+            return int(self.returncode or 0)
+
+    monkeypatch.setattr(companion.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setattr(companion.os, "killpg", lambda pid, sig: observed.update(killpg=(pid, sig)))
+
+    with pytest.raises(companion.CorrectionCompanionTimeout, match="credential bootstrap"):
+        companion.resolve_companion_credentials_subprocess(
+            companion_descriptor(tmp_path.resolve()),
+            0.01,
+        )
+
+    assert observed["killpg"] == (4241, signal.SIGKILL)
+    assert observed["communicate"] == [pytest.approx(0.01, abs=0.01), None]
     assert observed["waited"] is True
 
 
@@ -786,7 +829,7 @@ async def test_v2_app_server_correction_uses_isolated_companion_once_and_is_dura
         agent_id="hello_world",
         agent_factory=lambda: agent,
         correction_companion_resolver=companion_descriptor,
-        correction_companion_credentials_resolver=lambda _descriptor: companion_config("rotated-token"),
+        correction_companion_credentials_resolver=lambda _descriptor, _timeout: companion_config("rotated-token"),
         correction_companion_runner=companion,
     )
     await worker.start()
@@ -886,7 +929,7 @@ async def test_v2_concurrent_correction_replay_waits_for_one_terminal_result(tmp
         agent_id="hello_world",
         agent_factory=CorrectionAgent,
         correction_companion_resolver=companion_descriptor,
-        correction_companion_credentials_resolver=lambda _descriptor: companion_config(),
+        correction_companion_credentials_resolver=lambda _descriptor, _timeout: companion_config(),
         correction_companion_runner=companion,
     )
     await worker.start()
@@ -909,6 +952,58 @@ async def test_v2_concurrent_correction_replay_waits_for_one_terminal_result(tmp
 
 
 @pytest.mark.asyncio
+async def test_v2_nonterminating_credential_refresh_completes_owner_and_duplicate_at_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(persistent_worker, "CORRECTION_CREDENTIAL_PREFLIGHT_SECONDS", 0.001)
+    refresh_entered = threading.Event()
+    release_refresh = threading.Event()
+
+    def credentials(_descriptor: dict, _timeout: float) -> dict:
+        refresh_entered.set()
+        release_refresh.wait()
+        return companion_config()
+
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        turn_timeout=0.05,
+        agent_factory=CorrectionAgent,
+        correction_companion_resolver=companion_descriptor,
+        correction_companion_credentials_resolver=credentials,
+        correction_companion_runner=FakeCorrectionCompanion(),
+    )
+    await worker.start()
+    try:
+        await worker.handle_request(v2_request("completed-malformed"))
+        request = correction_request("completed-malformed")
+        first = asyncio.create_task(worker.handle_request(request))
+        assert await asyncio.to_thread(refresh_entered.wait, 1)
+        duplicate = asyncio.create_task(worker.handle_request(dict(request)))
+        duplicate_response = await asyncio.wait_for(duplicate, timeout=0.2)
+        terminal_record = json.loads(
+            worker._ledger_path(request["conversation_id"], request["event_id"]).read_text()
+        )
+        release_refresh.set()
+        first_response = await asyncio.wait_for(first, timeout=0.2)
+        final_record = json.loads(
+            worker._ledger_path(request["conversation_id"], request["event_id"]).read_text()
+        )
+    finally:
+        release_refresh.set()
+        await worker.stop()
+
+    assert first_response == duplicate_response
+    assert first_response["status"] == "failed"
+    assert first_response["error"]["code"] == "CORRECTION_DEADLINE_EXPIRED"
+    assert terminal_record["presentation_state"] == "correction_failed"
+    assert terminal_record["correction_response"] == duplicate_response
+    assert final_record["correction_response"] == first_response
+
+
+@pytest.mark.asyncio
 async def test_v2_correction_does_not_spawn_companion_after_lock_wait_exhausts_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -921,7 +1016,7 @@ async def test_v2_correction_does_not_spawn_companion_after_lock_wait_exhausts_d
         agent_id="hello_world",
         agent_factory=CorrectionAgent,
         correction_companion_resolver=companion_descriptor,
-        correction_companion_credentials_resolver=lambda _descriptor: companion_config(),
+        correction_companion_credentials_resolver=lambda _descriptor, _timeout: companion_config(),
         correction_companion_runner=companion,
     )
     await worker.start()
@@ -959,7 +1054,7 @@ async def test_v2_refresh_quiesces_and_persists_after_deadline_without_blocking_
     model = FakeCorrectionCompanion()
     agent = CorrectionAgent()
 
-    def credentials(descriptor: dict) -> dict:
+    def credentials(descriptor: dict, _timeout: float = 1) -> dict:
         credential_calls.append(dict(descriptor))
         if not token_path.exists():
             refresh_entered.set()
@@ -1082,7 +1177,7 @@ async def test_v2_correction_timeout_quiesces_companion_before_rejecting_prequeu
         turn_timeout=0.01,
         agent_factory=lambda: agent,
         correction_companion_resolver=companion_descriptor,
-        correction_companion_credentials_resolver=lambda _descriptor: companion_config(),
+        correction_companion_credentials_resolver=lambda _descriptor, _timeout: companion_config(),
         correction_companion_runner=timed_out_companion,
     )
     await worker.start()

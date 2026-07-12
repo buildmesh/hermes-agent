@@ -236,9 +236,17 @@ def _sanitized_environment() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name in allowed}
 
 
-def resolve_companion_credentials_subprocess(descriptor: dict[str, str]) -> dict[str, str]:
-    """Resolve and durably refresh profile credentials without a hard timeout."""
+def resolve_companion_credentials_subprocess(
+    descriptor: dict[str, str],
+    timeout: float,
+) -> dict[str, str]:
+    """Resolve and durably refresh profile credentials in a bounded child."""
     descriptor = validate_companion_descriptor(descriptor)
+    if timeout <= 0:
+        raise CorrectionCompanionTimeout(
+            "render correction credential bootstrap exceeded its hard timeout"
+        )
+    monotonic_deadline = time.monotonic() + timeout
     profile_root = Path(descriptor["profile_root"])
     payload = json.dumps({"descriptor": descriptor})
     with tempfile.TemporaryDirectory(prefix="hermes-render-credentials-") as directory:
@@ -254,8 +262,37 @@ def resolve_companion_credentials_subprocess(descriptor: dict[str, str]) -> dict
             stderr=subprocess.DEVNULL,
             text=True,
             close_fds=True,
+            start_new_session=True,
         )
-        stdout, _ = process.communicate(payload)
+        try:
+            remaining = monotonic_deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired("render correction credentials", timeout)
+            stdout, _ = process.communicate(payload, timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except OSError:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+            finally:
+                try:
+                    process.communicate()
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    try:
+                        process.wait()
+                    except (ChildProcessError, OSError):
+                        pass
+            raise CorrectionCompanionTimeout(
+                "render correction credential bootstrap exceeded its hard timeout"
+            ) from exc
         process.wait()
     if process.returncode != 0:
         raise CorrectionCompanionUnavailable("render correction credential bootstrap failed")
