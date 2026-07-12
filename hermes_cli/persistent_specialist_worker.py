@@ -1055,10 +1055,11 @@ class PersistentSpecialistWorker:
                 self._resetting = False
 
     async def _handle_correct_render(self, request: dict[str, Any]) -> dict[str, Any]:
-        correction_deadline = min(
+        caller_deadline = min(
             _parse_time(request["deadline"]),
             _utcnow() + timedelta(seconds=self.turn_timeout),
         )
+        correction_deadline = caller_deadline
         conversation_id = request["conversation_id"]
         event_id = request["event_id"]
         path = self._ledger_path(conversation_id, event_id)
@@ -1088,6 +1089,15 @@ class PersistentSpecialistWorker:
                     )
                 if isinstance(record.get("correction_response"), dict):
                     return record["correction_response"]
+                try:
+                    correction_deadline = _parse_time(record["correction_deadline"])
+                except (KeyError, TypeError, ValueError):
+                    return self._correction_failure(
+                        request,
+                        "CORRECTION_STATE_UNAVAILABLE",
+                        "the durable correction attempt has no accepted deadline",
+                        "correction_failed",
+                    )
                 wait_for_terminal = self._correction_events.get(path)
                 if wait_for_terminal is None:
                     return self._correction_failure(
@@ -1102,6 +1112,7 @@ class PersistentSpecialistWorker:
                     correction_attempt_count=1,
                     correction_fingerprint=fingerprint,
                     correction_request_id=request["request_id"],
+                    correction_deadline=_iso(correction_deadline),
                     presentation_state="correction_in_flight",
                     updated_at=_iso(_utcnow()),
                 )
@@ -1109,7 +1120,7 @@ class PersistentSpecialistWorker:
                 self._correction_events[path] = asyncio.Event()
 
         if wait_for_terminal is not None:
-            remaining = (correction_deadline - _utcnow()).total_seconds()
+            remaining = (min(caller_deadline, correction_deadline) - _utcnow()).total_seconds()
             try:
                 if remaining <= 0:
                     raise asyncio.TimeoutError
@@ -1118,21 +1129,14 @@ class PersistentSpecialistWorker:
                 async with self._correction_state_lock:
                     replay_record = json.loads(path.read_text(encoding="utf-8"))
                     response = replay_record.get("correction_response")
-                    if not isinstance(response, dict):
-                        response = self._correction_failure(
-                            request,
-                            "CORRECTION_DEADLINE_EXPIRED",
-                            "correction did not complete before its deadline",
-                            "correction_failed",
-                        )
-                        replay_record["presentation_state"] = "correction_failed"
-                        replay_record["correction_response"] = response
-                        replay_record["updated_at"] = _iso(_utcnow())
-                        _atomic_json(path, replay_record)
-                    terminal_event = self._correction_events.pop(path, None)
-                    if terminal_event is not None:
-                        terminal_event.set()
-                    return response
+                    if isinstance(response, dict):
+                        return response
+                return self._correction_failure(
+                    request,
+                    "CORRECTION_DEADLINE_EXPIRED",
+                    "correction did not complete before its caller deadline",
+                    "correction_failed",
+                )
             async with self._correction_state_lock:
                 replay_record = json.loads(path.read_text(encoding="utf-8"))
                 response = replay_record.get("correction_response")

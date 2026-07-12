@@ -952,6 +952,69 @@ async def test_v2_concurrent_correction_replay_waits_for_one_terminal_result(tmp
 
 
 @pytest.mark.asyncio
+async def test_v2_shorter_deadline_duplicate_does_not_terminalize_owner_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(persistent_worker, "CORRECTION_CREDENTIAL_PREFLIGHT_SECONDS", 0.001)
+    entered = threading.Event()
+    release = threading.Event()
+    companion = FakeCorrectionCompanion(entered=entered, release=release)
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        turn_timeout=0.5,
+        agent_factory=CorrectionAgent,
+        correction_companion_resolver=companion_descriptor,
+        correction_companion_credentials_resolver=lambda _descriptor, _timeout: companion_config(),
+        correction_companion_runner=companion,
+    )
+    await worker.start()
+    try:
+        await worker.handle_request(v2_request("completed-malformed"))
+        owner_request = correction_request("completed-malformed")
+        owner_request["deadline"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=0.3)
+        ).isoformat()
+        owner = asyncio.create_task(worker.handle_request(owner_request))
+        assert await asyncio.to_thread(entered.wait, 1)
+
+        duplicate_request = dict(owner_request)
+        duplicate_request["request_id"] = "req_correction_short_duplicate"
+        duplicate_request["deadline"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=0.03)
+        ).isoformat()
+        duplicate_response = await asyncio.wait_for(
+            worker.handle_request(duplicate_request),
+            timeout=0.15,
+        )
+        in_flight_record = json.loads(
+            worker._ledger_path(owner_request["conversation_id"], owner_request["event_id"]).read_text()
+        )
+
+        release.set()
+        owner_response = await asyncio.wait_for(owner, timeout=0.2)
+        replay_response = await worker.handle_request(duplicate_request)
+        terminal_record = json.loads(
+            worker._ledger_path(owner_request["conversation_id"], owner_request["event_id"]).read_text()
+        )
+    finally:
+        release.set()
+        await worker.stop()
+
+    assert duplicate_response["status"] == "failed"
+    assert duplicate_response["error"]["code"] == "CORRECTION_DEADLINE_EXPIRED"
+    assert in_flight_record["presentation_state"] == "correction_in_flight"
+    assert "correction_response" not in in_flight_record
+    assert in_flight_record["correction_deadline"] == owner_request["deadline"]
+    assert owner_response["status"] == "completed"
+    assert replay_response == owner_response
+    assert terminal_record["correction_response"] == owner_response
+    assert len(companion.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_v2_nonterminating_credential_refresh_completes_owner_and_duplicate_at_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -983,11 +1046,12 @@ async def test_v2_nonterminating_credential_refresh_completes_owner_and_duplicat
         assert await asyncio.to_thread(refresh_entered.wait, 1)
         duplicate = asyncio.create_task(worker.handle_request(dict(request)))
         duplicate_response = await asyncio.wait_for(duplicate, timeout=0.2)
-        terminal_record = json.loads(
+        in_flight_record = json.loads(
             worker._ledger_path(request["conversation_id"], request["event_id"]).read_text()
         )
         release_refresh.set()
         first_response = await asyncio.wait_for(first, timeout=0.2)
+        replay_response = await worker.handle_request(dict(request))
         final_record = json.loads(
             worker._ledger_path(request["conversation_id"], request["event_id"]).read_text()
         )
@@ -995,11 +1059,13 @@ async def test_v2_nonterminating_credential_refresh_completes_owner_and_duplicat
         release_refresh.set()
         await worker.stop()
 
-    assert first_response == duplicate_response
     assert first_response["status"] == "failed"
     assert first_response["error"]["code"] == "CORRECTION_DEADLINE_EXPIRED"
-    assert terminal_record["presentation_state"] == "correction_failed"
-    assert terminal_record["correction_response"] == duplicate_response
+    assert duplicate_response["status"] == "failed"
+    assert duplicate_response["error"]["code"] == "CORRECTION_DEADLINE_EXPIRED"
+    assert in_flight_record["presentation_state"] == "correction_in_flight"
+    assert "correction_response" not in in_flight_record
+    assert replay_response == first_response
     assert final_record["correction_response"] == first_response
 
 
