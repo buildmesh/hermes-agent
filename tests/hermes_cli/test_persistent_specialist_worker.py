@@ -476,6 +476,16 @@ def test_companion_model_call_has_no_tools_or_parent_context(monkeypatch: pytest
     assert len(calls[0]["messages"]) == 2
     assert json.loads(calls[0]["messages"][1]["content"]) == repair
     assert "Envelope JSON" not in json.dumps(calls[0])
+    correction_instructions = calls[0]["messages"][0]["content"]
+    for required_fragment in (
+        '"message_id":"msg_<event_id>_result"',
+        '"action":"send"',
+        '"target":{"chat_id":123456789}',
+        '"render":{"text":"User-facing response."}',
+        "Never put chat_id or text at the payload top level",
+        "Never wrap the object in payload",
+    ):
+        assert required_fragment in correction_instructions
 
 
 def test_credential_bootstrap_child_is_profile_scoped_and_separate_from_model(
@@ -741,6 +751,16 @@ async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> No
         assert len(agents[0].prompts) == 2
         assert agents[0].prompts[0].count('"event_id": "event1"') == 1
         assert agents[0].prompts[1].count('"event_id": "event2"') == 1
+        for prompt in agents[0].prompts:
+            for required_fragment in (
+                '"message_id":"msg_<event_id>_result"',
+                '"action":"send"',
+                '"target":{"chat_id":123456789}',
+                '"render":{"text":"User-facing response."}',
+                "Never put chat_id or text at the payload top level",
+                "Never wrap the object in payload",
+            ):
+                assert required_fragment in prompt
         assert "turn_completed" in (tmp_path / "logs/persistent-specialist.jsonl").read_text()
 
         old_thread = second["conversation_instance_id"]
