@@ -161,6 +161,74 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_thread_start_preserves_developer_instructions_exactly(self):
+        client = FakeClient()
+        prompt = "  profile prompt\nwith exact spacing\n"
+        s = make_session(client, developer_instructions=prompt)
+
+        s.ensure_started()
+
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["developerInstructions"] == prompt
+
+    @pytest.mark.parametrize("prompt", [None, ""])
+    def test_thread_start_omits_empty_developer_instructions(self, prompt):
+        client = FakeClient()
+        s = make_session(client, developer_instructions=prompt)
+
+        s.ensure_started()
+
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert "developerInstructions" not in params
+
+    def test_warm_turns_reuse_thread_without_resending_instructions(self):
+        client = FakeClient()
+        for turn_id in ("tu1", "tu2"):
+            client.queue_notification(
+                "turn/completed",
+                threadId="thread-fake-001",
+                turn={"id": turn_id, "status": "completed", "error": None},
+            )
+        s = make_session(client, developer_instructions="profile prompt")
+
+        first = s.run_turn("first", turn_timeout=2.0)
+        second = s.run_turn("second", turn_timeout=2.0)
+
+        assert first.thread_id == second.thread_id == "thread-fake-001"
+        thread_starts = [req for req in client.requests if req[0] == "thread/start"]
+        assert thread_starts == [
+            (
+                "thread/start",
+                {
+                    "cwd": "/tmp",
+                    "developerInstructions": "profile prompt",
+                },
+            )
+        ]
+        turn_starts = [params for method, params in client.requests if method == "turn/start"]
+        assert len(turn_starts) == 2
+        assert all("developerInstructions" not in params for params in turn_starts)
+
+    def test_thread_start_failure_keeps_developer_instructions_in_request(self):
+        client = FakeClient()
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        def reject_thread(method, params):
+            if method == "thread/start":
+                raise CodexAppServerError(code=-32600, message="bad instructions")
+            return {}
+
+        client._request_handler = reject_thread
+        s = make_session(client, developer_instructions="profile prompt")
+
+        result = s.run_turn("hello", turn_timeout=2.0)
+
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["developerInstructions"] == "profile prompt"
+        assert result.error is not None
+        assert "bad instructions" in result.error
+        assert result.should_retire is True
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)

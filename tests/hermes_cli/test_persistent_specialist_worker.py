@@ -787,6 +787,110 @@ async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_reset_rebuilds_codex_session_with_new_cached_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reset retires the old agent so changed profile context reaches a new thread."""
+    from agent.codex_runtime import run_codex_app_server_turn
+
+    profile_prompt = {"value": "profile prompt v1"}
+    agents = []
+    sessions = []
+
+    class CapturingSession:
+        def __init__(self, **kwargs) -> None:
+            self.developer_instructions = kwargs.get("developer_instructions")
+            self.closed = False
+            sessions.append(self)
+
+        def run_turn(self, *, user_input: str) -> types.SimpleNamespace:
+            envelope = json.loads(user_input.split("Envelope JSON:\n", 1)[1])
+            payload = [{
+                "schema_version": "telegram.bridge.render_payload.v1",
+                "message_id": f"msg_{envelope['event_id']}",
+                "correlation_id": envelope["event_id"],
+                "action": "send",
+                "target": {"chat_id": envelope["chat_id"]},
+                "render": {"text": "ok"},
+            }]
+            return types.SimpleNamespace(
+                interrupted=False,
+                error=None,
+                thread_id=f"thread-{len(sessions)}",
+                turn_id="turn-1",
+                projected_messages=[],
+                tool_iterations=0,
+                final_text=json.dumps(payload),
+                should_retire=False,
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    class RuntimeAgent(FakeAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self._cached_system_prompt = profile_prompt["value"]
+            self.tool_progress_callback = None
+            self._session_db = None
+            self._session_db_created = False
+            self.session_id = None
+            self.session_api_calls = 0
+            self._iters_since_skill = 0
+            self._skill_nudge_interval = 0
+            self.valid_tool_names = set()
+
+        def run_conversation(self, prompt: str) -> dict:
+            return run_codex_app_server_turn(
+                self,
+                user_message=prompt,
+                original_user_message=prompt,
+                messages=[{"role": "user", "content": prompt}],
+                effective_task_id="persistent-specialist",
+            )
+
+        def _sync_external_memory_for_turn(self, **kwargs) -> None:
+            return None
+
+    def factory() -> RuntimeAgent:
+        agent = RuntimeAgent()
+        agents.append(agent)
+        return agent
+
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        CapturingSession,
+    )
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        turn_timeout=2,
+        reset_timeout=3,
+        agent_factory=factory,
+    )
+    await worker.start()
+    try:
+        first = await worker.handle_request(request("profile-v1"))
+        assert first["status"] == "completed"
+        assert sessions[0].developer_instructions == "profile prompt v1"
+
+        profile_prompt["value"] = "profile prompt v2"
+        reset = await worker.handle_request(request("reset-profile", "reset"))
+        assert reset["status"] == "completed"
+        assert sessions[0].closed is True
+
+        second = await worker.handle_request(request("profile-v2"))
+        assert second["status"] == "completed"
+        assert len(agents) == 2
+        assert len(sessions) == 2
+        assert sessions[1].developer_instructions == "profile prompt v2"
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.asyncio
 async def test_v2_completed_turn_persists_raw_malformed_render_candidate(tmp_path: Path) -> None:
     agent = CorrectionAgent()
     worker = PersistentSpecialistWorker(
