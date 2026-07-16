@@ -787,11 +787,15 @@ async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_reset_rebuilds_codex_session_with_new_cached_prompt(
+async def test_reset_projects_new_agent_prompt_into_new_codex_session(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Reset retires the old agent so changed profile context reaches a new thread."""
+    """Reset retires the old agent so its successor prompt reaches a new thread.
+
+    Fresh-agent prompt assembly is covered by the conversation-loop tests. This
+    test covers the worker boundary from reset retirement through projection.
+    """
     from agent.codex_runtime import run_codex_app_server_turn
 
     profile_prompt = {"value": "profile prompt v1"}
