@@ -359,3 +359,74 @@ async def test_bridge_callback_does_not_repair_or_answer_after_ambiguous_deliver
     assert await adapter._maybe_handle_telegram_bridge_callback(SimpleNamespace(update_id=3), query)
     adapter._rerender_telegram_bridge_with_repair.assert_not_awaited()
     query.answer.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bridge_command_exception_sends_safe_user_message(tmp_path):
+    adapter = _make_adapter()
+    dispatcher = MagicMock()
+    dispatcher.can_handle_command.return_value = True
+    dispatcher.dispatch_command.side_effect = RuntimeError("sensitive command failure")
+    adapter._load_telegram_bridge_dispatcher = MagicMock(return_value=dispatcher)
+    adapter._telegram_bridge_paths = MagicMock(return_value=(tmp_path / "bridge", tmp_path))
+    adapter.send = AsyncMock()
+    msg = SimpleNamespace(
+        text="/hello",
+        chat_id=123,
+        message_id=456,
+        from_user=SimpleNamespace(id=789),
+        chat=SimpleNamespace(id=123),
+    )
+
+    assert await adapter._maybe_handle_telegram_bridge_command(SimpleNamespace(update_id=4), msg)
+    adapter.send.assert_awaited_once_with(
+        "123",
+        "I couldn't complete that request just now. Please try again.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_bridge_text_exception_sends_safe_user_message(tmp_path):
+    adapter = _make_adapter()
+    dispatcher = MagicMock()
+    dispatcher.dispatch_text.side_effect = RuntimeError("sensitive text failure")
+    adapter._load_telegram_bridge_dispatcher = MagicMock(return_value=dispatcher)
+    adapter._telegram_bridge_paths = MagicMock(return_value=(tmp_path / "bridge", tmp_path))
+    adapter._clean_bot_trigger_text = MagicMock(return_value="hello")
+    adapter.send = AsyncMock()
+    msg = SimpleNamespace(
+        text="hello",
+        chat_id=123,
+        message_id=456,
+        from_user=SimpleNamespace(id=789),
+        chat=SimpleNamespace(id=123),
+        reply_to_message=None,
+    )
+
+    assert await adapter._maybe_handle_telegram_bridge_text(SimpleNamespace(update_id=5), msg)
+    adapter.send.assert_awaited_once_with(
+        "123",
+        "I couldn't complete that request just now. Please try again.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_bridge_callback_exception_alerts_with_safe_user_message(tmp_path):
+    adapter = _make_adapter()
+    dispatcher = MagicMock()
+    dispatcher.dispatch_callback.side_effect = RuntimeError("sensitive callback failure")
+    adapter._load_telegram_bridge_dispatcher = MagicMock(return_value=dispatcher)
+    adapter._telegram_bridge_paths = MagicMock(return_value=(tmp_path / "bridge", tmp_path))
+    query = SimpleNamespace(
+        id="cbq_2",
+        data="hello.action",
+        from_user=SimpleNamespace(id=789),
+        message=SimpleNamespace(chat_id=123, message_id=456, text="button"),
+        answer=AsyncMock(),
+    )
+
+    assert await adapter._maybe_handle_telegram_bridge_callback(SimpleNamespace(update_id=6), query)
+    query.answer.assert_awaited_once_with(
+        text="I couldn't complete that action. Please try again.",
+        show_alert=True,
+    )

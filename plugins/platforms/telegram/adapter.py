@@ -7769,7 +7769,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     command,
                 )
                 return True
-            await self.send(str(msg.chat_id), f"Telegram bridge error: {exc}")
+            await self.send(
+                str(msg.chat_id),
+                "I couldn't complete that request just now. Please try again.",
+            )
             return True
 
     async def _maybe_handle_telegram_bridge_text(self, update: "Update", msg: "Message") -> bool:
@@ -7827,7 +7830,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name,
                 )
                 return True
-            await self.send(str(msg.chat_id), f"Telegram bridge error: {exc}")
+            await self.send(
+                str(msg.chat_id),
+                "I couldn't complete that request just now. Please try again.",
+            )
             return True
 
     async def _maybe_handle_telegram_bridge_callback(self, update: "Update", query: Any) -> bool:
@@ -7886,7 +7892,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     pass
                 return True
             try:
-                await query.answer(text=f"Telegram bridge error: {exc}", show_alert=True)
+                await query.answer(
+                    text="I couldn't complete that action. Please try again.",
+                    show_alert=True,
+                )
             except Exception:
                 pass
             return True
