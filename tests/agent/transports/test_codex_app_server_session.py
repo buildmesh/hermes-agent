@@ -281,6 +281,40 @@ class TestModelResolutionCapture:
         assert result.resolved_model is None
         assert result.resolved_model_provider is None
 
+    def test_desired_model_is_requested_on_thread_start(self):
+        client = FakeClient()
+        s = make_session(client, desired_model="gpt-5.3-codex-spark")
+        s.ensure_started()
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["model"] == "gpt-5.3-codex-spark"
+
+    def test_no_desired_model_sends_no_model_key(self):
+        client = FakeClient()
+        s = make_session(client, desired_model="   ")
+        s.ensure_started()
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert "model" not in params
+
+    def test_substitution_despite_pin_keeps_observation_and_warns(self, caplog):
+        # codex echoes what it actually resolved; if that differs from the
+        # explicit request, the observation must win (never the intent) and
+        # the substitution must be loud in the log.
+        client = FakeClient()
+        client._request_handler = lambda method, params: (
+            {
+                "thread": {"id": "thread-fake-001"},
+                "model": "gpt-5.6-sol",
+                "modelProvider": "openai",
+            }
+            if method == "thread/start"
+            else {"turn": {"id": "tu1"}} if method == "turn/start" else {}
+        )
+        s = make_session(client, desired_model="gpt-5.3-codex-spark")
+        with caplog.at_level("WARNING"):
+            s.ensure_started()
+        assert s._resolved_model == "gpt-5.6-sol"
+        assert any("despite explicit request" in r.message for r in caplog.records)
+
     def test_close_drops_resolution_so_new_thread_cannot_inherit_it(self):
         responses = iter(
             [

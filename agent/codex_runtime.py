@@ -374,6 +374,10 @@ def run_codex_app_server_turn(
 
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            # Request the configured model explicitly. Otherwise codex falls
+            # back to its own mutable defaults and the thread can silently
+            # run a different model than agent.model claims.
+            desired_model=getattr(agent, "model", None),
             developer_instructions=getattr(agent, "_cached_system_prompt", None),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(

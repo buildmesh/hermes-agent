@@ -212,6 +212,7 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
+        desired_model: Optional[str] = None,
         developer_instructions: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
@@ -221,6 +222,16 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        # Model to request explicitly on thread/start. Without it codex
+        # resolves a default from mutable shared state (~/.codex config,
+        # account-side defaults other clients change), which is how
+        # specialist threads pinned to spark ended up served by other
+        # models. codex echoes the resolved model in the response, so the
+        # captured observation below stays honest even if the request is
+        # ignored or the model name is invalid (codex echoes it unvalidated;
+        # a bad name fails at the first turn and MODEL_MISMATCH-style
+        # consumers catch silent substitution).
+        self._desired_model = (desired_model or "").strip() or None
         self._developer_instructions = developer_instructions
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
@@ -279,6 +290,8 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
+        if self._desired_model:
+            params["model"] = self._desired_model
         if self._developer_instructions:
             params["developerInstructions"] = self._developer_instructions
         result = self._client.request("thread/start", params, timeout=15)
@@ -312,6 +325,17 @@ class CodexAppServerSession:
             self._resolved_model = resolved_model.strip()
         if isinstance(resolved_provider, str) and resolved_provider.strip():
             self._resolved_model_provider = resolved_provider.strip()
+        if (
+            self._desired_model
+            and self._resolved_model is not None
+            and self._resolved_model != self._desired_model
+        ):
+            logger.warning(
+                "codex app-server resolved model %s despite explicit request "
+                "for %s — substitution will surface in runtime_model metadata",
+                self._resolved_model,
+                self._desired_model,
+            )
         logger.info(
             "codex app-server thread started: id=%s profile=%s cwd=%s "
             "resolved_model=%s resolved_provider=%s",
