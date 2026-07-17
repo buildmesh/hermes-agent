@@ -1035,6 +1035,133 @@ async def test_v2_turn_without_any_model_attributes_emits_no_metadata(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_v2_duplicate_in_flight_turn_never_reaches_the_model(tmp_path: Path) -> None:
+    """The runtime ledger, not the agent, owns mutation idempotency: a
+    duplicate of an event whose turn is still running must be rejected
+    without a second model run (task 150 evidence)."""
+    entered = threading.Event()
+    release = threading.Event()
+    agents: list[BlockingAgent] = []
+
+    def factory() -> BlockingAgent:
+        agent = BlockingAgent(entered, release)
+        agents.append(agent)
+        return agent
+
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        turn_timeout=5,
+        reset_timeout=6,
+        agent_factory=factory,
+    )
+    await worker.start()
+    try:
+        owner = asyncio.create_task(worker.handle_request(v2_request("dup-in-flight")))
+        await asyncio.to_thread(entered.wait, 2)
+        duplicate = await worker.handle_request(v2_request("dup-in-flight"))
+        release.set()
+        owner_response = await owner
+    finally:
+        release.set()
+        await worker.stop()
+
+    assert owner_response["status"] == "completed"
+    assert duplicate["status"] == "failed"
+    assert duplicate["error"]["code"] == "DUPLICATE_IN_FLIGHT"
+    assert duplicate["execution_state"] == "in_flight"
+    assert len(agents) == 1 and agents[0].turns == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_event_id_reuse_with_different_content_is_a_conflict(tmp_path: Path) -> None:
+    agents: list[FakeAgent] = []
+
+    def factory() -> FakeAgent:
+        agent = FakeAgent()
+        agents.append(agent)
+        return agent
+
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=factory,
+    )
+    await worker.start()
+    try:
+        first = await worker.handle_request(v2_request("reused-event"))
+        tampered = v2_request("reused-event")
+        tampered["envelope"]["message"] = {"text": "use 99 instead"}
+        conflict = await worker.handle_request(tampered)
+    finally:
+        await worker.stop()
+
+    assert first["status"] == "completed"
+    assert conflict["status"] == "failed"
+    assert conflict["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert agents and agents[0].turns == 1
+
+
+@pytest.mark.asyncio
+async def test_ledger_retention_keeps_replay_until_horizon_then_prunes(tmp_path: Path) -> None:
+    """Terminal ledger records survive worker restarts (so redelivery keeps
+    replaying, never re-running) until the 30-day retention horizon, far
+    beyond any Telegram redelivery window; only then are they compacted."""
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=FakeAgent,
+    )
+    await worker.start()
+    try:
+        first = await worker.handle_request(v2_request("retained-event"))
+    finally:
+        await worker.stop()
+    assert first["status"] == "completed"
+    ledger_path = worker._ledger_path("conv_" + "1" * 64, "retained-event")
+
+    agents: list[FakeAgent] = []
+
+    def factory() -> FakeAgent:
+        agent = FakeAgent()
+        agents.append(agent)
+        return agent
+
+    restarted = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=factory,
+    )
+    await restarted.start()
+    try:
+        replay = await restarted.handle_request(v2_request("retained-event"))
+    finally:
+        await restarted.stop()
+    assert replay == first
+    assert not agents  # replay came from the ledger; no agent was built
+    assert ledger_path.exists()
+
+    record = json.loads(ledger_path.read_text(encoding="utf-8"))
+    record["accepted_at"] = "2026-06-01T00:00:00+00:00"
+    ledger_path.write_text(json.dumps(record), encoding="utf-8")
+    expired = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=FakeAgent,
+    )
+    await expired.start()
+    try:
+        assert not ledger_path.exists()
+    finally:
+        await expired.stop()
+
+
+@pytest.mark.asyncio
 async def test_v2_failed_turn_emits_no_model_metadata(tmp_path: Path) -> None:
     class FailingModelAgent(FailingAgent):
         model = "gpt-5.3-codex-spark"
