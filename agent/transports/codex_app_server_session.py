@@ -76,6 +76,13 @@ class TurnResult:
     token_usage_total: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
+    # Model the app-server actually resolved for the serving thread, from the
+    # thread/start response. Hermes sends no model in any request on this
+    # path, so this observation — not configuration — is the only record of
+    # which model served the turn (config.toml or account-side defaults win
+    # silently otherwise).
+    resolved_model: Optional[str] = None
+    resolved_model_provider: Optional[str] = None
     # Hint to the caller that the underlying codex subprocess is likely
     # wedged (turn-level timeout fired, post-tool watchdog tripped, or
     # token-refresh failure killed the child). The caller should retire
@@ -228,6 +235,8 @@ class CodexAppServerSession:
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
+        self._resolved_model: Optional[str] = None
+        self._resolved_model_provider: Optional[str] = None
         self._interrupt_event = threading.Event()
         # Pending file-change items, keyed by item id. Populated on
         # item/started for fileChange items; consumed by the approval
@@ -293,11 +302,24 @@ class CodexAppServerSession:
                 ),
             )
         self._thread_id = thread_id
+        # thread/start echoes the model/provider the app-server resolved for
+        # this thread. Hermes never sends a model on this path, so capture
+        # the observation here; it is the producer for specialist
+        # model-verification metadata (and the only way to see substitution).
+        resolved_model = result.get("model")
+        resolved_provider = result.get("modelProvider")
+        if isinstance(resolved_model, str) and resolved_model.strip():
+            self._resolved_model = resolved_model.strip()
+        if isinstance(resolved_provider, str) and resolved_provider.strip():
+            self._resolved_model_provider = resolved_provider.strip()
         logger.info(
-            "codex app-server thread started: id=%s profile=%s cwd=%s",
+            "codex app-server thread started: id=%s profile=%s cwd=%s "
+            "resolved_model=%s resolved_provider=%s",
             self._thread_id[:8],
             self._permission_profile,
             self._cwd,
+            self._resolved_model or "unknown",
+            self._resolved_model_provider or "unknown",
         )
         return self._thread_id
 
@@ -312,6 +334,10 @@ class CodexAppServerSession:
                 pass
             self._client = None
         self._thread_id = None
+        # Drop the resolved-model observation with the thread it belongs to,
+        # so a replacement thread can never inherit a stale attribution.
+        self._resolved_model = None
+        self._resolved_model_provider = None
 
     def __enter__(self) -> "CodexAppServerSession":
         return self
@@ -403,6 +429,8 @@ class CodexAppServerSession:
             return result
         assert self._client is not None and self._thread_id is not None
         result.thread_id = self._thread_id
+        result.resolved_model = self._resolved_model
+        result.resolved_model_provider = self._resolved_model_provider
 
         self._interrupt_event.clear()
         projector = CodexEventProjector()

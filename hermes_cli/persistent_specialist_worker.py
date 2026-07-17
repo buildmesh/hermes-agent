@@ -652,6 +652,40 @@ class PersistentSpecialistWorker:
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
 
+    def _model_metadata(self, result: dict[str, Any]) -> dict[str, str]:
+        """Model-resolution metadata for completed turn responses.
+
+        requested_* restate what the profile configuration asked Hermes to
+        run — the claim under verification. runtime_model is the model the
+        codex app-server reported for the serving thread (thread/start
+        response), observed by the transport rather than read from any
+        config. runtime_provider/runtime_api_mode identify the transport
+        that actually served the turn, emitted in Hermes provider naming so
+        the bridge can compare them against profile config; they are only
+        emitted alongside a runtime_model observation. All fields are
+        optional in the response contract: when the runtime exposes nothing,
+        nothing is emitted and the bridge records the turn as unverified.
+        """
+        fields: dict[str, str] = {}
+        agent = self._agent
+        for key, value in (
+            ("requested_model", getattr(agent, "model", None)),
+            ("requested_provider", getattr(agent, "provider", None)),
+            ("requested_api_mode", getattr(agent, "api_mode", None)),
+        ):
+            if isinstance(value, str) and value.strip():
+                fields[key] = value.strip()
+        runtime_model = result.get("runtime_model")
+        if isinstance(runtime_model, str) and runtime_model.strip():
+            fields["runtime_model"] = runtime_model.strip()
+            provider = getattr(agent, "provider", None)
+            if isinstance(provider, str) and provider.strip():
+                fields["runtime_provider"] = provider.strip()
+            api_mode = getattr(agent, "api_mode", None)
+            if isinstance(api_mode, str) and api_mode.strip():
+                fields["runtime_api_mode"] = api_mode.strip()
+        return fields
+
     def _base_response(self, request: dict[str, Any], **extra: Any) -> dict[str, Any]:
         return {
             "protocol_version": request.get("protocol_version", PROTOCOL),
@@ -991,6 +1025,7 @@ class PersistentSpecialistWorker:
                             model_and_tools=model_and_tools_ms,
                             render_preparation=render_preparation_ms,
                         ),
+                        **self._model_metadata(result),
                     }
                     if request["protocol_version"] == PROTOCOL_V2:
                         response_fields.update(

@@ -516,6 +516,14 @@ def run_codex_app_server_turn(
         "completed": not turn.interrupted and turn.error is None,
         "partial": turn.interrupted or turn.error is not None,
         "error": turn.error,
+        # App-server-observed model resolution for this turn's thread. The
+        # persistent specialist worker forwards it as runtime_* metadata so
+        # the bridge can detect model substitution; codex's native provider
+        # label ("openai") is preserved here — contract naming happens at
+        # the worker. getattr: duck-typed TurnResults from older/other
+        # session implementations simply report no observation.
+        "runtime_model": getattr(turn, "resolved_model", None),
+        "runtime_model_provider": getattr(turn, "resolved_model_provider", None),
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

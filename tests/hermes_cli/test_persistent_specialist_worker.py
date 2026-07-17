@@ -925,6 +925,144 @@ async def test_v2_completed_turn_persists_raw_malformed_render_candidate(tmp_pat
     assert ledger["render_candidate_sha256"] == response["render_candidate"]["sha256"]
 
 
+class ModelReportingAgent(FakeAgent):
+    """Mirrors an AIAgent on the codex app-server runtime: configured model
+    attributes (the claim) plus the transport's runtime_model observation in
+    the run_conversation result. The runtime model deliberately differs so
+    tests prove the observation is forwarded verbatim, not restated from
+    configuration."""
+
+    model = "gpt-5.3-codex-spark"
+    provider = "openai-codex"
+    api_mode = "codex_app_server"
+
+    def run_conversation(self, prompt: str) -> dict:
+        result = super().run_conversation(prompt)
+        result["runtime_model"] = "gpt-5.6-sol"
+        result["runtime_model_provider"] = "openai"
+        return result
+
+
+class RequestedOnlyAgent(FakeAgent):
+    """Configured attributes but no runtime observation (e.g. a runtime that
+    predates thread/start model reporting)."""
+
+    model = "gpt-5.3-codex-spark"
+    provider = "openai-codex"
+    api_mode = "codex_app_server"
+
+
+def _v2_response_schema() -> dict:
+    return json.loads(
+        (Path(__file__).parents[1] / "fixtures/telegram.bridge.persistent_service_response.v2.schema.json")
+        .read_text(encoding="utf-8")
+    )
+
+
+@pytest.mark.asyncio
+async def test_v2_completed_turn_emits_model_resolution_metadata(tmp_path: Path) -> None:
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=ModelReportingAgent,
+    )
+    await worker.start()
+    try:
+        response = await worker.handle_request(v2_request("model-metadata-1"))
+    finally:
+        await worker.stop()
+
+    assert response["status"] == "completed"
+    assert response["requested_model"] == "gpt-5.3-codex-spark"
+    assert response["requested_provider"] == "openai-codex"
+    assert response["requested_api_mode"] == "codex_app_server"
+    # The observation is forwarded verbatim — here it disagrees with the
+    # requested model, which is exactly the substitution signal the bridge
+    # verifies. Provider/api_mode stay in Hermes naming for comparability.
+    assert response["runtime_model"] == "gpt-5.6-sol"
+    assert response["runtime_provider"] == "openai-codex"
+    assert response["runtime_api_mode"] == "codex_app_server"
+    jsonschema.Draft202012Validator(_v2_response_schema()).validate(response)
+    # The durable ledger record replays the same metadata.
+    ledger_path = worker._ledger_path("conv_" + "1" * 64, "model-metadata-1")
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    assert ledger["response"]["runtime_model"] == "gpt-5.6-sol"
+
+
+@pytest.mark.asyncio
+async def test_v2_turn_without_runtime_observation_emits_requested_only(tmp_path: Path) -> None:
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=RequestedOnlyAgent,
+    )
+    await worker.start()
+    try:
+        response = await worker.handle_request(v2_request("model-metadata-2"))
+    finally:
+        await worker.stop()
+
+    assert response["status"] == "completed"
+    assert response["requested_model"] == "gpt-5.3-codex-spark"
+    for absent in ("runtime_model", "runtime_provider", "runtime_api_mode"):
+        assert absent not in response
+    jsonschema.Draft202012Validator(_v2_response_schema()).validate(response)
+
+
+@pytest.mark.asyncio
+async def test_v2_turn_without_any_model_attributes_emits_no_metadata(tmp_path: Path) -> None:
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=FakeAgent,
+    )
+    await worker.start()
+    try:
+        response = await worker.handle_request(v2_request("model-metadata-3"))
+    finally:
+        await worker.stop()
+
+    assert response["status"] == "completed"
+    for absent in (
+        "requested_model", "requested_provider", "requested_api_mode",
+        "runtime_model", "runtime_provider", "runtime_api_mode",
+    ):
+        assert absent not in response
+    jsonschema.Draft202012Validator(_v2_response_schema()).validate(response)
+
+
+@pytest.mark.asyncio
+async def test_v2_failed_turn_emits_no_model_metadata(tmp_path: Path) -> None:
+    class FailingModelAgent(FailingAgent):
+        model = "gpt-5.3-codex-spark"
+        provider = "openai-codex"
+        api_mode = "codex_app_server"
+
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=FailingModelAgent,
+    )
+    await worker.start()
+    try:
+        response = await worker.handle_request(v2_request("model-metadata-4"))
+    finally:
+        await worker.stop()
+
+    # Only completed turns are verifiable; failure responses must not carry
+    # model claims (the v2 schema permits them, the producer refuses).
+    assert response["status"] == "failed"
+    for absent in (
+        "requested_model", "requested_provider", "requested_api_mode",
+        "runtime_model", "runtime_provider", "runtime_api_mode",
+    ):
+        assert absent not in response
+
+
 @pytest.mark.asyncio
 async def test_v2_reset_uses_render_candidate_contract(tmp_path: Path) -> None:
     worker = PersistentSpecialistWorker(

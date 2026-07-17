@@ -238,6 +238,78 @@ class TestLifecycle:
         assert client._closed is True
 
 
+# ---- model resolution capture ----
+
+class TestModelResolutionCapture:
+    """thread/start's response is the only observation of which model the
+    app-server resolved for the thread (Hermes sends no model in any
+    request), so the session must capture it and stamp it on TurnResult."""
+
+    def test_run_turn_carries_model_resolved_at_thread_start(self):
+        client = FakeClient()
+        client._request_handler = lambda method, params: (
+            {
+                "thread": {"id": "thread-fake-001"},
+                "model": "gpt-5.3-codex-spark",
+                "modelProvider": "openai",
+            }
+            if method == "thread/start"
+            else {"turn": {"id": "tu1"}} if method == "turn/start" else {}
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        result = s.run_turn("hello", turn_timeout=2.0)
+        assert result.resolved_model == "gpt-5.3-codex-spark"
+        assert result.resolved_model_provider == "openai"
+
+    def test_missing_model_fields_leave_resolution_unset(self):
+        # FakeClient's default thread/start response has no model keys —
+        # older app-server builds may omit them; absence must stay absence
+        # (the worker then emits no runtime metadata, never a config guess).
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client)
+        result = s.run_turn("hello", turn_timeout=2.0)
+        assert result.resolved_model is None
+        assert result.resolved_model_provider is None
+
+    def test_close_drops_resolution_so_new_thread_cannot_inherit_it(self):
+        responses = iter(
+            [
+                {
+                    "thread": {"id": "thread-a"},
+                    "model": "gpt-5.3-codex-spark",
+                    "modelProvider": "openai",
+                },
+                {"thread": {"id": "thread-b"}},
+            ]
+        )
+        client = FakeClient()
+        client._request_handler = lambda method, params: (
+            next(responses) if method == "thread/start"
+            else {"turn": {"id": "tu"}} if method == "turn/start" else {}
+        )
+        s = make_session(client)
+        s.ensure_started()
+        assert s._resolved_model == "gpt-5.3-codex-spark"
+        s.close()
+        assert s._resolved_model is None
+        client._closed = False  # fake stays usable for the replacement thread
+        s.ensure_started()
+        # thread-b's response named no model: a stale attribution from
+        # thread-a must not survive the restart.
+        assert s._resolved_model is None
+        assert s._resolved_model_provider is None
+
+
 # ---- turn loop ----
 
 class TestRunTurn:
