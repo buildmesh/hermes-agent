@@ -794,8 +794,9 @@ async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> No
                 assert required_fragment in prompt
             lowered_prompt = prompt.lower()
             assert "text-only, non-exclusive example" in lowered_prompt
-            assert "tables, lists, and buttons" in lowered_prompt
+            assert "tables and lists" in lowered_prompt
             assert "render.blocks" in prompt
+            assert "buttons use render.buttons" in lowered_prompt
             assert "profile and task instructions" in lowered_prompt
             assert "exactly this object shape" not in lowered_prompt
         assert "turn_completed" in (tmp_path / "logs/persistent-specialist.jsonl").read_text()
