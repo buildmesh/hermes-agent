@@ -17,7 +17,7 @@ from typing import Any
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.config import load_config
 from hermes_cli.runtime_provider import resolve_runtime_provider
-from agent.telegram_bridge_render_contract import CANONICAL_TEXT_RENDER_INSTRUCTIONS
+from agent.telegram_bridge_render_contract import CANONICAL_RENDER_ENVELOPE_INSTRUCTIONS
 
 
 class CorrectionCompanionUnavailable(RuntimeError):
@@ -191,8 +191,11 @@ def _correction_messages(repair: dict[str, Any]) -> list[dict[str, str]]:
         "Correct only the formatting of a completed Telegram Bridge render. "
         "Do not repeat, continue, verify, or infer any domain work. Return only a JSON array of "
         "telegram.bridge.render_payload.v1 objects. No tools, memory, persistence, fallback, or "
-        "workspace context is available. "
-        + CANONICAL_TEXT_RENDER_INSTRUCTIONS
+        "workspace context is available. Preserve the candidate's intended supported presentation "
+        "and preserve any valid structured blocks. Repair only the reported formatting or schema "
+        "errors; never replace tables, lists, or buttons with plain text merely to make the JSON "
+        "valid. "
+        + CANONICAL_RENDER_ENVELOPE_INSTRUCTIONS
     )
     material = {
         "candidate": repair["candidate"],

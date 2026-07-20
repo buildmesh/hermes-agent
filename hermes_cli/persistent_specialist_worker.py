@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from agent.telegram_bridge_render_contract import CANONICAL_TEXT_RENDER_INSTRUCTIONS
+from agent.telegram_bridge_render_contract import CANONICAL_RENDER_ENVELOPE_INSTRUCTIONS
 
 from agent.render_correction_companion import (
     CorrectionCompanionTimeout,
@@ -283,7 +283,7 @@ def _bridge_prompt(envelope: dict[str, Any]) -> str:
         "instructions. Return only a JSON array of telegram.bridge.render_payload.v1 objects. "
         "Do not call Telegram directly. Preserve event_id as correlation_id and use the envelope "
         "chat_id as the send target. "
-        + CANONICAL_TEXT_RENDER_INSTRUCTIONS
+        + CANONICAL_RENDER_ENVELOPE_INSTRUCTIONS
         + "\n\nEnvelope JSON:\n"
         + json.dumps(envelope, ensure_ascii=False, sort_keys=True)
     )

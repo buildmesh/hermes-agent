@@ -455,9 +455,32 @@ def test_companion_model_call_has_no_tools_or_parent_context(monkeypatch: pytest
         close=lambda: None,
     )
     monkeypatch.setattr(companion, "_direct_responses_client", lambda _config: client)
+    candidate = json.dumps([
+        {
+            "schema_version": "telegram.bridge.render_payload.v1",
+            "message_id": "msg_evt_1",
+            "correlation_id": "evt_1",
+            "action": "send",
+            "target": {"chat_id": 123456789},
+            "render": {
+                "text": "User-facing response.",
+                "blocks": [
+                    {
+                        "type": "table",
+                        "columns": ["Item", "Qty"],
+                        "rows": [["Citric Acid, qt", "2 jars"], ["Paper towels", "8 rolls"]],
+                    }
+                ],
+            },
+        }
+    ], ensure_ascii=False, separators=(",", ":"))
     repair = {
-        "candidate": "not-json",
-        "validation_errors": [{"code": "RENDER_JSON_INVALID", "path": "$", "message": "invalid"}],
+        "candidate": candidate,
+        "validation_errors": [{
+            "code": "RENDER_TARGET_MISMATCH",
+            "path": "$[0].target.chat_id",
+            "message": "candidate target does not match the authoritative chat",
+        }],
         "target_constraints": {
             "correlation_id": "evt_1",
             "chat_id": 123,
@@ -474,9 +497,12 @@ def test_companion_model_call_has_no_tools_or_parent_context(monkeypatch: pytest
     assert calls[0]["tools"] == []
     assert calls[0]["tool_choice"] == "none"
     assert len(calls[0]["messages"]) == 2
-    assert json.loads(calls[0]["messages"][1]["content"]) == repair
+    repair_payload = json.loads(calls[0]["messages"][1]["content"])
+    assert repair_payload == repair
+    assert json.loads(repair_payload["candidate"])[0]["render"]["blocks"][0]["type"] == "table"
     assert "Envelope JSON" not in json.dumps(calls[0])
     correction_instructions = calls[0]["messages"][0]["content"]
+    lowered_instructions = correction_instructions.lower()
     for required_fragment in (
         '"message_id":"msg_<event_id>_result"',
         '"action":"send"',
@@ -486,6 +512,11 @@ def test_companion_model_call_has_no_tools_or_parent_context(monkeypatch: pytest
         "Never wrap the object in payload",
     ):
         assert required_fragment in correction_instructions
+    assert "Do not repeat, continue, verify, or infer any domain work." in correction_instructions
+    assert "preserve the candidate's intended supported presentation" in lowered_instructions
+    assert "preserve any valid structured blocks" in lowered_instructions
+    assert "tables, lists, or buttons" in lowered_instructions
+    assert "plain text" in lowered_instructions
 
 
 def test_credential_bootstrap_child_is_profile_scoped_and_separate_from_model(
@@ -761,6 +792,12 @@ async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> No
                 "Never wrap the object in payload",
             ):
                 assert required_fragment in prompt
+            lowered_prompt = prompt.lower()
+            assert "text-only, non-exclusive example" in lowered_prompt
+            assert "tables, lists, and buttons" in lowered_prompt
+            assert "render.blocks" in prompt
+            assert "profile and task instructions" in lowered_prompt
+            assert "exactly this object shape" not in lowered_prompt
         assert "turn_completed" in (tmp_path / "logs/persistent-specialist.jsonl").read_text()
 
         old_thread = second["conversation_instance_id"]
