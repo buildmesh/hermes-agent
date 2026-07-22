@@ -17,6 +17,7 @@ import os
 import html as _html
 import re
 import signal
+import stat
 import sys
 import threading
 from datetime import datetime, timezone
@@ -426,6 +427,7 @@ _UPDATER_STOP_TIMEOUT = 15.0
 # trigger its own recovery path. Refs: NousResearch/hermes-agent#59614
 _UPDATER_START_TIMEOUT = 30.0
 _PERSISTENT_WORKER_STOP_TIMEOUT = 5.0
+_PERSISTENT_WORKER_KILL_TIMEOUT = 5.0
 _PERSISTENT_WORKER_RECOVERY_CODES = frozenset({"TURN_TIMEOUT", "RESET_UNCONFIRMED"})
 
 
@@ -7595,6 +7597,18 @@ class TelegramAdapter(BasePlatformAdapter):
         spec: dict[str, Any],
     ) -> asyncio.subprocess.Process:
         """Spawn one worker in a dedicated POSIX session and await readiness."""
+        socket_path = _Path(spec["socket_path"])
+        stale_socket_identity: tuple[int, int, int] | None = None
+        try:
+            socket_stat = socket_path.stat()
+            if stat.S_ISSOCK(socket_stat.st_mode):
+                stale_socket_identity = (
+                    socket_stat.st_dev,
+                    socket_stat.st_ino,
+                    socket_stat.st_ctime_ns,
+                )
+        except FileNotFoundError:
+            pass
         env = dict(os.environ)
         env["HERMES_HOME"] = spec["profile_root"]
         env["TERMINAL_CWD"] = spec["profile_root"]
@@ -7623,8 +7637,25 @@ class TelegramAdapter(BasePlatformAdapter):
             start_new_session=True,
         )
         deadline = asyncio.get_running_loop().time() + float(spec["startup_timeout_seconds"])
-        socket_path = _Path(spec["socket_path"])
-        while not socket_path.exists() and process.returncode is None:
+        while process.returncode is None:
+            try:
+                current_socket_stat = socket_path.stat()
+                current_socket_identity = (
+                    current_socket_stat.st_dev,
+                    current_socket_stat.st_ino,
+                    current_socket_stat.st_ctime_ns,
+                )
+                socket_ready = (
+                    stale_socket_identity is None
+                    or (
+                        stat.S_ISSOCK(current_socket_stat.st_mode)
+                        and current_socket_identity != stale_socket_identity
+                    )
+                )
+            except FileNotFoundError:
+                socket_ready = False
+            if socket_ready:
+                break
             if asyncio.get_running_loop().time() >= deadline:
                 await self._terminate_telegram_bridge_persistent_worker(
                     spec["agent_id"],
@@ -7671,7 +7702,20 @@ class TelegramAdapter(BasePlatformAdapter):
                     process.kill()
             except ProcessLookupError:
                 pass
-            await process.wait()
+            try:
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=_PERSISTENT_WORKER_KILL_TIMEOUT,
+                )
+            except asyncio.TimeoutError as exc:
+                logger.error(
+                    "[%s] Persistent specialist worker could not be reaped after SIGKILL: agent_id=%s",
+                    self.name,
+                    agent_id,
+                )
+                raise TimeoutError(
+                    f"persistent worker could not be reaped after SIGKILL: {agent_id}"
+                ) from exc
             return True
 
     async def _stop_telegram_bridge_persistent_workers_locked(self) -> None:
