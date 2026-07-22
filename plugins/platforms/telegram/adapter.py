@@ -428,6 +428,8 @@ _UPDATER_STOP_TIMEOUT = 15.0
 _UPDATER_START_TIMEOUT = 30.0
 _PERSISTENT_WORKER_STOP_TIMEOUT = 5.0
 _PERSISTENT_WORKER_KILL_TIMEOUT = 5.0
+_PERSISTENT_WORKER_RETRY_INITIAL_DELAY = 1.0
+_PERSISTENT_WORKER_RETRY_MAX_DELAY = 30.0
 _PERSISTENT_WORKER_RECOVERY_CODES = frozenset({"TURN_TIMEOUT", "RESET_UNCONFIRMED"})
 
 
@@ -7550,14 +7552,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if not callable(specs_fn):
             return
         specs = specs_fn(paths[0], paths[1])
+        self._telegram_bridge_persistent_workers_shutdown = True
+        await self._cancel_telegram_bridge_persistent_worker_recoveries()
         lifecycle_lock = self._get_telegram_bridge_persistent_worker_lifecycle_lock()
         async with lifecycle_lock:
-            self._telegram_bridge_persistent_workers_shutdown = True
             await self._stop_telegram_bridge_persistent_workers_locked()
             self._telegram_bridge_persistent_worker_specs = {
                 spec["agent_id"]: dict(spec) for spec in specs
             }
-            self._telegram_bridge_persistent_worker_recovery_keys = set()
             self._telegram_bridge_persistent_workers_shutdown = False
             try:
                 for spec in self._telegram_bridge_persistent_worker_specs.values():
@@ -7568,17 +7570,31 @@ class TelegramAdapter(BasePlatformAdapter):
                         self.name,
                         spec["agent_id"],
                     )
-            except Exception:
+            except BaseException:
                 self._telegram_bridge_persistent_workers_shutdown = True
                 await self._stop_telegram_bridge_persistent_workers_locked()
                 raise
 
     async def _stop_telegram_bridge_persistent_workers(self) -> None:
         """Stop all persistent worker process groups without racing recovery."""
+        # Publish shutdown before waiting for the lifecycle lock.  A recovery
+        # task may currently own that lock while spawning; cancellation makes
+        # the spawn path reap any child it acquired before releasing the lock.
+        self._telegram_bridge_persistent_workers_shutdown = True
+        await self._cancel_telegram_bridge_persistent_worker_recoveries()
         lifecycle_lock = self._get_telegram_bridge_persistent_worker_lifecycle_lock()
         async with lifecycle_lock:
-            self._telegram_bridge_persistent_workers_shutdown = True
             await self._stop_telegram_bridge_persistent_workers_locked()
+
+    async def _cancel_telegram_bridge_persistent_worker_recoveries(self) -> None:
+        """Cancel and drain every adapter-owned recovery/retry task."""
+        tasks = list(
+            getattr(self, "_telegram_bridge_persistent_worker_recovery_tasks", {}).values()
+        )
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _get_telegram_bridge_persistent_worker_lifecycle_lock(self) -> asyncio.Lock:
         """Return the lazily initialized lock shared by start, stop, and recovery."""
@@ -7612,7 +7628,7 @@ class TelegramAdapter(BasePlatformAdapter):
         env = dict(os.environ)
         env["HERMES_HOME"] = spec["profile_root"]
         env["TERMINAL_CWD"] = spec["profile_root"]
-        process = await asyncio.create_subprocess_exec(
+        spawn_task = asyncio.create_task(asyncio.create_subprocess_exec(
             sys.executable,
             "-m",
             "hermes_cli.persistent_specialist_worker",
@@ -7635,50 +7651,114 @@ class TelegramAdapter(BasePlatformAdapter):
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
             start_new_session=True,
-        )
-        deadline = asyncio.get_running_loop().time() + float(spec["startup_timeout_seconds"])
-        while process.returncode is None:
-            try:
-                current_socket_stat = socket_path.stat()
-                current_socket_identity = (
-                    current_socket_stat.st_dev,
-                    current_socket_stat.st_ino,
-                    current_socket_stat.st_ctime_ns,
-                )
-                socket_ready = (
-                    stat.S_ISSOCK(current_socket_stat.st_mode)
-                    and (
-                        stale_socket_identity is None
-                        or current_socket_identity != stale_socket_identity
+        ))
+        process: asyncio.subprocess.Process | None = None
+        try:
+            # Shield process creation so cancellation cannot lose ownership of
+            # a child created by the event loop just before the await unwinds.
+            process = await asyncio.shield(spawn_task)
+            deadline = asyncio.get_running_loop().time() + float(spec["startup_timeout_seconds"])
+            while process.returncode is None:
+                try:
+                    current_socket_stat = socket_path.stat()
+                    current_socket_identity = (
+                        current_socket_stat.st_dev,
+                        current_socket_stat.st_ino,
+                        current_socket_stat.st_ctime_ns,
                     )
-                )
-            except FileNotFoundError:
-                socket_ready = False
-            if socket_ready:
-                break
-            if asyncio.get_running_loop().time() >= deadline:
-                await self._terminate_telegram_bridge_persistent_worker(
-                    spec["agent_id"],
-                    process,
-                )
-                raise TimeoutError(f"persistent worker startup timed out: {spec['agent_id']}")
-            await asyncio.sleep(0.05)
-        if process.returncode is not None:
+                    socket_ready = (
+                        stat.S_ISSOCK(current_socket_stat.st_mode)
+                        and (
+                            stale_socket_identity is None
+                            or current_socket_identity != stale_socket_identity
+                        )
+                    )
+                except FileNotFoundError:
+                    socket_ready = False
+                if socket_ready:
+                    return process
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError(f"persistent worker startup timed out: {spec['agent_id']}")
+                await asyncio.sleep(0.05)
             raise RuntimeError(f"persistent worker exited during startup: {spec['agent_id']}")
-        return process
+        except BaseException:
+            if process is None and not spawn_task.cancelled():
+                try:
+                    process = await asyncio.shield(spawn_task)
+                except BaseException:
+                    process = None
+            if process is not None:
+                try:
+                    await self._terminate_telegram_bridge_persistent_worker(
+                        spec["agent_id"], process
+                    )
+                except BaseException as cleanup_exc:
+                    logger.error(
+                        "[%s] Persistent specialist spawn cleanup failed: agent_id=%s error_type=%s",
+                        self.name,
+                        spec["agent_id"],
+                        type(cleanup_exc).__name__,
+                        exc_info=True,
+                    )
+            raise
 
     async def _terminate_telegram_bridge_persistent_worker(
         self,
         agent_id: str,
         process: asyncio.subprocess.Process,
     ) -> bool:
-        """Terminate one worker tree, escalating to SIGKILL after a bounded wait."""
+        """Cancellation-safely terminate a worker and its whole process group."""
+        termination = asyncio.create_task(
+            self._terminate_telegram_bridge_persistent_worker_impl(agent_id, process)
+        )
+        try:
+            return await asyncio.shield(termination)
+        except asyncio.CancelledError:
+            # The caller still receives cancellation, but only after bounded
+            # cleanup has relinquished ownership of the subprocess tree.
+            try:
+                await asyncio.shield(termination)
+            except BaseException as cleanup_exc:
+                logger.error(
+                    "[%s] Persistent specialist cancellation cleanup failed: agent_id=%s error_type=%s",
+                    self.name,
+                    agent_id,
+                    type(cleanup_exc).__name__,
+                    exc_info=True,
+                )
+            raise
+
+    @staticmethod
+    def _telegram_bridge_process_group_exists(pid: int) -> bool:
+        """Return whether a POSIX process group still has surviving members."""
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
+    async def _terminate_telegram_bridge_persistent_worker_impl(
+        self,
+        agent_id: str,
+        process: asyncio.subprocess.Process,
+    ) -> bool:
+        """Terminate one worker tree, escalating while descendants survive."""
+        # Once the tracked leader is already reaped, its numeric PGID is no
+        # longer proof of ownership: the kernel may have recycled it for an
+        # unrelated process group.  Descendant cleanup is safe only when this
+        # call first signaled the group while its tracked leader was live.
         if process.returncode is not None:
             return False
         pid = getattr(process, "pid", None)
+        use_process_group = isinstance(pid, int) and hasattr(os, "killpg") and os.name != "nt"
+        group_signaled = False
+        leader_timed_out = False
         try:
-            if isinstance(pid, int) and hasattr(os, "killpg"):
+            if use_process_group:
                 os.killpg(pid, signal.SIGTERM)
+                group_signaled = True
             else:
                 process.terminate()
         except ProcessLookupError:
@@ -7688,20 +7768,27 @@ class TelegramAdapter(BasePlatformAdapter):
                 process.wait(),
                 timeout=_PERSISTENT_WORKER_STOP_TIMEOUT,
             )
-            return False
         except asyncio.TimeoutError:
-            logger.warning(
-                "[%s] Persistent specialist recovery forced termination: agent_id=%s",
-                self.name,
-                agent_id,
-            )
-            try:
-                if isinstance(pid, int) and hasattr(os, "killpg"):
-                    os.killpg(pid, signal.SIGKILL)
-                else:
-                    process.kill()
-            except ProcessLookupError:
-                pass
+            leader_timed_out = True
+
+        group_survived = bool(
+            group_signaled and self._telegram_bridge_process_group_exists(pid)
+        )
+        if not leader_timed_out and not group_survived:
+            return False
+        logger.warning(
+            "[%s] Persistent specialist recovery forced termination: agent_id=%s",
+            self.name,
+            agent_id,
+        )
+        try:
+            if use_process_group:
+                os.killpg(pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        if process.returncode is None:
             try:
                 await asyncio.wait_for(
                     process.wait(),
@@ -7716,7 +7803,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 raise TimeoutError(
                     f"persistent worker could not be reaped after SIGKILL: {agent_id}"
                 ) from exc
-            return True
+        if use_process_group:
+            deadline = asyncio.get_running_loop().time() + _PERSISTENT_WORKER_KILL_TIMEOUT
+            while self._telegram_bridge_process_group_exists(pid):
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError(
+                        f"persistent worker process group survived SIGKILL: {agent_id}"
+                    )
+                await asyncio.sleep(0.05)
+        return True
 
     async def _stop_telegram_bridge_persistent_workers_locked(self) -> None:
         """Stop every tracked worker while the lifecycle lock is held."""
@@ -7741,7 +7836,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 continue
             logger.info("[%s] Persistent specialist worker stopped: %s", self.name, agent_id)
 
-    async def _recover_telegram_bridge_persistent_worker(self, error: Exception) -> bool:
+    async def _recover_telegram_bridge_persistent_worker(
+        self,
+        error: Exception,
+        worker_snapshot: dict[str, asyncio.subprocess.Process] | None = None,
+    ) -> bool:
         """Replace the worker identified by a terminal TBA service error.
 
         Returns ``True`` when ``error`` satisfies the recovery contract, even if
@@ -7762,68 +7861,117 @@ class TelegramAdapter(BasePlatformAdapter):
         agent_id = agent_id.strip()
         runtime_instance_id = runtime_instance_id.strip()
         recovery_key = (agent_id, runtime_instance_id)
-        lifecycle_lock = self._get_telegram_bridge_persistent_worker_lifecycle_lock()
-        async with lifecycle_lock:
-            recovery_keys = getattr(
-                self,
-                "_telegram_bridge_persistent_worker_recovery_keys",
-                set(),
-            )
-            self._telegram_bridge_persistent_worker_recovery_keys = recovery_keys
-            if recovery_key in recovery_keys:
-                return True
-            recovery_keys.add(recovery_key)
-            logger.warning(
-                "[%s] Persistent specialist recovery requested: agent_id=%s runtime_instance_id=%s code=%s",
+        retired = getattr(self, "_telegram_bridge_persistent_worker_retired_runtimes", set())
+        self._telegram_bridge_persistent_worker_retired_runtimes = retired
+        tasks = getattr(self, "_telegram_bridge_persistent_worker_recovery_tasks", {})
+        self._telegram_bridge_persistent_worker_recovery_tasks = tasks
+        if recovery_key in retired or agent_id in tasks:
+            return True
+        if getattr(self, "_telegram_bridge_persistent_workers_shutdown", False):
+            return True
+        workers = getattr(self, "_telegram_bridge_persistent_workers", {})
+        specs = getattr(self, "_telegram_bridge_persistent_worker_specs", {})
+        process = workers.get(agent_id)
+        spec = specs.get(agent_id)
+        if process is None or spec is None:
+            logger.error(
+                "[%s] Persistent specialist recovery failed: agent_id=%s runtime_instance_id=%s reason=worker_not_managed",
                 self.name,
                 agent_id,
                 runtime_instance_id,
-                code,
             )
-            if getattr(self, "_telegram_bridge_persistent_workers_shutdown", False):
-                logger.warning(
-                    "[%s] Persistent specialist recovery skipped during shutdown: agent_id=%s runtime_instance_id=%s",
-                    self.name,
-                    agent_id,
-                    runtime_instance_id,
-                )
-                return True
-            workers = getattr(self, "_telegram_bridge_persistent_workers", {})
-            specs = getattr(self, "_telegram_bridge_persistent_worker_specs", {})
-            process = workers.pop(agent_id, None)
-            spec = specs.get(agent_id)
-            if process is None or spec is None:
-                logger.error(
-                    "[%s] Persistent specialist recovery failed: agent_id=%s runtime_instance_id=%s reason=worker_not_managed",
-                    self.name,
-                    agent_id,
-                    runtime_instance_id,
-                )
-                return True
+            return True
+        if worker_snapshot is not None and worker_snapshot.get(agent_id) is not process:
+            logger.warning(
+                "[%s] Persistent specialist recovery ignored for stale worker: agent_id=%s runtime_instance_id=%s",
+                self.name,
+                agent_id,
+                runtime_instance_id,
+            )
+            return True
+        logger.warning(
+            "[%s] Persistent specialist recovery requested: agent_id=%s runtime_instance_id=%s code=%s",
+            self.name,
+            agent_id,
+            runtime_instance_id,
+            code,
+        )
+        task = asyncio.create_task(
+            self._run_telegram_bridge_persistent_worker_recovery(
+                agent_id, runtime_instance_id, process, dict(spec)
+            ),
+            name=f"telegram-specialist-recovery:{agent_id}",
+        )
+        tasks[agent_id] = task
+
+        def _recovery_done(done: asyncio.Task[Any]) -> None:
+            if tasks.get(agent_id) is done:
+                tasks.pop(agent_id, None)
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(_recovery_done)
+        return True
+
+    async def _run_telegram_bridge_persistent_worker_recovery(
+        self,
+        agent_id: str,
+        runtime_instance_id: str,
+        original_process: asyncio.subprocess.Process,
+        spec: dict[str, Any],
+    ) -> None:
+        """Own termination and retry replacement until success or shutdown."""
+        delay = _PERSISTENT_WORKER_RETRY_INITIAL_DELAY
+        original_terminated = False
+        while not getattr(self, "_telegram_bridge_persistent_workers_shutdown", False):
             try:
-                forced = await self._terminate_telegram_bridge_persistent_worker(
-                    agent_id,
-                    process,
-                )
-                replacement = await self._spawn_telegram_bridge_persistent_worker(spec)
-                workers[agent_id] = replacement
-                logger.info(
-                    "[%s] Persistent specialist recovery completed: agent_id=%s runtime_instance_id=%s forced=%s",
-                    self.name,
-                    agent_id,
-                    runtime_instance_id,
-                    forced,
-                )
+                lifecycle_lock = self._get_telegram_bridge_persistent_worker_lifecycle_lock()
+                async with lifecycle_lock:
+                    if getattr(self, "_telegram_bridge_persistent_workers_shutdown", False):
+                        return
+                    workers = getattr(self, "_telegram_bridge_persistent_workers", {})
+                    if not original_terminated:
+                        # Identity, not merely agent_id, is the ownership fence:
+                        # a delayed old-runtime signal can never kill a newer process.
+                        if workers.get(agent_id) is not original_process:
+                            return
+                        await self._terminate_telegram_bridge_persistent_worker(
+                            agent_id, original_process
+                        )
+                        workers.pop(agent_id, None)
+                        original_terminated = True
+                        self._telegram_bridge_persistent_worker_retired_runtimes.add(
+                            (agent_id, runtime_instance_id)
+                        )
+                    replacement = await self._spawn_telegram_bridge_persistent_worker(spec)
+                    if getattr(self, "_telegram_bridge_persistent_workers_shutdown", False):
+                        await self._terminate_telegram_bridge_persistent_worker(
+                            agent_id, replacement
+                        )
+                        return
+                    workers[agent_id] = replacement
+                    logger.info(
+                        "[%s] Persistent specialist recovery completed: agent_id=%s runtime_instance_id=%s",
+                        self.name,
+                        agent_id,
+                        runtime_instance_id,
+                    )
+                    return
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
                 logger.error(
-                    "[%s] Persistent specialist recovery failed: agent_id=%s runtime_instance_id=%s error_type=%s",
+                    "[%s] Persistent specialist recovery failed; retrying: agent_id=%s runtime_instance_id=%s error_type=%s",
                     self.name,
                     agent_id,
                     runtime_instance_id,
                     type(exc).__name__,
                     exc_info=True,
                 )
-            return True
+            if getattr(self, "_telegram_bridge_persistent_workers_shutdown", False):
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2.0, _PERSISTENT_WORKER_RETRY_MAX_DELAY)
 
     async def _start_telegram_bridge_notification_worker(self) -> None:
         dispatcher = self._load_telegram_bridge_dispatcher()
@@ -7948,10 +8096,14 @@ class TelegramAdapter(BasePlatformAdapter):
             hermes_known = False
         profile_root, hermes_base = paths
         render_retry_failed = False
+        worker_snapshot: dict[str, asyncio.subprocess.Process] | None = None
         try:
             if not dispatcher.can_handle_command(profile_root, command, hermes_known=hermes_known):
                 return False
             user_id = getattr(getattr(msg, "from_user", None), "id", None) or getattr(msg.chat, "id", None)
+            worker_snapshot = dict(
+                getattr(self, "_telegram_bridge_persistent_workers", {})
+            )
             result = await self._await_telegram_bridge_dispatch(
                 int(msg.chat_id),
                 dispatcher.dispatch_command,
@@ -7985,7 +8137,7 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.info("[%s] Telegram bridge handled /%s (%s)", self.name, command, result.reason)
             return True
         except Exception as exc:
-            await self._recover_telegram_bridge_persistent_worker(exc)
+            await self._recover_telegram_bridge_persistent_worker(exc, worker_snapshot)
             logger.error("[%s] Telegram bridge command failed: %s", self.name, exc, exc_info=True)
             if render_retry_failed:
                 logger.warning(
@@ -8013,8 +8165,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         profile_root, hermes_base = paths
         render_retry_failed = False
+        worker_snapshot: dict[str, asyncio.subprocess.Process] | None = None
         try:
             user_id = getattr(getattr(msg, "from_user", None), "id", None) or getattr(msg.chat, "id", None)
+            worker_snapshot = dict(
+                getattr(self, "_telegram_bridge_persistent_workers", {})
+            )
             result = await self._await_telegram_bridge_dispatch(
                 int(msg.chat_id),
                 dispatch_text,
@@ -8048,7 +8204,7 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.info("[%s] Telegram bridge handled text (%s)", self.name, result.reason)
             return True
         except Exception as exc:
-            await self._recover_telegram_bridge_persistent_worker(exc)
+            await self._recover_telegram_bridge_persistent_worker(exc, worker_snapshot)
             logger.error("[%s] Telegram bridge text failed: %s", self.name, exc, exc_info=True)
             if render_retry_failed:
                 logger.warning(
@@ -8075,7 +8231,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         profile_root, hermes_base = paths
         render_retry_failed = False
+        worker_snapshot: dict[str, asyncio.subprocess.Process] | None = None
         try:
+            worker_snapshot = dict(
+                getattr(self, "_telegram_bridge_persistent_workers", {})
+            )
             result = await self._await_telegram_bridge_dispatch(
                 int(message.chat_id),
                 dispatcher.dispatch_callback,
@@ -8110,7 +8270,7 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.info("[%s] Telegram bridge handled callback %s (%s)", self.name, data, result.reason)
             return True
         except Exception as exc:
-            await self._recover_telegram_bridge_persistent_worker(exc)
+            await self._recover_telegram_bridge_persistent_worker(exc, worker_snapshot)
             logger.error("[%s] Telegram bridge callback failed: %s", self.name, exc, exc_info=True)
             if render_retry_failed:
                 try:

@@ -24,6 +24,18 @@ def _make_adapter():
     return adapter
 
 
+@pytest.fixture(autouse=True)
+def _default_process_groups_exit_with_leader(monkeypatch):
+    """Most process doubles have no descendants; focused tests override this."""
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    monkeypatch.setattr(
+        TelegramAdapter,
+        "_telegram_bridge_process_group_exists",
+        staticmethod(lambda _pid: False),
+    )
+
+
 class DeliveryOutcomeUnknown(RuntimeError):
     delivery_outcome_unknown = True
 
@@ -335,6 +347,12 @@ def _create_process_with_ready_socket(process, socket_path, opened_sockets):
     return create
 
 
+async def _await_recovery(adapter, agent_id="myhomestead"):
+    """Await an adapter-owned recovery task captured before its done callback."""
+    task = adapter._telegram_bridge_persistent_worker_recovery_tasks[agent_id]
+    await task
+
+
 @pytest.mark.asyncio
 async def test_terminal_persistent_error_replaces_only_affected_worker(tmp_path, monkeypatch):
     adapter = _make_adapter()
@@ -362,6 +380,7 @@ async def test_terminal_persistent_error_replaces_only_affected_worker(tmp_path,
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
 
     recovered = await adapter._recover_telegram_bridge_persistent_worker(PersistentRecoveryRequired())
+    await _await_recovery(adapter)
 
     assert recovered is True
     assert signals == [(stuck.pid, signal.SIGTERM)]
@@ -438,6 +457,58 @@ async def test_spawn_never_accepts_preexisting_regular_file_as_socket(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_cancelled_spawn_reaps_child_created_during_cancellation(tmp_path, monkeypatch):
+    adapter = _make_adapter()
+    spec = _persistent_spec(tmp_path, "myhomestead")
+    process = _PersistentProcess(1181)
+    create_started = asyncio.Event()
+    release_create = asyncio.Event()
+    signals = []
+
+    async def delayed_create(*_args, **_kwargs):
+        create_started.set()
+        await release_create.wait()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", delayed_create)
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    spawn = asyncio.create_task(adapter._spawn_telegram_bridge_persistent_worker(spec))
+    await create_started.wait()
+    spawn.cancel()
+    release_create.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await spawn
+
+    assert signals == [(process.pid, signal.SIGTERM)]
+    assert process.returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_spawn_preserves_cancellation_when_cleanup_fails(tmp_path, monkeypatch):
+    adapter = _make_adapter()
+    spec = _persistent_spec(tmp_path, "myhomestead")
+    process = _PersistentProcess(1182)
+    child_created = asyncio.Event()
+
+    async def create_without_socket(*_args, **_kwargs):
+        child_created.set()
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_without_socket)
+    adapter._terminate_telegram_bridge_persistent_worker = AsyncMock(
+        side_effect=RuntimeError("cleanup failed")
+    )
+    spawn = asyncio.create_task(adapter._spawn_telegram_bridge_persistent_worker(spec))
+    await child_created.wait()
+    await asyncio.sleep(0)
+    spawn.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await spawn
+
+
+@pytest.mark.asyncio
 async def test_duplicate_terminal_signal_does_not_replace_worker_twice(tmp_path, monkeypatch):
     adapter = _make_adapter()
     stuck = _PersistentProcess(1201)
@@ -460,6 +531,7 @@ async def test_duplicate_terminal_signal_does_not_replace_worker_twice(tmp_path,
 
     assert await adapter._recover_telegram_bridge_persistent_worker(error) is True
     assert await adapter._recover_telegram_bridge_persistent_worker(error) is True
+    await _await_recovery(adapter)
 
     assert create.await_count == 1
     assert adapter._telegram_bridge_persistent_workers["myhomestead"] is replacement
@@ -507,6 +579,7 @@ async def test_persistent_recovery_force_kills_uninterruptible_worker_group(tmp_
     )
 
     assert await adapter._recover_telegram_bridge_persistent_worker(PersistentRecoveryRequired()) is True
+    await _await_recovery(adapter)
 
     assert signals == [(stuck.pid, signal.SIGTERM), (stuck.pid, signal.SIGKILL)]
     assert adapter._telegram_bridge_persistent_workers["myhomestead"] is replacement
@@ -544,14 +617,94 @@ async def test_persistent_recovery_fails_when_worker_cannot_be_reaped_after_sigk
     create = AsyncMock()
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
 
-    assert await asyncio.wait_for(
-        adapter._recover_telegram_bridge_persistent_worker(PersistentRecoveryRequired()),
-        timeout=0.1,
-    ) is True
+    with pytest.raises(TimeoutError, match="could not be reaped"):
+        await adapter._terminate_telegram_bridge_persistent_worker("myhomestead", stuck)
 
     assert signals == [(stuck.pid, signal.SIGTERM), (stuck.pid, signal.SIGKILL)]
     assert create.await_count == 0
-    assert "Persistent specialist recovery failed" in caplog.text
+    assert "could not be reaped after SIGKILL" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_termination_does_not_signal_recycled_group_for_already_dead_leader(monkeypatch):
+    adapter = _make_adapter()
+    process = _PersistentProcess(1361)
+    process.returncode = 0
+    signals = []
+    group_exists = MagicMock(return_value=True)
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(
+        adapter,
+        "_telegram_bridge_process_group_exists",
+        group_exists,
+    )
+
+    forced = await adapter._terminate_telegram_bridge_persistent_worker(
+        "myhomestead", process
+    )
+
+    assert forced is False
+    assert signals == []
+    group_exists.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_termination_kills_descendants_after_signaled_leader_exits(monkeypatch):
+    adapter = _make_adapter()
+    process = _PersistentProcess(1362)
+    group_alive = True
+    signals = []
+
+    def killpg(pid, sig):
+        nonlocal group_alive
+        signals.append((pid, sig))
+        if sig == signal.SIGKILL:
+            group_alive = False
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    monkeypatch.setattr(
+        adapter,
+        "_telegram_bridge_process_group_exists",
+        lambda _pid: group_alive,
+    )
+
+    forced = await adapter._terminate_telegram_bridge_persistent_worker(
+        "myhomestead", process
+    )
+
+    assert forced is True
+    assert signals == [
+        (process.pid, signal.SIGTERM),
+        (process.pid, signal.SIGKILL),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_termination_preserves_cancellation_when_cleanup_fails(monkeypatch):
+    adapter = _make_adapter()
+    process = _PersistentProcess(1363)
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def failing_cleanup(_agent_id, _process):
+        cleanup_started.set()
+        await release_cleanup.wait()
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(
+        adapter,
+        "_terminate_telegram_bridge_persistent_worker_impl",
+        failing_cleanup,
+    )
+    termination = asyncio.create_task(
+        adapter._terminate_telegram_bridge_persistent_worker("myhomestead", process)
+    )
+    await cleanup_started.wait()
+    termination.cancel()
+    release_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await termination
 
 
 @pytest.mark.asyncio
@@ -618,24 +771,129 @@ async def test_stop_signals_other_workers_when_one_cannot_be_reaped(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_persistent_recovery_records_replacement_start_failure(tmp_path, monkeypatch, caplog):
+async def test_persistent_recovery_retries_failed_replacement_without_blocking_handler(
+    tmp_path, monkeypatch, caplog
+):
+    from plugins.platforms.telegram import adapter as telegram_adapter
+
     adapter = _make_adapter()
     stuck = _PersistentProcess(1401)
+    replacement = _PersistentProcess(1402)
     adapter._telegram_bridge_persistent_workers = {"myhomestead": stuck}
     adapter._telegram_bridge_persistent_worker_specs = {
         "myhomestead": _persistent_spec(tmp_path, "myhomestead"),
     }
     monkeypatch.setattr(os, "killpg", lambda _pid, _sig: None)
-    monkeypatch.setattr(
-        asyncio,
-        "create_subprocess_exec",
-        AsyncMock(side_effect=RuntimeError("replacement unavailable")),
+    monkeypatch.setattr(telegram_adapter, "_PERSISTENT_WORKER_RETRY_INITIAL_DELAY", 0)
+    ready_sockets = []
+    ready_create = _create_process_with_ready_socket(
+        replacement,
+        Path(adapter._telegram_bridge_persistent_worker_specs["myhomestead"]["socket_path"]),
+        ready_sockets,
     )
+    attempts = 0
 
-    assert await adapter._recover_telegram_bridge_persistent_worker(PersistentRecoveryRequired()) is True
+    async def create(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("replacement unavailable")
+        return await ready_create(*args, **kwargs)
 
-    assert "myhomestead" not in adapter._telegram_bridge_persistent_workers
-    assert "Persistent specialist recovery failed" in caplog.text
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+
+    assert await asyncio.wait_for(
+        adapter._recover_telegram_bridge_persistent_worker(PersistentRecoveryRequired()),
+        timeout=0.1,
+    ) is True
+    await _await_recovery(adapter)
+
+    assert attempts == 2
+    assert adapter._telegram_bridge_persistent_workers["myhomestead"] is replacement
+    assert "recovery failed; retrying" in caplog.text
+    for ready_socket in ready_sockets:
+        ready_socket.close()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_recovery_and_reaps_unpublished_replacement(
+    tmp_path, monkeypatch
+):
+    adapter = _make_adapter()
+    stuck = _PersistentProcess(1411)
+    replacement = _PersistentProcess(1412)
+    adapter._telegram_bridge_persistent_workers = {"myhomestead": stuck}
+    adapter._telegram_bridge_persistent_worker_specs = {
+        "myhomestead": _persistent_spec(tmp_path, "myhomestead"),
+    }
+    replacement_created = asyncio.Event()
+    signals = []
+
+    async def create_without_socket(*_args, **_kwargs):
+        replacement_created.set()
+        return replacement
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_without_socket)
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+
+    await adapter._recover_telegram_bridge_persistent_worker(PersistentRecoveryRequired())
+    await replacement_created.wait()
+    await adapter._stop_telegram_bridge_persistent_workers()
+
+    assert (stuck.pid, signal.SIGTERM) in signals
+    assert (replacement.pid, signal.SIGTERM) in signals
+    assert adapter._telegram_bridge_persistent_workers == {}
+    assert adapter._telegram_bridge_persistent_worker_recovery_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_recovery_does_not_sleep_after_spawn_failure_publishes_shutdown(
+    tmp_path, monkeypatch
+):
+    adapter = _make_adapter()
+    stuck = _PersistentProcess(1413)
+    adapter._telegram_bridge_persistent_workers = {"myhomestead": stuck}
+    adapter._telegram_bridge_persistent_worker_specs = {
+        "myhomestead": _persistent_spec(tmp_path, "myhomestead"),
+    }
+    monkeypatch.setattr(os, "killpg", lambda _pid, _sig: None)
+
+    async def fail_during_shutdown(*_args, **_kwargs):
+        adapter._telegram_bridge_persistent_workers_shutdown = True
+        raise RuntimeError("shutdown won")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_during_shutdown)
+
+    await adapter._recover_telegram_bridge_persistent_worker(PersistentRecoveryRequired())
+    await asyncio.wait_for(_await_recovery(adapter), timeout=0.1)
+
+    assert adapter._telegram_bridge_persistent_workers == {}
+
+
+@pytest.mark.asyncio
+async def test_dispatch_snapshot_prevents_delayed_old_runtime_from_killing_replacement(
+    tmp_path, monkeypatch
+):
+    adapter = _make_adapter()
+    old_process = _PersistentProcess(1421)
+    replacement = _PersistentProcess(1422)
+    adapter._telegram_bridge_persistent_workers = {"myhomestead": replacement}
+    adapter._telegram_bridge_persistent_worker_specs = {
+        "myhomestead": _persistent_spec(tmp_path, "myhomestead"),
+    }
+    signals = []
+    create = AsyncMock()
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+
+    assert await adapter._recover_telegram_bridge_persistent_worker(
+        PersistentRecoveryRequired(),
+        {"myhomestead": old_process},
+    ) is True
+
+    assert signals == []
+    assert create.await_count == 0
+    assert adapter._telegram_bridge_persistent_workers["myhomestead"] is replacement
 
 
 @pytest.mark.asyncio
@@ -644,8 +902,11 @@ async def test_bridge_text_consumes_terminal_recovery_signal(tmp_path):
     adapter._bot.username = "bridge_bot"
     adapter.send = AsyncMock()
     adapter._recover_telegram_bridge_persistent_worker = AsyncMock(return_value=True)
+    worker = _PersistentProcess(1501)
+    adapter._telegram_bridge_persistent_workers = {"myhomestead": worker}
     dispatcher = MagicMock()
-    dispatcher.dispatch_text.side_effect = PersistentRecoveryRequired()
+    error = PersistentRecoveryRequired()
+    dispatcher.dispatch_text.side_effect = error
     adapter._load_telegram_bridge_dispatcher = MagicMock(return_value=dispatcher)
     adapter._telegram_bridge_paths = MagicMock(return_value=(tmp_path / "bridge", tmp_path))
     msg = SimpleNamespace(
@@ -659,7 +920,10 @@ async def test_bridge_text_consumes_terminal_recovery_signal(tmp_path):
 
     assert await adapter._maybe_handle_telegram_bridge_text(SimpleNamespace(update_id=1), msg) is True
 
-    adapter._recover_telegram_bridge_persistent_worker.assert_awaited_once()
+    adapter._recover_telegram_bridge_persistent_worker.assert_awaited_once_with(
+        error,
+        {"myhomestead": worker},
+    )
     adapter.send.assert_awaited_once_with(
         "123",
         "I couldn't complete that request just now. Please try again.",
