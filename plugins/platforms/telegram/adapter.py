@@ -7646,10 +7646,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     current_socket_stat.st_ctime_ns,
                 )
                 socket_ready = (
-                    stale_socket_identity is None
-                    or (
-                        stat.S_ISSOCK(current_socket_stat.st_mode)
-                        and current_socket_identity != stale_socket_identity
+                    stat.S_ISSOCK(current_socket_stat.st_mode)
+                    and (
+                        stale_socket_identity is None
+                        or current_socket_identity != stale_socket_identity
                     )
                 )
             except FileNotFoundError:
@@ -7722,8 +7722,23 @@ class TelegramAdapter(BasePlatformAdapter):
         """Stop every tracked worker while the lifecycle lock is held."""
         workers = getattr(self, "_telegram_bridge_persistent_workers", {})
         self._telegram_bridge_persistent_workers = {}
-        for agent_id, process in workers.items():
-            await self._terminate_telegram_bridge_persistent_worker(agent_id, process)
+        worker_items = list(workers.items())
+        results = await asyncio.gather(
+            *(
+                self._terminate_telegram_bridge_persistent_worker(agent_id, process)
+                for agent_id, process in worker_items
+            ),
+            return_exceptions=True,
+        )
+        for (agent_id, _process), result in zip(worker_items, results):
+            if isinstance(result, BaseException):
+                logger.error(
+                    "[%s] Persistent specialist worker shutdown failed: agent_id=%s error_type=%s",
+                    self.name,
+                    agent_id,
+                    type(result).__name__,
+                )
+                continue
             logger.info("[%s] Persistent specialist worker stopped: %s", self.name, agent_id)
 
     async def _recover_telegram_bridge_persistent_worker(self, error: Exception) -> bool:

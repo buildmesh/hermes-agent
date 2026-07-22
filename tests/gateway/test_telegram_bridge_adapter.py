@@ -5,6 +5,7 @@ import os
 import signal
 import socket
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -219,9 +220,8 @@ async def test_bridge_persistent_worker_lifecycle(tmp_path, monkeypatch):
     adapter._telegram_bridge_persistent_workers = {}
     profile_root = tmp_path / "profiles/telegram-bridge"
     specialist = tmp_path / "profiles/hello-world-specialist"
-    socket_path = specialist / "state/runtime/hello.sock"
-    socket_path.parent.mkdir(parents=True)
-    socket_path.touch()
+    socket_path = tmp_path / "hello.sock"
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
 
     dispatcher = MagicMock()
     dispatcher.persistent_service_specs.return_value = [{
@@ -256,7 +256,10 @@ async def test_bridge_persistent_worker_lifecycle(tmp_path, monkeypatch):
             self.returncode = -9
 
     process = Process()
-    create = AsyncMock(return_value=process)
+    ready_sockets = []
+    create = AsyncMock(
+        side_effect=_create_process_with_ready_socket(process, socket_path, ready_sockets),
+    )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
     monkeypatch.setenv("HERMES_HOME", str(profile_root))
     monkeypatch.setenv("TERMINAL_CWD", str(profile_root))
@@ -279,13 +282,15 @@ async def test_bridge_persistent_worker_lifecycle(tmp_path, monkeypatch):
 
     assert process.terminated is True
     assert adapter._telegram_bridge_persistent_workers == {}
+    for ready_socket in ready_sockets:
+        ready_socket.close()
 
 
 def _persistent_spec(tmp_path, agent_id):
     """Build one validated persistent-service spec for lifecycle tests."""
     profile_root = tmp_path / "profiles" / agent_id
-    socket_path = profile_root / "state/runtime/worker.sock"
-    socket_path.parent.mkdir(parents=True)
+    socket_path = tmp_path / f"{agent_id}.sock"
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
     socket_path.touch()
     return {
         "agent_id": agent_id,
@@ -318,6 +323,18 @@ class _PersistentProcess:
         return self.returncode
 
 
+def _create_process_with_ready_socket(process, socket_path, opened_sockets):
+    """Return a subprocess factory that creates the worker's Unix socket."""
+    async def create(*_args, **_kwargs):
+        socket_path.unlink(missing_ok=True)
+        ready_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        ready_socket.bind(str(socket_path))
+        opened_sockets.append(ready_socket)
+        return process
+
+    return create
+
+
 @pytest.mark.asyncio
 async def test_terminal_persistent_error_replaces_only_affected_worker(tmp_path, monkeypatch):
     adapter = _make_adapter()
@@ -334,7 +351,14 @@ async def test_terminal_persistent_error_replaces_only_affected_worker(tmp_path,
     }
     signals = []
     monkeypatch.setattr(os, "killpg", lambda pid, sig: signals.append((pid, sig)))
-    create = AsyncMock(return_value=replacement)
+    ready_sockets = []
+    create = AsyncMock(
+        side_effect=_create_process_with_ready_socket(
+            replacement,
+            Path(adapter._telegram_bridge_persistent_worker_specs["myhomestead"]["socket_path"]),
+            ready_sockets,
+        ),
+    )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
 
     recovered = await adapter._recover_telegram_bridge_persistent_worker(PersistentRecoveryRequired())
@@ -347,6 +371,8 @@ async def test_terminal_persistent_error_replaces_only_affected_worker(tmp_path,
     }
     assert create.await_count == 1
     assert create.await_args.kwargs["start_new_session"] is True
+    for ready_socket in ready_sockets:
+        ready_socket.close()
 
 
 @pytest.mark.asyncio
@@ -390,6 +416,28 @@ async def test_spawn_waits_for_child_to_replace_preexisting_stale_socket(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_spawn_never_accepts_preexisting_regular_file_as_socket(tmp_path, monkeypatch):
+    from plugins.platforms.telegram import adapter as telegram_adapter
+
+    adapter = _make_adapter()
+    spec = _persistent_spec(tmp_path, "myhomestead")
+    spec["startup_timeout_seconds"] = 0.01
+    socket_path = Path(spec["socket_path"])
+    socket_path.write_text("preserve me", encoding="utf-8")
+    process = _PersistentProcess(1171)
+    signals = []
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    monkeypatch.setattr(telegram_adapter, "_PERSISTENT_WORKER_STOP_TIMEOUT", 0.01)
+
+    with pytest.raises(TimeoutError, match="startup timed out"):
+        await adapter._spawn_telegram_bridge_persistent_worker(spec)
+
+    assert socket_path.read_text(encoding="utf-8") == "preserve me"
+    assert signals == [(process.pid, signal.SIGTERM)]
+
+
+@pytest.mark.asyncio
 async def test_duplicate_terminal_signal_does_not_replace_worker_twice(tmp_path, monkeypatch):
     adapter = _make_adapter()
     stuck = _PersistentProcess(1201)
@@ -399,7 +447,14 @@ async def test_duplicate_terminal_signal_does_not_replace_worker_twice(tmp_path,
         "myhomestead": _persistent_spec(tmp_path, "myhomestead"),
     }
     monkeypatch.setattr(os, "killpg", lambda _pid, _sig: None)
-    create = AsyncMock(return_value=replacement)
+    ready_sockets = []
+    create = AsyncMock(
+        side_effect=_create_process_with_ready_socket(
+            replacement,
+            Path(adapter._telegram_bridge_persistent_worker_specs["myhomestead"]["socket_path"]),
+            ready_sockets,
+        ),
+    )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
     error = PersistentRecoveryRequired()
 
@@ -408,6 +463,8 @@ async def test_duplicate_terminal_signal_does_not_replace_worker_twice(tmp_path,
 
     assert create.await_count == 1
     assert adapter._telegram_bridge_persistent_workers["myhomestead"] is replacement
+    for ready_socket in ready_sockets:
+        ready_socket.close()
 
 
 @pytest.mark.asyncio
@@ -436,12 +493,25 @@ async def test_persistent_recovery_force_kills_uninterruptible_worker_group(tmp_
     }
     signals = []
     monkeypatch.setattr(os, "killpg", lambda pid, sig: signals.append((pid, sig)))
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=replacement))
+    ready_sockets = []
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(
+            side_effect=_create_process_with_ready_socket(
+                replacement,
+                Path(adapter._telegram_bridge_persistent_worker_specs["myhomestead"]["socket_path"]),
+                ready_sockets,
+            ),
+        ),
+    )
 
     assert await adapter._recover_telegram_bridge_persistent_worker(PersistentRecoveryRequired()) is True
 
     assert signals == [(stuck.pid, signal.SIGTERM), (stuck.pid, signal.SIGKILL)]
     assert adapter._telegram_bridge_persistent_workers["myhomestead"] is replacement
+    for ready_socket in ready_sockets:
+        ready_socket.close()
 
 
 @pytest.mark.asyncio
@@ -512,6 +582,39 @@ async def test_shutdown_winning_lifecycle_lock_prevents_recovery_replacement(tmp
     assert signals == [(stuck.pid, signal.SIGTERM)]
     assert create.await_count == 0
     assert adapter._telegram_bridge_persistent_workers == {}
+
+
+@pytest.mark.asyncio
+async def test_stop_signals_other_workers_when_one_cannot_be_reaped(monkeypatch, caplog):
+    from plugins.platforms.telegram import adapter as telegram_adapter
+
+    adapter = _make_adapter()
+
+    class UnreapableProcess(_PersistentProcess):
+        """Process double that remains stuck after both termination signals."""
+
+        async def wait(self):
+            await asyncio.Event().wait()
+
+    stuck = UnreapableProcess(1381)
+    healthy = _PersistentProcess(1382)
+    adapter._telegram_bridge_persistent_workers = {
+        "myhomestead": stuck,
+        "healthmesh": healthy,
+    }
+    signals = []
+    monkeypatch.setattr(os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(telegram_adapter, "_PERSISTENT_WORKER_STOP_TIMEOUT", 0.01)
+    monkeypatch.setattr(telegram_adapter, "_PERSISTENT_WORKER_KILL_TIMEOUT", 0.01)
+
+    await asyncio.wait_for(adapter._stop_telegram_bridge_persistent_workers(), timeout=0.1)
+
+    assert (stuck.pid, signal.SIGTERM) in signals
+    assert (stuck.pid, signal.SIGKILL) in signals
+    assert (healthy.pid, signal.SIGTERM) in signals
+    assert healthy.returncode == 0
+    assert adapter._telegram_bridge_persistent_workers == {}
+    assert "Persistent specialist worker shutdown failed" in caplog.text
 
 
 @pytest.mark.asyncio
