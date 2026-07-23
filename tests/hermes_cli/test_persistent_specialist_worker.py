@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import signal
@@ -17,9 +18,11 @@ import hermes_cli.persistent_specialist_worker as persistent_worker
 from hermes_cli.persistent_specialist_worker import (
     PROTOCOL,
     PROTOCOL_V2,
+    PROTOCOL_V3,
     PersistentSpecialistWorker,
     _initialize_worker_process_context,
     _extract_render_payloads,
+    _terminal_presenter_is_final_and_unbatched,
 )
 
 
@@ -43,6 +46,42 @@ def test_extract_render_payloads_repairs_one_missing_container_close() -> None:
 def test_extract_render_payloads_rejects_other_malformed_json() -> None:
     with pytest.raises(ValueError):
         _extract_render_payloads('[{"render":{"text":"broken" "blocks":[]}}]')
+
+
+def test_terminal_presenter_finality_rejects_batched_tool_call() -> None:
+    result = {"messages": [
+        {"role": "user", "content": "prompt"},
+        {"role": "assistant", "tool_calls": [
+            {"id": "call_domain", "function": {"name": "domain_tool"}},
+            {"id": "call_present", "function": {"name": "finalize_telegram_presentation"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_present", "content": "artifact"},
+    ]}
+
+    assert not _terminal_presenter_is_final_and_unbatched(result, "prompt", "artifact")
+
+
+def test_terminal_presenter_finality_allows_failed_retry_but_rejects_calls_after_success() -> None:
+    result = {"messages": [
+        {"role": "user", "content": "prompt"},
+        {"role": "assistant", "tool_calls": [
+            {"id": "call_failed", "function": {"name": "finalize_telegram_presentation"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_failed", "content": "{\"error\":true}"},
+        {"role": "assistant", "tool_calls": [
+            {"id": "call_success", "function": {"name": "finalize_telegram_presentation"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_success", "content": "artifact"},
+    ]}
+
+    assert _terminal_presenter_is_final_and_unbatched(result, "prompt", "artifact")
+    result["messages"].extend([
+        {"role": "assistant", "tool_calls": [
+            {"id": "call_late", "function": {"name": "finalize_telegram_presentation"}},
+        ]},
+        {"role": "tool", "tool_call_id": "call_late", "content": "{\"error\":true}"},
+    ])
+    assert not _terminal_presenter_is_final_and_unbatched(result, "prompt", "artifact")
 
 
 class FakeAgent:
@@ -151,6 +190,92 @@ def v2_request(event_id: str, operation: str = "turn") -> dict:
     value = request(event_id, operation)
     value["protocol_version"] = PROTOCOL_V2
     return value
+
+
+def v3_request(event_id: str, operation: str = "turn") -> dict:
+    value = request(event_id, operation)
+    value["protocol_version"] = PROTOCOL_V3
+    value["_terminal_presenter_negotiated"] = True
+    return value
+
+
+def install_test_presenter(root: Path) -> None:
+    handler = root / "skills/test/present.py"
+    schema = root / "contract/test.input.schema.json"
+    handler.parent.mkdir(parents=True)
+    schema.parent.mkdir(parents=True)
+    handler.write_text(
+        "import json,sys\n"
+        "value=json.load(sys.stdin)\n"
+        "sys.stdout.write(json.dumps(value['payloads'], separators=(',', ':')))\n",
+        encoding="utf-8",
+    )
+    schema.write_text(json.dumps({
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"payloads": {"type": "array"}},
+    }), encoding="utf-8")
+    manifest = {
+        "schema_version": "telegram.bridge.terminal_presenters.v1",
+        "presenters": [{
+            "presenter_id": "test-presenter",
+            "version": "1.0.0",
+            "description": "Render a test payload.",
+            "handler": "skills/test/present.py",
+            "sha256": "sha256:" + hashlib.sha256(handler.read_bytes()).hexdigest(),
+            "input_schema": "contract/test.input.schema.json",
+            "input_schema_sha256": "sha256:" + hashlib.sha256(schema.read_bytes()).hexdigest(),
+            "command": ["python3", "{handler}"],
+            "timeout_seconds": 2,
+            "max_output_bytes": 4096,
+        }],
+    }
+    (root / "contract/terminal-presenters.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+class TerminalPresenterAgent(FakeAgent):
+    def run_conversation(self, prompt: str) -> dict:
+        from hermes_cli.terminal_presenter import invoke_presenter_endpoint
+
+        self.turns += 1
+        envelope = json.loads(prompt.split("Envelope JSON:\n", 1)[1])
+        payload = [{
+            "schema_version": "telegram.bridge.render_payload.v1",
+            "message_id": f"msg_{envelope['event_id']}",
+            "correlation_id": envelope["event_id"],
+            "action": "send",
+            "target": {"chat_id": envelope["chat_id"]},
+            "render": {"text": "exact presenter"},
+        }]
+        content = invoke_presenter_endpoint(
+            "test-presenter",
+            {"payloads": payload},
+            profile_root=Path(self.session_cwd),
+        )
+        return {
+            "completed": True,
+            "partial": False,
+            "final_response": "model prose must not win",
+            "messages": [
+                {"role": "user", "content": prompt},
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_terminal_presenter",
+                        "function": {
+                            "name": "finalize_telegram_presentation",
+                            "arguments": "{}",
+                        }
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_terminal_presenter",
+                    "content": content,
+                },
+                {"role": "assistant", "content": "model prose must not win"},
+            ],
+        }
 
 
 def correction_request(event_id: str, attempt_id: str = "corr_attempt_1") -> dict:
@@ -949,7 +1074,7 @@ async def test_v2_completed_turn_persists_raw_malformed_render_candidate(tmp_pat
 
     candidate = '[{"schema_version":"telegram.bridge.render_payload.v1"'
     assert response["protocol_version"] == PROTOCOL_V2
-    assert response["status"] == "completed"
+    assert response["status"] == "completed", response
     assert response["execution_state"] == "completed"
     assert response["presentation_state"] == "candidate_unvalidated"
     assert response["render_candidate"]["content"] == candidate
@@ -961,6 +1086,56 @@ async def test_v2_completed_turn_persists_raw_malformed_render_candidate(tmp_pat
     assert ledger["presentation_state"] == "candidate_unvalidated"
     assert ledger["render_candidate"] == candidate
     assert ledger["render_candidate_sha256"] == response["render_candidate"]["sha256"]
+
+
+@pytest.mark.asyncio
+async def test_v3_terminal_presenter_promotes_exact_output_and_replays(
+    tmp_path: Path,
+) -> None:
+    install_test_presenter(tmp_path)
+    agents: list[TerminalPresenterAgent] = []
+
+    def factory() -> TerminalPresenterAgent:
+        agent = TerminalPresenterAgent()
+        agents.append(agent)
+        return agent
+
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=factory,
+    )
+    await worker.start()
+    request_value = v3_request("terminal-presenter")
+    try:
+        response = await worker.handle_request(request_value)
+        replay = await worker.handle_request(request_value)
+    finally:
+        await worker.stop()
+
+    expected = json.dumps([{
+        "schema_version": "telegram.bridge.render_payload.v1",
+        "message_id": "msg_terminal-presenter",
+        "correlation_id": "terminal-presenter",
+        "action": "send",
+        "target": {"chat_id": 123},
+        "render": {"text": "exact presenter"},
+    }], sort_keys=True, separators=(",", ":"))
+    assert response["status"] == "completed", response
+    assert response["render_candidate"]["content"] == expected
+    assert response["candidate_source"] == {
+        "kind": "terminal_presenter",
+        "presenter_id": "test-presenter",
+        "presenter_version": "1.0.0",
+        "presenter_sha256": hashlib.sha256(
+            (tmp_path / "skills/test/present.py").read_bytes()
+        ).hexdigest(),
+        "invocation_id": response["candidate_source"]["invocation_id"],
+    }
+    assert response["candidate_source"]["invocation_id"].startswith("present_")
+    assert replay == response
+    assert len(agents) == 1 and agents[0].turns == 1
 
 
 class ModelReportingAgent(FakeAgent):
@@ -1977,6 +2152,57 @@ async def test_worker_socket_negotiation_permissions_and_restart_recovery(tmp_pa
         assert_terminal_log(tmp_path, accepted_replay, "accepted-recovery", "turn_replayed")
     finally:
         await recovered.stop()
+
+
+@pytest.mark.asyncio
+async def test_v3_declined_presenter_capability_is_not_enabled(tmp_path: Path) -> None:
+    install_test_presenter(tmp_path)
+    agents: list[FakeAgent] = []
+
+    def factory() -> FakeAgent:
+        agent = FakeAgent()
+        agents.append(agent)
+        return agent
+
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="hello_world",
+        agent_factory=factory,
+    )
+    await worker.start()
+    serve = asyncio.create_task(worker.serve_forever())
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(worker.socket_path))
+        writer.write(json.dumps({
+            "protocol_version": PROTOCOL_V3,
+            "request_id": "req_hello_v3_declined",
+            "operation": "hello",
+            "client": {"name": "telegram-bridge", "revision": "test"},
+            "accepted_capabilities": [],
+        }).encode() + b"\n")
+        await writer.drain()
+        negotiated = json.loads(await reader.readline())
+        assert "terminal_presenter_finalization.v1" not in negotiated["capabilities"]
+        turn = v3_request("v3-declined")
+        turn.pop("_terminal_presenter_negotiated")
+        writer.write(json.dumps(turn).encode() + b"\n")
+        await writer.drain()
+        response = json.loads(await reader.readline())
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        serve.cancel()
+        await asyncio.gather(serve, return_exceptions=True)
+        await worker.stop()
+
+    assert response["status"] == "completed"
+    assert response["candidate_source"] == {"kind": "model_final"}
+    assert "finalize_telegram_presentation" not in agents[0].prompts[0]
+    endpoint = json.loads(
+        (tmp_path / "state/persistent-runtime/presenter-endpoint.json").read_text()
+    ) if (tmp_path / "state/persistent-runtime/presenter-endpoint.json").exists() else {}
+    assert "turn_token" not in endpoint
 
 
 @pytest.mark.asyncio

@@ -65,6 +65,8 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     # Cronjob management
     "cronjob",
+    # Persistent Telegram specialist presenter (profile-declaration gated).
+    "finalize_telegram_presentation",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Kanban multi-agent coordination — only in schema when the agent is
@@ -161,6 +163,12 @@ TOOLSETS = {
         "description": "Terminal/command execution and process management tools",
         "tools": ["terminal", "process"],
         "includes": []
+    },
+
+    "terminal_presenter": {
+        "description": "Declared deterministic presentation for persistent Telegram specialists",
+        "tools": ["finalize_telegram_presentation"],
+        "includes": [],
     },
     
     "skills": {

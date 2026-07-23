@@ -29,10 +29,20 @@ from agent.render_correction_companion import (
     run_companion_subprocess,
     validate_companion_descriptor,
 )
+from hermes_cli.terminal_presenter import (
+    ENDPOINT_RELATIVE_PATH,
+    MAX_PRESENTER_WIRE_BYTES,
+    PRESENTER_PROTOCOL,
+    TerminalPresenterError,
+    execute_terminal_presenter,
+    load_terminal_presenters,
+)
 
 
 PROTOCOL = "telegram.bridge.persistent_service.v1"
 PROTOCOL_V2 = "telegram.bridge.persistent_service.v2"
+PROTOCOL_V3 = "telegram.bridge.persistent_service.v3"
+TERMINAL_PRESENTER_CAPABILITY = "terminal_presenter_finalization.v1"
 MAX_LINE_BYTES = 1024 * 1024
 MAX_CANDIDATE_BYTES = 512 * 1024
 LEDGER_RETENTION = timedelta(days=30)
@@ -222,6 +232,31 @@ def _validate_v2_request(request: dict[str, Any]) -> None:
         raise ValueError("invalid callback query constraint")
 
 
+def _validate_v3_request(request: dict[str, Any]) -> None:
+    """Validate v3, which adds explicit hello capability acceptance."""
+    if request.get("protocol_version") != PROTOCOL_V3:
+        raise ValueError("invalid protocol version")
+    if request.get("operation") == "hello":
+        if set(request) != {
+            "protocol_version", "request_id", "operation", "client", "accepted_capabilities",
+        }:
+            raise ValueError("invalid closed request shape")
+        accepted = request.get("accepted_capabilities")
+        if (
+            not isinstance(accepted, list)
+            or len(accepted) != len(set(accepted))
+            or any(not isinstance(item, str) or not 1 <= len(item) <= 128 for item in accepted)
+        ):
+            raise ValueError("invalid accepted capabilities")
+        v2_hello = {key: value for key, value in request.items() if key != "accepted_capabilities"}
+        v2_hello["protocol_version"] = PROTOCOL_V2
+        _validate_v2_request(v2_hello)
+        return
+    compatible = dict(request)
+    compatible["protocol_version"] = PROTOCOL_V2
+    _validate_v2_request(compatible)
+
+
 def _extract_render_payloads(text: str) -> list[dict[str, Any]]:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -277,15 +312,79 @@ def _repair_missing_container_close(text: str, error_pos: int) -> str | None:
     return text[:error_pos] + expected + text[error_pos:]
 
 
-def _bridge_prompt(envelope: dict[str, Any]) -> str:
+def _bridge_prompt(envelope: dict[str, Any], *, terminal_presenter: bool = False) -> str:
+    presenter_instruction = (
+        " If you use finalize_telegram_presentation, invoke it only after all domain work and as "
+        "the final tool. Its exact presenter output becomes the Telegram response, so after the "
+        "tool result reply only with a brief acknowledgement and do not reproduce the JSON."
+        if terminal_presenter
+        else ""
+    )
     return (
         "Handle the following Telegram Bridge specialist envelope using this profile's skills and "
         "instructions. Return only a JSON array of telegram.bridge.render_payload.v1 objects. "
         "Do not call Telegram directly. Preserve event_id as correlation_id and use the envelope "
-        "chat_id as the send target. "
+        "chat_id as the send target."
+        + presenter_instruction
+        + " "
         + CANONICAL_RENDER_ENVELOPE_INSTRUCTIONS
         + "\n\nEnvelope JSON:\n"
         + json.dumps(envelope, ensure_ascii=False, sort_keys=True)
+    )
+
+
+def _terminal_presenter_is_final_and_unbatched(
+    result: dict[str, Any],
+    prompt: str,
+    artifact_content: str,
+) -> bool:
+    messages = result.get("messages")
+    if not isinstance(messages, list):
+        return False
+    start = next((
+        index
+        for index in range(len(messages) - 1, -1, -1)
+        if isinstance(messages[index], dict)
+        and messages[index].get("role") == "user"
+        and messages[index].get("content") == prompt
+    ), -1)
+    if start < 0:
+        return False
+    calls: list[tuple[str, str, int]] = []
+    successful_call_ids: set[str] = set()
+    for message in messages[start + 1 :]:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list):
+            batch_size = len(message["tool_calls"])
+            for call in message["tool_calls"]:
+                function = call.get("function") if isinstance(call, dict) else None
+                call_id = call.get("id") if isinstance(call, dict) else None
+                name = function.get("name") if isinstance(function, dict) else None
+                if isinstance(call_id, str) and isinstance(name, str):
+                    calls.append((call_id, name, batch_size))
+        elif (
+            message.get("role") == "tool"
+            and message.get("content") == artifact_content
+            and isinstance(message.get("tool_call_id"), str)
+        ):
+            successful_call_ids.add(message["tool_call_id"])
+    if not calls or not successful_call_ids:
+        return False
+    successful = [call for call in calls if call[0] in successful_call_ids]
+    return (
+        len(successful) == 1
+        and successful[0] == calls[-1]
+        and successful[0][2] == 1
+        and _is_terminal_presenter_tool(successful[0][1])
+    )
+
+
+def _is_terminal_presenter_tool(name: str) -> bool:
+    return (
+        name == "finalize_telegram_presentation"
+        or name.endswith(".finalize_telegram_presentation")
+        or name.endswith("__finalize_telegram_presentation")
     )
 
 
@@ -367,6 +466,12 @@ class PersistentSpecialistWorker:
         self._unhealthy = False
         self._ledger_dir = self.profile_root / "state/persistent-runtime/ledger"
         self._log_path = self.profile_root / "logs/persistent-specialist.jsonl"
+        self._presenter_endpoint_path = self.profile_root / ENDPOINT_RELATIVE_PATH
+        self._active_presenter_turn: dict[str, Any] | None = None
+        try:
+            self._terminal_presenters = load_terminal_presenters(self.profile_root)
+        except TerminalPresenterError:
+            self._terminal_presenters = {}
 
     def _log_event(self, event: str, **fields: Any) -> None:
         value = {
@@ -391,6 +496,34 @@ class PersistentSpecialistWorker:
         agent.session_cwd = str(self.profile_root)
         return agent
 
+    def _write_presenter_endpoint(self, turn_token: str | None = None) -> None:
+        endpoint = {
+            "schema_version": "hermes.terminal_presenter_endpoint.v1",
+            "socket": str(self.socket_path.relative_to(self.profile_root)),
+            "runtime_instance_id": self.runtime_instance_id,
+        }
+        if turn_token is not None:
+            endpoint["turn_token"] = turn_token
+        _atomic_json(self._presenter_endpoint_path, endpoint)
+
+    def _begin_presenter_turn(self, request: dict[str, Any]) -> None:
+        token = f"present_turn_{uuid.uuid4().hex}"
+        self._active_presenter_turn = {
+            "turn_token": token,
+            "event_id": request["event_id"],
+            "conversation_id": request["conversation_id"],
+            "artifact": None,
+            "violation": None,
+        }
+        self._write_presenter_endpoint(token)
+
+    def _end_presenter_turn(self) -> None:
+        self._active_presenter_turn = None
+        if self._server is not None:
+            self._write_presenter_endpoint()
+        else:
+            self._presenter_endpoint_path.unlink(missing_ok=True)
+
     def _ledger_path(self, conversation_id: str, event_id: str) -> Path:
         return self._ledger_dir / f"{_ledger_key(conversation_id, event_id)}.json"
 
@@ -410,7 +543,9 @@ class PersistentSpecialistWorker:
                 and not record.get("correction_response")
             ):
                 correction_response = {
-                    "protocol_version": PROTOCOL_V2,
+                    "protocol_version": (
+                        PROTOCOL_V3 if record.get("protocol_version") == PROTOCOL_V3 else PROTOCOL_V2
+                    ),
                     "request_id": record.get("correction_request_id")
                     or f"req_recovered_correction_{record['event_id']}",
                     "operation": "correct_render",
@@ -494,6 +629,7 @@ class PersistentSpecialistWorker:
                 raise RuntimeError("refusing to replace a non-socket runtime path")
         self._server = await asyncio.start_unix_server(self._handle_connection, path=str(self.socket_path))
         os.chmod(self.socket_path, 0o600)
+        self._write_presenter_endpoint()
         self._log_event("worker_ready", socket=str(self.socket_path))
 
     async def stop(self) -> None:
@@ -503,6 +639,7 @@ class PersistentSpecialistWorker:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        self._presenter_endpoint_path.unlink(missing_ok=True)
         await self._conversation_lock.acquire()
         quiesced = False
         try:
@@ -599,20 +736,105 @@ class PersistentSpecialistWorker:
         writer.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
         await writer.drain()
 
+    async def _handle_presenter_request(self, request: dict[str, Any]) -> dict[str, Any]:
+        allowed = {"protocol_version", "operation", "turn_token", "presenter_id", "input"}
+        active = self._active_presenter_turn
+        if set(request) != allowed or request.get("operation") != "present":
+            return {
+                "protocol_version": PRESENTER_PROTOCOL,
+                "status": "failed",
+                "error": {"code": "PRESENTER_PROTOCOL_ERROR", "message": "invalid presenter request"},
+            }
+        if (
+            active is None
+            or request.get("turn_token") != active.get("turn_token")
+            or not self._terminal_presenters
+        ):
+            return {
+                "protocol_version": PRESENTER_PROTOCOL,
+                "status": "failed",
+                "error": {
+                    "code": "PRESENTER_TURN_UNAVAILABLE",
+                    "message": "no eligible persistent presenter turn is active",
+                },
+            }
+        if active.get("artifact") is not None:
+            active["violation"] = "multiple successful presenter invocations"
+            return {
+                "protocol_version": PRESENTER_PROTOCOL,
+                "status": "failed",
+                "error": {
+                    "code": "TERMINAL_PRESENTER_NOT_FINAL",
+                    "message": "the turn already has a successful terminal presenter",
+                },
+            }
+        presenter_id = request.get("presenter_id")
+        presenter_input = request.get("input")
+        if not isinstance(presenter_id, str) or not isinstance(presenter_input, dict):
+            return {
+                "protocol_version": PRESENTER_PROTOCOL,
+                "status": "failed",
+                "error": {"code": "PRESENTER_INPUT_INVALID", "message": "invalid presenter arguments"},
+            }
+        try:
+            artifact = await asyncio.to_thread(
+                execute_terminal_presenter,
+                self.profile_root,
+                presenter_id,
+                presenter_input,
+            )
+        except TerminalPresenterError as exc:
+            return {
+                "protocol_version": PRESENTER_PROTOCOL,
+                "status": "failed",
+                "error": {"code": exc.code, "message": str(exc)[:500]},
+            }
+        artifact["invocation_id"] = f"present_{uuid.uuid4().hex}"
+        completed_response = {
+            "protocol_version": PRESENTER_PROTOCOL,
+            "status": "completed",
+            "content": artifact["content"],
+            "sha256": artifact["sha256"],
+            "invocation_id": artifact["invocation_id"],
+        }
+        if len(json.dumps(completed_response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1 > MAX_PRESENTER_WIRE_BYTES:
+            return {
+                "protocol_version": PRESENTER_PROTOCOL,
+                "status": "failed",
+                "error": {
+                    "code": "PRESENTER_OUTPUT_TOO_LARGE",
+                    "message": "presenter output exceeds the protocol frame limit",
+                },
+            }
+        active["artifact"] = artifact
+        return completed_response
+
     async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         hello: dict[str, Any] | None = None
         request: dict[str, Any] | None = None
         try:
             hello = await self._read(reader)
-            if hello.get("protocol_version") not in {PROTOCOL, PROTOCOL_V2} or hello.get("operation") != "hello":
+            if hello.get("protocol_version") == PRESENTER_PROTOCOL:
+                await self._write(writer, await self._handle_presenter_request(hello))
+                return
+            if hello.get("protocol_version") not in {PROTOCOL, PROTOCOL_V2, PROTOCOL_V3} or hello.get("operation") != "hello":
                 raise ValueError("hello negotiation required")
             if hello["protocol_version"] == PROTOCOL_V2:
                 _validate_v2_request(hello)
+            elif hello["protocol_version"] == PROTOCOL_V3:
+                _validate_v3_request(hello)
             capabilities = [
                 "turn", "reset", "health", "shutdown", "durable_event_ledger", "render_candidate",
             ]
             if self._correction_companion_descriptor is not None:
                 capabilities.append("tool_free_render_correction")
+            accepted_raw = hello.get("accepted_capabilities")
+            accepted = set(accepted_raw) if isinstance(accepted_raw, list) else None
+            if (
+                self._terminal_presenters
+                and (accepted is None or TERMINAL_PRESENTER_CAPABILITY in accepted)
+            ):
+                capabilities.append(TERMINAL_PRESENTER_CAPABILITY)
             await self._write(writer, {
                 "protocol_version": hello["protocol_version"],
                 "request_id": hello["request_id"],
@@ -621,12 +843,18 @@ class PersistentSpecialistWorker:
                 "runtime_instance_id": self.runtime_instance_id,
                 "framework": "hermes",
                 "profile": self.profile_root.name,
-                "supported_protocol_versions": [PROTOCOL, PROTOCOL_V2],
+                "supported_protocol_versions": [PROTOCOL, PROTOCOL_V2, PROTOCOL_V3],
                 "capabilities": capabilities,
             })
             request = await self._read(reader)
             if request.get("protocol_version") == PROTOCOL_V2:
                 _validate_v2_request(request)
+            elif request.get("protocol_version") == PROTOCOL_V3:
+                _validate_v3_request(request)
+            request["_terminal_presenter_negotiated"] = (
+                request.get("protocol_version") == PROTOCOL_V3
+                and TERMINAL_PRESENTER_CAPABILITY in capabilities
+            )
             response = await self.handle_request(request)
             await self._write(writer, response)
             if request.get("operation") == "shutdown":
@@ -641,7 +869,7 @@ class PersistentSpecialistWorker:
                         request_id=str((request or hello or {}).get("request_id") or "req_error"),
                         operation=(
                             "health"
-                            if str((request or hello or {}).get("protocol_version") or "") == PROTOCOL_V2
+                            if str((request or hello or {}).get("protocol_version") or "") in {PROTOCOL_V2, PROTOCOL_V3}
                             else str((request or hello or {}).get("operation") or "health")
                         ),
                         protocol_version=str((request or hello or {}).get("protocol_version") or PROTOCOL),
@@ -707,7 +935,7 @@ class PersistentSpecialistWorker:
     ) -> dict[str, Any]:
         started = time.monotonic()
         return {
-            "protocol_version": PROTOCOL,
+            "protocol_version": str(record.get("protocol_version") or PROTOCOL),
             "request_id": record.get("request_id") or f"req_recovered_{record['event_id']}",
             "operation": record["operation"],
             "status": "failed",
@@ -732,7 +960,9 @@ class PersistentSpecialistWorker:
         if operation not in {"hello", "turn", "reset", "correct_render", "health", "shutdown"}:
             operation = "health"
         response = {
-            "protocol_version": protocol_version if protocol_version in {PROTOCOL, PROTOCOL_V2} else PROTOCOL,
+            "protocol_version": (
+                protocol_version if protocol_version in {PROTOCOL, PROTOCOL_V2, PROTOCOL_V3} else PROTOCOL
+            ),
             "request_id": request_id,
             "operation": operation,
             "status": "failed",
@@ -773,7 +1003,7 @@ class PersistentSpecialistWorker:
             "_trace_id": f"trace_{uuid.uuid4().hex}",
             "_started_at": time.monotonic(),
         }
-        if request.get("protocol_version") not in {PROTOCOL, PROTOCOL_V2}:
+        if request.get("protocol_version") not in {PROTOCOL, PROTOCOL_V2, PROTOCOL_V3}:
             return self._protocol_failure_response(
                 request_id=str(request.get("request_id") or "req_error"),
                 operation=str(request.get("operation") or "health"),
@@ -798,8 +1028,8 @@ class PersistentSpecialistWorker:
             self._log_terminal_response("worker_shutdown_requested", request, response)
             return response
         if operation == "correct_render":
-            if request["protocol_version"] != PROTOCOL_V2:
-                raise ValueError("correct_render requires protocol v2")
+            if request["protocol_version"] not in {PROTOCOL_V2, PROTOCOL_V3}:
+                raise ValueError("correct_render requires protocol v2 or v3")
             return await self._handle_correct_render(request)
         if operation not in {"turn", "reset"}:
             raise ValueError("unsupported operation")
@@ -960,6 +1190,7 @@ class PersistentSpecialistWorker:
                 initialization_ms = 0
                 retirement_started = time.monotonic()
                 model_started = time.monotonic()
+                presenter_turn_active = False
                 if request["operation"] == "reset":
                     retirement_started = time.monotonic()
                     remaining = max(0.1, self.reset_timeout - (time.monotonic() - started))
@@ -976,7 +1207,7 @@ class PersistentSpecialistWorker:
                             render_preparation=int((time.monotonic() - render_started) * 1000),
                         ),
                     )
-                    if request["protocol_version"] == PROTOCOL_V2:
+                    if request["protocol_version"] in {PROTOCOL_V2, PROTOCOL_V3}:
                         reset_candidate = response["render_candidate"]["content"]
                         record.update(
                             execution_state="completed",
@@ -984,12 +1215,25 @@ class PersistentSpecialistWorker:
                             render_candidate=reset_candidate,
                             render_candidate_sha256=_candidate_hash(reset_candidate),
                         )
+                        if request["protocol_version"] == PROTOCOL_V3:
+                            record["candidate_source"] = response["candidate_source"]
                 else:
+                    terminal_presenter_enabled = (
+                        request["protocol_version"] == PROTOCOL_V3
+                        and request.get("_terminal_presenter_negotiated") is True
+                        and bool(self._terminal_presenters)
+                    )
+                    if terminal_presenter_enabled:
+                        self._begin_presenter_turn(request)
+                        presenter_turn_active = True
                     initialization_started = time.monotonic()
                     if self._agent is None:
                         self._agent = await asyncio.to_thread(self._construct_agent)
                         initialization_ms = int((time.monotonic() - initialization_started) * 1000)
-                    prompt = _bridge_prompt(request["envelope"])
+                    prompt = _bridge_prompt(
+                        request["envelope"],
+                        terminal_presenter=terminal_presenter_enabled,
+                    )
                     model_started = time.monotonic()
                     model_task: asyncio.Task[Any] | None = None
                     try:
@@ -1009,6 +1253,32 @@ class PersistentSpecialistWorker:
                         raise RuntimeError(result.get("error") or "model turn did not complete")
                     render_started = time.monotonic()
                     candidate = result.get("final_response") or ""
+                    candidate_source: dict[str, Any] = {"kind": "model_final"}
+                    active_presenter = self._active_presenter_turn if presenter_turn_active else None
+                    artifact = active_presenter.get("artifact") if active_presenter else None
+                    if isinstance(artifact, dict):
+                        if active_presenter.get("violation"):
+                            raise TerminalPresenterError(
+                                "TERMINAL_PRESENTER_NOT_FINAL",
+                                str(active_presenter["violation"]),
+                            )
+                        if not _terminal_presenter_is_final_and_unbatched(
+                            result,
+                            prompt,
+                            str(artifact["content"]),
+                        ):
+                            raise TerminalPresenterError(
+                                "TERMINAL_PRESENTER_NOT_FINAL",
+                                "terminal presenter was not the final tool invocation",
+                            )
+                        candidate = str(artifact["content"])
+                        candidate_source = {
+                            "kind": "terminal_presenter",
+                            "presenter_id": artifact["presenter_id"],
+                            "presenter_version": artifact["presenter_version"],
+                            "presenter_sha256": artifact["presenter_sha256"],
+                            "invocation_id": artifact["invocation_id"],
+                        }
                     payloads = None
                     if request["protocol_version"] == PROTOCOL:
                         payloads = _extract_render_payloads(candidate)
@@ -1027,17 +1297,21 @@ class PersistentSpecialistWorker:
                         ),
                         **self._model_metadata(result),
                     }
-                    if request["protocol_version"] == PROTOCOL_V2:
+                    if request["protocol_version"] in {PROTOCOL_V2, PROTOCOL_V3}:
                         response_fields.update(
                             presentation_state="candidate_unvalidated",
                             render_candidate=_bounded_candidate(candidate),
                         )
+                        if request["protocol_version"] == PROTOCOL_V3:
+                            response_fields["candidate_source"] = candidate_source
                         record.update(
                             execution_state="completed",
                             presentation_state="candidate_unvalidated",
                             render_candidate=candidate,
                             render_candidate_sha256=_candidate_hash(candidate),
                         )
+                        if request["protocol_version"] == PROTOCOL_V3:
+                            record["candidate_source"] = candidate_source
                     else:
                         response_fields["render_payloads"] = payloads
                     response = self._base_response(request, **response_fields)
@@ -1046,6 +1320,29 @@ class PersistentSpecialistWorker:
                 record["state"] = "completed"
                 record["response"] = response
                 self._log_terminal_response("turn_completed", request, response)
+            except TerminalPresenterError as exc:
+                self.last_error_code = exc.code
+                response = self._failure(
+                    request,
+                    exc.code,
+                    str(exc),
+                    False,
+                    "completed",
+                    timing_ms=_timing_ms(
+                        started,
+                        queue=queue_ms,
+                        initialization=initialization_ms if request["operation"] == "turn" else 0,
+                        model_and_tools=(
+                            int((time.monotonic() - model_started) * 1000)
+                            if request["operation"] == "turn"
+                            else 0
+                        ),
+                    ),
+                )
+                record["state"] = "failed"
+                record["execution_state"] = "completed"
+                record["response"] = response
+                self._log_terminal_response("turn_failed", request, response)
             except asyncio.TimeoutError:
                 self._unhealthy = True
                 self.last_error_code = "TURN_TIMEOUT" if request["operation"] == "turn" else "RESET_UNCONFIRMED"
@@ -1089,6 +1386,8 @@ class PersistentSpecialistWorker:
             _atomic_json(path, record)
             return response
         finally:
+            if self._active_presenter_turn is not None:
+                self._end_presenter_turn()
             self._conversation_lock.release()
             if request["operation"] == "reset":
                 self._resetting = False
@@ -1115,6 +1414,13 @@ class PersistentSpecialistWorker:
             if record.get("execution_state") != "completed" or not isinstance(record.get("render_candidate"), str):
                 return self._correction_failure(
                     request, "ORIGINAL_EVENT_NOT_COMPLETED", "render correction requires completed domain execution",
+                    "correction_failed",
+                )
+            if (record.get("candidate_source") or {}).get("kind") == "terminal_presenter":
+                return self._correction_failure(
+                    request,
+                    "TERMINAL_PRESENTER_CORRECTION_FORBIDDEN",
+                    "terminal presenter candidates cannot receive model correction",
                     "correction_failed",
                 )
             existing_attempt = record.get("correction_attempt_id")
@@ -1240,9 +1546,13 @@ class PersistentSpecialistWorker:
                 render_candidate=_bounded_candidate(candidate),
                 timing_ms=_timing_ms(started, model_and_tools=int((time.monotonic() - started) * 1000)),
             )
+            if request["protocol_version"] == PROTOCOL_V3:
+                response["candidate_source"] = {"kind": "model_correction"}
             record["corrected_candidate"] = candidate
             record["corrected_candidate_sha256"] = _candidate_hash(candidate)
             record["presentation_state"] = "correction_candidate_unvalidated"
+            if request["protocol_version"] == PROTOCOL_V3:
+                record["corrected_candidate_source"] = response["candidate_source"]
         except CorrectionCompanionTimeout:
             self._unhealthy = True
             self.last_error_code = "CORRECTION_TIMEOUT"
@@ -1350,12 +1660,14 @@ class PersistentSpecialistWorker:
             "conversation_instance_id": self.conversation_instance_id,
             "timing_ms": timing_ms,
         }
-        if request["protocol_version"] == PROTOCOL_V2:
+        if request["protocol_version"] in {PROTOCOL_V2, PROTOCOL_V3}:
             candidate = json.dumps([payload], ensure_ascii=False, separators=(",", ":"))
             fields.update(
                 presentation_state="candidate_unvalidated",
                 render_candidate=_bounded_candidate(candidate),
             )
+            if request["protocol_version"] == PROTOCOL_V3:
+                fields["candidate_source"] = {"kind": "runtime_control"}
         else:
             fields["render_payloads"] = [payload]
         return self._base_response(request, **fields)
