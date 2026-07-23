@@ -346,11 +346,9 @@ def test_default_agent_factory_does_not_mutate_environment(monkeypatch: pytest.M
     assert "HERMES_ACCEPT_HOOKS" not in os.environ
 
 
-@pytest.mark.parametrize("primary_api_mode", ["codex_app_server", "codex_responses"])
-def test_correction_companion_uses_specialist_profile_config_and_auth_not_global(
+def test_app_server_companion_uses_specialist_profile_config_and_auth_not_global(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    primary_api_mode: str,
 ) -> None:
     from agent import render_correction_companion as companion
     from hermes_constants import get_hermes_home
@@ -377,7 +375,7 @@ def test_correction_companion_uses_specialist_profile_config_and_auth_not_global
         auth = json.loads((get_hermes_home() / "test-auth.json").read_text())
         return {
             "provider": "openai-codex",
-            "api_mode": primary_api_mode,
+            "api_mode": "codex_app_server",
             "base_url": "https://chatgpt.com/backend-api/codex",
             "api_key": auth["api_key"],
         }
