@@ -38,7 +38,7 @@ def _configured_model(config: dict[str, Any]) -> str:
 
 
 def _direct_runtime_config(runtime: dict[str, Any], model: str) -> dict[str, str] | None:
-    if runtime.get("api_mode") != "codex_app_server":
+    if runtime.get("api_mode") not in {"codex_app_server", "codex_responses"}:
         return None
     if runtime.get("provider") not in {"openai", "openai-codex"}:
         return None
