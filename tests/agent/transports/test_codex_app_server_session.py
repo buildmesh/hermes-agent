@@ -52,10 +52,34 @@ class FakeClient:
             return self._request_handler(method, params or {})
         # Sensible defaults for protocol methods used by the session
         if method == "thread/start":
-            return {"thread": {"id": "thread-fake-001"},
+            queued_thread_id = next(
+                (
+                    note.get("params", {}).get("threadId")
+                    for note in self._notifications
+                    if note.get("params", {}).get("threadId")
+                ),
+                "thread-fake-001",
+            )
+            return {"thread": {"id": queued_thread_id},
                     "activePermissionProfile": {"id": "workspace-write"}}
         if method == "turn/start":
-            return {"turn": {"id": "turn-fake-001"}}
+            queued_turn_id = next(
+                (
+                    note.get("params", {}).get("turnId")
+                    or (
+                        note.get("params", {}).get("turn") or {}
+                    ).get("id")
+                    for note in self._notifications
+                    if (
+                        note.get("params", {}).get("turnId")
+                        or (
+                            note.get("params", {}).get("turn") or {}
+                        ).get("id")
+                    )
+                ),
+                "turn-fake-001",
+            )
+            return {"turn": {"id": queued_turn_id}}
         if method == "turn/interrupt":
             return {}
         return {}
@@ -533,7 +557,7 @@ class TestRunTurn:
         assert any(m["role"] == "assistant" and m.get("content") == "hello world"
                    for m in r.projected_messages)
         # turn_id propagated for downstream session-DB linkage
-        assert r.turn_id == "turn-fake-001"
+        assert r.turn_id == "tu1"
 
     def test_token_usage_notification_is_captured(self):
         client = FakeClient()
@@ -743,7 +767,7 @@ class TestRunTurn:
         assert r.interrupted is True
         # turn/interrupt was requested with the right turnId
         assert any(
-            method == "turn/interrupt" and params.get("turnId") == "turn-fake-001"
+            method == "turn/interrupt" and params.get("turnId") == "tu1"
             for (method, params) in client.requests
         )
 
@@ -1197,15 +1221,134 @@ class TestSessionRetirement:
         )
         session = make_session(client)
 
-        result = session.run_turn("lookup", turn_timeout=1.0)
+        result = session.run_turn(
+            "lookup",
+            turn_timeout=1.0,
+            terminal_interrupt_timeout=0.01,
+        )
 
         assert result.final_text == "Terminal workflow completed."
         assert result.interrupted is False
-        assert result.should_retire is False
+        assert result.should_retire is True
         assert any(
             method == "turn/interrupt"
             for method, _params in client.requests
         )
+
+    def test_terminal_workflow_drains_completion_and_reuses_warm_thread(self):
+        client = FakeClient()
+        turn_number = 0
+
+        def handler(method, params):
+            nonlocal turn_number
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                turn_number += 1
+                turn_id = f"tu{turn_number}"
+                client.queue_notification(
+                    "item/completed",
+                    item={
+                        "type": "mcpToolCall",
+                        "id": f"workflow-{turn_number}",
+                        "server": "hermes-tools",
+                        "tool": "run_terminal_workflow",
+                        "arguments": {"workflow_id": "lookup", "input": {}},
+                        "result": {
+                            "content": [{"type": "text", "text": "artifact"}]
+                        },
+                        "error": None,
+                    },
+                    threadId="thread-fake-001",
+                    turnId=turn_id,
+                )
+                client.queue_notification(
+                    "turn/completed",
+                    threadId="thread-fake-001",
+                    turn={
+                        "id": turn_id,
+                        "status": "interrupted",
+                        "error": None,
+                    },
+                )
+                if turn_number == 1:
+                    client.queue_notification(
+                        "item/completed",
+                        item={
+                            "type": "agentMessage",
+                            "id": "late-first-turn-message",
+                            "text": "stale",
+                        },
+                        threadId="thread-fake-001",
+                        turnId=turn_id,
+                    )
+                    client.queue_notification(
+                        "thread/tokenUsage/updated",
+                        threadId="thread-fake-001",
+                        turnId=turn_id,
+                        tokenUsage={
+                            "last": {"totalTokens": 999},
+                            "total": {"totalTokens": 999},
+                        },
+                    )
+                return {"turn": {"id": turn_id}}
+            if method == "turn/interrupt":
+                return {}
+            return {}
+
+        client._request_handler = handler
+        session = make_session(client)
+
+        first = session.run_turn("lookup", turn_timeout=1.0)
+        second = session.run_turn("lookup", turn_timeout=1.0)
+
+        assert first.final_text == second.final_text == "Terminal workflow completed."
+        assert first.should_retire is False
+        assert second.should_retire is False
+        assert first.turn_id == "tu1"
+        assert second.turn_id == "tu2"
+        assert second.token_usage_last is None
+        assert all(
+            message.get("content") != "stale"
+            for message in second.projected_messages
+        )
+        assert turn_number == 2
+
+    def test_stale_completion_cannot_complete_next_warm_turn(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "old-turn", "status": "interrupted", "error": None},
+        )
+        client.queue_notification(
+            "item/completed",
+            item={"type": "agentMessage", "id": "m2", "text": "fresh"},
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={
+                "id": "turn-fake-001",
+                "status": "completed",
+                "error": None,
+            },
+        )
+        client._request_handler = lambda method, _params: (
+            {"thread": {"id": "thread-fake-001"}}
+            if method == "thread/start"
+            else {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/start"
+            else {}
+        )
+        session = make_session(client)
+
+        result = session.run_turn("next", turn_timeout=1.0)
+
+        assert result.final_text == "fresh"
+        assert result.turn_id == "turn-fake-001"
 
     def test_final_agent_message_without_turn_completed_is_recovered(self):
         """A completed assistant item is still a usable terminal response when

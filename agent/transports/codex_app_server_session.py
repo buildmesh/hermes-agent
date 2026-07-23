@@ -100,6 +100,35 @@ class TurnResult:
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
 
 
+def _notification_turn_identity(
+    note: dict[str, Any],
+) -> tuple[Optional[str], Optional[str]]:
+    """Return explicit thread/turn identity carried by an app-server note."""
+    params = note.get("params") if isinstance(note, dict) else None
+    if not isinstance(params, dict):
+        return None, None
+    turn = params.get("turn")
+    turn_id = params.get("turnId")
+    if not turn_id and isinstance(turn, dict):
+        turn_id = turn.get("id")
+    return params.get("threadId"), turn_id
+
+
+def _notification_matches_turn(
+    note: dict[str, Any],
+    *,
+    thread_id: str,
+    turn_id: Optional[str],
+) -> bool:
+    """Reject a note only when it explicitly identifies another turn."""
+    note_thread_id, note_turn_id = _notification_turn_identity(note)
+    if note_thread_id and note_thread_id != thread_id:
+        return False
+    if turn_id and note_turn_id and note_turn_id != turn_id:
+        return False
+    return True
+
+
 def _coerce_turn_input_text(user_input: Any) -> str:
     """Collapse Hermes/OpenAI rich content into app-server text input.
 
@@ -524,6 +553,7 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
+        terminal_interrupt_timeout: float = 5.0,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -558,6 +588,7 @@ class CodexAppServerSession:
         result.resolved_reasoning_effort = self._resolved_reasoning_effort
 
         self._interrupt_event.clear()
+        self._pending_file_changes.clear()
         projector = CodexEventProjector()
 
         user_input_text = _coerce_turn_input_text(user_input)
@@ -603,6 +634,8 @@ class CodexAppServerSession:
         result.turn_id = (ts.get("turn") or {}).get("id")
         deadline = time.monotonic() + turn_timeout
         turn_complete = False
+        terminal_workflow_completed = False
+        terminal_interrupt_deadline: Optional[float] = None
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
         # within post_tool_quiet_timeout and the turn hasn't completed, we
@@ -610,6 +643,17 @@ class CodexAppServerSession:
         last_tool_completion_at: Optional[float] = None
 
         while time.monotonic() < deadline and not turn_complete:
+            if (
+                terminal_interrupt_deadline is not None
+                and time.monotonic() >= terminal_interrupt_deadline
+            ):
+                logger.warning(
+                    "codex terminal-workflow interrupt did not reach matching "
+                    "turn/completed; retiring session"
+                )
+                result.should_retire = True
+                turn_complete = True
+                break
             if self._interrupt_event.is_set():
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
@@ -662,6 +706,19 @@ class CodexAppServerSession:
                     pending = self._client.take_notification(timeout=0)
                     if pending is None:
                         break
+                    if not _notification_matches_turn(
+                        pending,
+                        thread_id=self._thread_id,
+                        turn_id=result.turn_id,
+                    ):
+                        logger.debug(
+                            "discarding Codex notification for another turn"
+                        )
+                        continue
+                    if terminal_workflow_completed:
+                        if pending.get("method") == "turn/completed":
+                            turn_complete = True
+                        continue
                     _apply_token_usage_notification(result, pending)
                     _apply_compaction_notification(result, pending)
                     self._track_pending_file_change(pending)
@@ -693,6 +750,28 @@ class CodexAppServerSession:
                 continue
 
             method = note.get("method", "")
+            if method == "turn/started" and result.turn_id is None:
+                _note_thread_id, started_turn_id = (
+                    _notification_turn_identity(note)
+                )
+                if started_turn_id:
+                    result.turn_id = started_turn_id
+            if not _notification_matches_turn(
+                note,
+                thread_id=self._thread_id,
+                turn_id=result.turn_id,
+            ):
+                logger.debug(
+                    "discarding Codex notification for another turn"
+                )
+                continue
+            if terminal_workflow_completed:
+                if method == "turn/completed":
+                    turn_complete = True
+                # The terminal artifact is already authoritative. Drain only
+                # to the matching boundary; never project post-interrupt
+                # assistant/tool/usage events into this result.
+                continue
             if self._on_event is not None:
                 try:
                     self._on_event(note)
@@ -723,7 +802,13 @@ class CodexAppServerSession:
                     # producer→mapper→presenter chain.
                     self._issue_interrupt(result.turn_id)
                     result.final_text = "Terminal workflow completed."
-                    turn_complete = True
+                    terminal_workflow_completed = True
+                    terminal_interrupt_deadline = min(
+                        deadline,
+                        time.monotonic()
+                        + max(0.0, terminal_interrupt_timeout),
+                    )
+                    continue
             if projection.is_tool_iteration:
                 result.tool_iterations += 1
                 # Arm/refresh the post-tool quiet watchdog whenever a
@@ -775,6 +860,13 @@ class CodexAppServerSession:
                             result.error = self._format_error_with_stderr(
                                 f"turn ended status={turn_status}", err_msg
                             )
+
+        if terminal_workflow_completed and not turn_complete:
+            # The deterministic artifact remains the successful response, but
+            # a missing completion boundary makes the warm process unsafe to
+            # reuse. The caller will close it before accepting another turn.
+            result.should_retire = True
+            turn_complete = True
 
         if (
             not turn_complete
