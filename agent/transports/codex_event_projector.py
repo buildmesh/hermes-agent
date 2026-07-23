@@ -78,6 +78,32 @@ def _terminal_presenter_content_sha256(result: Any) -> Optional[str]:
     return None
 
 
+def _terminal_workflow_result_is_terminal(result: Any) -> bool:
+    if isinstance(result, dict):
+        text = result.get("text")
+        if isinstance(text, str):
+            try:
+                value = json.loads(text)
+            except (TypeError, ValueError):
+                return True
+            return not (
+                isinstance(value, dict)
+                and (
+                    "error" in value
+                    or value.get("outcome") == "continue"
+                )
+            )
+        for key in ("content", "structuredContent", "result"):
+            nested = result.get(key)
+            if nested is not None:
+                return _terminal_workflow_result_is_terminal(nested)
+    if isinstance(result, list):
+        return any(_terminal_workflow_result_is_terminal(item) for item in result)
+    if isinstance(result, str):
+        return _terminal_workflow_result_is_terminal({"text": result})
+    return False
+
+
 @dataclass
 class ProjectionResult:
     """Output of projecting one Codex item.
@@ -315,12 +341,20 @@ class CodexEventProjector:
         }
         if (
             server.replace("_", "-") == "hermes-tools"
-            and tool == "finalize_telegram_presentation"
+            and tool in {
+                "finalize_telegram_presentation",
+                "run_terminal_workflow",
+            }
             and not error
         ):
             content_sha256 = _terminal_presenter_content_sha256(result)
             if content_sha256:
                 tool_msg["terminal_presenter_content_sha256"] = content_sha256
+                if (
+                    tool == "run_terminal_workflow"
+                    and _terminal_workflow_result_is_terminal(result)
+                ):
+                    tool_msg["terminal_workflow_completed"] = True
         return ProjectionResult(
             messages=[assistant_msg, tool_msg], is_tool_iteration=True
         )

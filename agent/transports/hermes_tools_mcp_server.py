@@ -85,6 +85,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "text_to_speech",
     # Service-gated by a valid installed terminal-presenter declaration.
     "finalize_telegram_presentation",
+    "run_terminal_workflow",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
     # in the callback, a worker spawned with openai_runtime=codex_app_server
@@ -179,6 +180,24 @@ def _build_server() -> Any:
                 _dispatch_terminal_presenter.__name__ = tool_name
                 _dispatch_terminal_presenter.__doc__ = description
                 return _dispatch_terminal_presenter
+
+            if tool_name == "run_terminal_workflow":
+                def _dispatch_terminal_workflow(
+                    workflow_id: str,
+                    input: dict[str, Any],
+                ) -> str:
+                    try:
+                        return handle_function_call(
+                            tool_name,
+                            {"workflow_id": workflow_id, "input": input},
+                        )
+                    except Exception as exc:
+                        logger.exception("tool %s raised", tool_name)
+                        return json.dumps({"error": str(exc), "tool": tool_name})
+
+                _dispatch_terminal_workflow.__name__ = tool_name
+                _dispatch_terminal_workflow.__doc__ = description
+                return _dispatch_terminal_workflow
 
             def _dispatch(**kwargs: Any) -> str:
                 try:

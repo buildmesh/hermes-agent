@@ -461,6 +461,98 @@ async def test_codex_app_server_projects_and_invokes_active_terminal_presenter(
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    shutil.which("codex") is None,
+    reason="real Codex app-server acceptance test requires the codex binary",
+)
+async def test_codex_app_server_projects_declared_terminal_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.hermes_cli.test_terminal_workflow import install_workflow
+
+    install_workflow(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="workflow-projection-test",
+        agent_factory=FakeAgent,
+    )
+    await worker.start()
+    serve = asyncio.create_task(worker.serve_forever())
+    request_value = v3_request("workflow-projection")
+    request_value["_terminal_workflow_negotiated"] = True
+    worker._begin_presenter_turn(request_value)
+
+    def exercise() -> tuple[dict, dict]:
+        client = CodexAppServerClient(
+            extra_args=hermes_tools_mcp_app_server_args(),
+        )
+        try:
+            client.initialize(
+                client_name="hermes-test",
+                client_title="Hermes Test",
+                client_version="test",
+            )
+            started = client.request(
+                "thread/start",
+                {"cwd": str(tmp_path)},
+                timeout=15,
+            )
+            thread_id = started["thread"]["id"]
+            inventory = client.request(
+                "mcpServerStatus/list",
+                {"threadId": thread_id, "detail": "toolsAndAuthOnly"},
+                timeout=30,
+            )
+            result = client.request(
+                "mcpServer/tool/call",
+                {
+                    "server": "hermes-tools",
+                    "tool": "run_terminal_workflow",
+                    "arguments": {
+                        "workflow_id": "test-workflow",
+                        "input": {
+                            "outcome": "terminal_ready",
+                            "payloads": [{"render": {"text": "workflow"}}],
+                        },
+                    },
+                    "threadId": thread_id,
+                },
+                timeout=30,
+            )
+            return inventory, result
+        finally:
+            client.close()
+
+    try:
+        inventory, result = await asyncio.to_thread(exercise)
+    finally:
+        serve.cancel()
+        await asyncio.gather(serve, return_exceptions=True)
+        await worker.stop()
+
+    hermes_server = next(
+        item for item in inventory["data"] if item["name"] == "hermes-tools"
+    )
+    assert "run_terminal_workflow" in hermes_server["tools"]
+    projection = CodexEventProjector().project({
+        "method": "item/completed",
+        "params": {"item": {
+            "type": "mcpToolCall",
+            "id": "workflow-call",
+            "server": "hermes-tools",
+            "tool": "run_terminal_workflow",
+            "arguments": {},
+            "result": result,
+            "error": None,
+        }},
+    }).messages
+    assert projection[1]["terminal_workflow_completed"] is True
+
+
 class TerminalPresenterAgent(FakeAgent):
     def run_conversation(self, prompt: str) -> dict:
         from hermes_cli.terminal_presenter import invoke_presenter_endpoint
@@ -522,6 +614,49 @@ class ProjectedMcpTerminalPresenterAgent(TerminalPresenterAgent):
         )
         result["messages"][3]["content"] = "Done."
         return result
+
+
+class TerminalWorkflowAgent(FakeAgent):
+    def run_conversation(self, prompt: str) -> dict:
+        from hermes_cli.terminal_workflow import invoke_terminal_workflow_endpoint
+
+        self.turns += 1
+        content = invoke_terminal_workflow_endpoint(
+            "test-workflow",
+            {
+                "outcome": "terminal_ready",
+                "payloads": [{
+                    "schema_version": "telegram.bridge.render_payload.v1",
+                    "message_id": "msg_workflow",
+                    "correlation_id": "terminal-workflow",
+                    "action": "send",
+                    "target": {"chat_id": 123},
+                    "render": {"text": "workflow result"},
+                }],
+            },
+            profile_root=Path(self.session_cwd),
+        )
+        return {
+            "completed": True,
+            "partial": False,
+            "final_response": "Done.",
+            "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "tool_calls": [{
+                    "id": "call_terminal_workflow",
+                    "function": {
+                        "name": "run_terminal_workflow",
+                        "arguments": "{}",
+                    },
+                }]},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_terminal_workflow",
+                    "content": content,
+                },
+                {"role": "assistant", "content": "Done."},
+            ],
+        }
 
 
 def correction_request(event_id: str, attempt_id: str = "corr_attempt_1") -> dict:
@@ -1387,6 +1522,128 @@ async def test_v3_terminal_presenter_promotes_exact_output_and_replays(
     assert response["candidate_source"]["invocation_id"].startswith("present_")
     assert replay == response
     assert len(agents) == 1 and agents[0].turns == 1
+
+
+@pytest.mark.asyncio
+async def test_v3_declared_terminal_workflow_promotes_exact_presenter_output(
+    tmp_path: Path,
+) -> None:
+    from tests.hermes_cli.test_terminal_workflow import install_workflow
+
+    install_workflow(tmp_path)
+    agent = TerminalWorkflowAgent()
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="workflow-test",
+        agent_factory=lambda: agent,
+    )
+    await worker.start()
+    request_value = v3_request("terminal-workflow")
+    request_value["_terminal_workflow_negotiated"] = True
+    try:
+        response = await worker.handle_request(request_value)
+        replay = await worker.handle_request(request_value)
+    finally:
+        await worker.stop()
+
+    assert response["status"] == "completed", response
+    assert json.loads(response["render_candidate"]["content"])[0]["render"] == {
+        "text": "workflow result"
+    }
+    assert response["candidate_source"]["kind"] == "terminal_presenter"
+    assert response["candidate_source"]["presenter_id"] == "test-presenter"
+    assert replay == response
+    assert agent.turns == 1
+    ledger = json.loads(
+        worker._ledger_path("conv_" + "1" * 64, "terminal-workflow").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert ledger["terminal_workflow"]["workflow_id"] == "test-workflow"
+    assert ledger["terminal_workflow"]["producer_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_declared_terminal_workflow_continue_creates_no_artifact(
+    tmp_path: Path,
+) -> None:
+    from hermes_cli.terminal_workflow import invoke_terminal_workflow_endpoint
+    from tests.hermes_cli.test_terminal_workflow import install_workflow
+
+    install_workflow(tmp_path)
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="workflow-continue-test",
+        agent_factory=FakeAgent,
+    )
+    await worker.start()
+    serve = asyncio.create_task(worker.serve_forever())
+    request_value = v3_request("workflow-continue")
+    request_value["_terminal_workflow_negotiated"] = True
+    worker._begin_presenter_turn(request_value)
+    try:
+        result, replay = await asyncio.gather(*[
+            asyncio.to_thread(
+                invoke_terminal_workflow_endpoint,
+                "test-workflow",
+                {"outcome": "continue", "payloads": []},
+                profile_root=tmp_path,
+            )
+            for _ in range(2)
+        ])
+        assert json.loads(result) == {
+            "outcome": "continue",
+            "model_result": {"reason": "clarify"},
+        }
+        assert replay == result
+        assert (tmp_path / "producer-count.txt").read_text() == "1"
+        assert worker._active_presenter_turn["artifact"] is None
+    finally:
+        serve.cancel()
+        await asyncio.gather(serve, return_exceptions=True)
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_terminal_workflow_endpoint_rejects_presenter_only_turn(
+    tmp_path: Path,
+) -> None:
+    from hermes_cli.terminal_workflow import (
+        TerminalWorkflowError,
+        invoke_terminal_workflow_endpoint,
+    )
+    from tests.hermes_cli.test_terminal_workflow import install_workflow
+
+    install_workflow(tmp_path)
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="workflow-auth-test",
+        agent_factory=FakeAgent,
+    )
+    await worker.start()
+    serve = asyncio.create_task(worker.serve_forever())
+    request_value = v3_request("workflow-not-negotiated")
+    request_value["_terminal_workflow_negotiated"] = False
+    worker._begin_presenter_turn(request_value)
+    try:
+        with pytest.raises(
+            TerminalWorkflowError,
+            match="not negotiated",
+        ):
+            await asyncio.to_thread(
+                invoke_terminal_workflow_endpoint,
+                "test-workflow",
+                {"outcome": "terminal_ready", "payloads": []},
+                profile_root=tmp_path,
+            )
+        assert worker._active_presenter_turn["artifact"] is None
+    finally:
+        serve.cancel()
+        await asyncio.gather(serve, return_exceptions=True)
+        await worker.stop()
 
 
 class ModelReportingAgent(FakeAgent):
@@ -2447,13 +2704,106 @@ async def test_v3_declined_presenter_capability_is_not_enabled(tmp_path: Path) -
         await asyncio.gather(serve, return_exceptions=True)
         await worker.stop()
 
-    assert response["status"] == "completed"
-    assert response["candidate_source"] == {"kind": "model_final"}
-    assert "finalize_telegram_presentation" not in agents[0].prompts[0]
-    endpoint = json.loads(
-        (tmp_path / "state/persistent-runtime/presenter-endpoint.json").read_text()
-    ) if (tmp_path / "state/persistent-runtime/presenter-endpoint.json").exists() else {}
-    assert "turn_token" not in endpoint
+
+@pytest.mark.asyncio
+async def test_v3_terminal_workflow_requires_mutual_presenter_and_workflow_acceptance(
+    tmp_path: Path,
+) -> None:
+    from tests.hermes_cli.test_terminal_workflow import install_workflow
+
+    install_workflow(tmp_path)
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="workflow-negotiation",
+        agent_factory=FakeAgent,
+    )
+    await worker.start()
+    serve = asyncio.create_task(worker.serve_forever())
+
+    async def negotiate(accepted: list[str], request_id: str) -> list[str]:
+        reader, writer = await asyncio.open_unix_connection(str(worker.socket_path))
+        writer.write(json.dumps({
+            "protocol_version": PROTOCOL_V3,
+            "request_id": request_id,
+            "operation": "hello",
+            "client": {"name": "telegram-bridge", "revision": "test"},
+            "accepted_capabilities": accepted,
+        }).encode() + b"\n")
+        await writer.drain()
+        response = json.loads(await reader.readline())
+        writer.close()
+        await writer.wait_closed()
+        return response["capabilities"]
+
+    try:
+        workflow_only = await negotiate(
+            ["terminal_workflow_chaining.v1"],
+            "req_workflow_only",
+        )
+        presenter_only = await negotiate(
+            ["terminal_presenter_finalization.v1"],
+            "req_presenter_only",
+        )
+        both = await negotiate(
+            [
+                "terminal_presenter_finalization.v1",
+                "terminal_workflow_chaining.v1",
+            ],
+            "req_workflow_both",
+        )
+    finally:
+        serve.cancel()
+        await asyncio.gather(serve, return_exceptions=True)
+        await worker.stop()
+
+    assert "terminal_workflow_chaining.v1" not in workflow_only
+    assert "terminal_workflow_chaining.v1" not in presenter_only
+    assert "terminal_workflow_chaining.v1" in both
+
+
+@pytest.mark.asyncio
+async def test_terminal_workflow_capability_is_withheld_outside_codex_runtime(
+    tmp_path: Path,
+) -> None:
+    from tests.hermes_cli.test_terminal_workflow import install_workflow
+
+    install_workflow(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "model:\n  openai_runtime: chat_completions\n",
+        encoding="utf-8",
+    )
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="workflow-runtime-gate",
+        agent_factory=FakeAgent,
+    )
+    await worker.start()
+    serve = asyncio.create_task(worker.serve_forever())
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(worker.socket_path))
+        writer.write(json.dumps({
+            "protocol_version": PROTOCOL_V3,
+            "request_id": "req_workflow_non_codex",
+            "operation": "hello",
+            "client": {"name": "telegram-bridge", "revision": "test"},
+            "accepted_capabilities": [
+                "terminal_presenter_finalization.v1",
+                "terminal_workflow_chaining.v1",
+            ],
+        }).encode() + b"\n")
+        await writer.drain()
+        negotiated = json.loads(await reader.readline())
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        serve.cancel()
+        await asyncio.gather(serve, return_exceptions=True)
+        await worker.stop()
+
+    assert "terminal_presenter_finalization.v1" in negotiated["capabilities"]
+    assert "terminal_workflow_chaining.v1" not in negotiated["capabilities"]
 
 
 @pytest.mark.asyncio

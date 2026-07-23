@@ -40,12 +40,18 @@ from hermes_cli.terminal_presenter import (
     execute_terminal_presenter,
     load_terminal_presenters,
 )
+from hermes_cli.terminal_workflow import (
+    TerminalWorkflowError,
+    execute_terminal_workflow,
+    load_terminal_workflows,
+)
 
 
 PROTOCOL = "telegram.bridge.persistent_service.v1"
 PROTOCOL_V2 = "telegram.bridge.persistent_service.v2"
 PROTOCOL_V3 = "telegram.bridge.persistent_service.v3"
 TERMINAL_PRESENTER_CAPABILITY = "terminal_presenter_finalization.v1"
+TERMINAL_WORKFLOW_CAPABILITY = "terminal_workflow_chaining.v1"
 MAX_LINE_BYTES = 1024 * 1024
 MAX_CANDIDATE_BYTES = 512 * 1024
 LEDGER_RETENTION = timedelta(days=30)
@@ -256,6 +262,7 @@ def _validate_v3_request(request: dict[str, Any]) -> None:
         _validate_v2_request(v2_hello)
         return
     compatible = dict(request)
+    compatible.pop("accepted_capabilities", None)
     compatible["protocol_version"] = PROTOCOL_V2
     _validate_v2_request(compatible)
 
@@ -315,10 +322,23 @@ def _repair_missing_container_close(text: str, error_pos: int) -> str | None:
     return text[:error_pos] + expected + text[error_pos:]
 
 
-def _bridge_prompt(envelope: dict[str, Any], *, terminal_presenter: bool = False) -> str:
+def _bridge_prompt(
+    envelope: dict[str, Any],
+    *,
+    terminal_presenter: bool = False,
+    terminal_workflow: bool = False,
+) -> str:
     if terminal_presenter:
         completion_instruction = (
-            "The negotiated finalize_telegram_presentation tool is available for this turn. "
+            (
+                "The negotiated run_terminal_workflow tool is available for installed "
+                "read-only workflows. Prefer it whenever one declared workflow directly "
+                "matches the requested domain operation; it runs the producer, profile-owned "
+                "mapping, and presenter as one final, unbatched framework tool call. "
+                if terminal_workflow
+                else ""
+            )
+            + "The negotiated finalize_telegram_presentation tool is available for this turn. "
             "Choose exactly one completion path. When the installed profile declares a supported "
             "presentation for the result, you must invoke finalize_telegram_presentation after all "
             "domain work and as the final, unbatched tool call. Do not inspect or invoke the "
@@ -409,8 +429,11 @@ def _terminal_presenter_is_final_and_unbatched(
 def _is_terminal_presenter_tool(name: str) -> bool:
     return (
         name == "finalize_telegram_presentation"
+        or name == "run_terminal_workflow"
         or name.endswith(".finalize_telegram_presentation")
+        or name.endswith(".run_terminal_workflow")
         or name.endswith("__finalize_telegram_presentation")
+        or name.endswith("__run_terminal_workflow")
     )
 
 
@@ -498,6 +521,30 @@ class PersistentSpecialistWorker:
             self._terminal_presenters = load_terminal_presenters(self.profile_root)
         except TerminalPresenterError:
             self._terminal_presenters = {}
+        try:
+            self._terminal_workflows = load_terminal_workflows(self.profile_root)
+        except TerminalPresenterError:
+            self._terminal_workflows = {}
+        try:
+            import yaml
+
+            profile_config = yaml.safe_load(
+                (self.profile_root / "config.yaml").read_text(encoding="utf-8")
+            )
+            model_config = (
+                profile_config.get("model")
+                if isinstance(profile_config, dict)
+                else None
+            )
+            self._terminal_workflow_runtime_supported = (
+                isinstance(model_config, dict)
+                and str(model_config.get("provider") or "").strip().lower()
+                in {"openai", "openai-codex"}
+                and str(model_config.get("openai_runtime") or "").strip().lower()
+                == "codex_app_server"
+            )
+        except (OSError, UnicodeDecodeError, ValueError, TypeError):
+            self._terminal_workflow_runtime_supported = False
 
     def _log_event(self, event: str, **fields: Any) -> None:
         value = {
@@ -522,7 +569,12 @@ class PersistentSpecialistWorker:
         agent.session_cwd = str(self.profile_root)
         return agent
 
-    def _write_presenter_endpoint(self, turn_token: str | None = None) -> None:
+    def _write_presenter_endpoint(
+        self,
+        turn_token: str | None = None,
+        *,
+        terminal_workflow: bool = False,
+    ) -> None:
         endpoint = {
             "schema_version": "hermes.terminal_presenter_endpoint.v1",
             "socket": str(self.socket_path.relative_to(self.profile_root)),
@@ -530,6 +582,7 @@ class PersistentSpecialistWorker:
         }
         if turn_token is not None:
             endpoint["turn_token"] = turn_token
+            endpoint["terminal_workflow"] = terminal_workflow
         _atomic_json(self._presenter_endpoint_path, endpoint)
 
     def _begin_presenter_turn(self, request: dict[str, Any]) -> None:
@@ -540,8 +593,13 @@ class PersistentSpecialistWorker:
             "conversation_id": request["conversation_id"],
             "artifact": None,
             "violation": None,
+            "terminal_workflow": request.get("_terminal_workflow_negotiated") is True,
+            "workflow_lock": asyncio.Lock(),
         }
-        self._write_presenter_endpoint(token)
+        self._write_presenter_endpoint(
+            token,
+            terminal_workflow=self._active_presenter_turn["terminal_workflow"],
+        )
 
     def _end_presenter_turn(self) -> None:
         self._active_presenter_turn = None
@@ -762,10 +820,20 @@ class PersistentSpecialistWorker:
         writer.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
         await writer.drain()
 
-    async def _handle_presenter_request(self, request: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"protocol_version", "operation", "turn_token", "presenter_id", "input"}
+    async def _handle_presenter_request(
+        self,
+        request: dict[str, Any],
+        *,
+        workflow_locked: bool = False,
+    ) -> dict[str, Any]:
+        operation = request.get("operation")
+        allowed = (
+            {"protocol_version", "operation", "turn_token", "workflow_id", "input"}
+            if operation == "workflow"
+            else {"protocol_version", "operation", "turn_token", "presenter_id", "input"}
+        )
         active = self._active_presenter_turn
-        if set(request) != allowed or request.get("operation") != "present":
+        if set(request) != allowed or operation not in {"present", "workflow"}:
             return {
                 "protocol_version": PRESENTER_PROTOCOL,
                 "status": "failed",
@@ -784,6 +852,22 @@ class PersistentSpecialistWorker:
                     "message": "no eligible persistent presenter turn is active",
                 },
             }
+        if operation == "workflow" and not workflow_locked:
+            workflow_lock = active.get("workflow_lock")
+            if workflow_lock is None:
+                return {
+                    "protocol_version": PRESENTER_PROTOCOL,
+                    "status": "failed",
+                    "error": {
+                        "code": "PRESENTER_TURN_UNAVAILABLE",
+                        "message": "workflow turn synchronization is unavailable",
+                    },
+                }
+            async with workflow_lock:
+                return await self._handle_presenter_request(
+                    request,
+                    workflow_locked=True,
+                )
         if active.get("artifact") is not None:
             active["violation"] = "multiple successful presenter invocations"
             return {
@@ -793,6 +877,125 @@ class PersistentSpecialistWorker:
                     "code": "TERMINAL_PRESENTER_NOT_FINAL",
                     "message": "the turn already has a successful terminal presenter",
                 },
+            }
+        if operation == "workflow":
+            if active.get("terminal_workflow") is not True:
+                return {
+                    "protocol_version": PRESENTER_PROTOCOL,
+                    "status": "failed",
+                    "error": {
+                        "code": "WORKFLOW_NOT_NEGOTIATED",
+                        "message": "terminal workflow capability was not negotiated",
+                    },
+                }
+            workflow_id = request.get("workflow_id")
+            workflow_input = request.get("input")
+            if (
+                not isinstance(workflow_id, str)
+                or workflow_id not in self._terminal_workflows
+                or not isinstance(workflow_input, dict)
+            ):
+                return {
+                    "protocol_version": PRESENTER_PROTOCOL,
+                    "status": "failed",
+                    "error": {
+                        "code": "WORKFLOW_NOT_DECLARED",
+                        "message": "workflow is not declared",
+                    },
+                }
+            try:
+                continued = active.get("workflow_continue")
+                input_sha256 = hashlib.sha256(
+                    json.dumps(
+                        workflow_input,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if isinstance(continued, dict):
+                    if (
+                        continued.get("workflow_id") != workflow_id
+                        or continued.get("input_sha256") != input_sha256
+                    ):
+                        return {
+                            "protocol_version": PRESENTER_PROTOCOL,
+                            "status": "failed",
+                            "error": {
+                                "code": "WORKFLOW_ALREADY_COMPLETED",
+                                "message": "a producer already completed in this turn",
+                            },
+                        }
+                    return {
+                        "protocol_version": PRESENTER_PROTOCOL,
+                        "status": "continue",
+                        "model_result": continued.get("model_result"),
+                    }
+                checkpoint = active.get("workflow_checkpoint")
+                if (
+                    isinstance(checkpoint, dict)
+                    and checkpoint.get("workflow_id") != workflow_id
+                ):
+                    return {
+                        "protocol_version": PRESENTER_PROTOCOL,
+                        "status": "failed",
+                        "error": {
+                            "code": "WORKFLOW_ALREADY_COMPLETED",
+                            "message": "another producer already completed in this turn",
+                        },
+                    }
+                workflow_result = await asyncio.to_thread(
+                    execute_terminal_workflow,
+                    self.profile_root,
+                    workflow_id,
+                    workflow_input,
+                    checkpoint=checkpoint if isinstance(checkpoint, dict) else None,
+                )
+            except TerminalWorkflowError as exc:
+                if isinstance(exc.checkpoint, dict):
+                    active["workflow_checkpoint"] = exc.checkpoint
+                return {
+                    "protocol_version": PRESENTER_PROTOCOL,
+                    "status": "failed",
+                    "error": {"code": exc.code, "message": str(exc)[:500]},
+                }
+            if workflow_result["outcome"] == "continue":
+                active["workflow_continue"] = {
+                    "workflow_id": workflow_result["workflow_id"],
+                    "input_sha256": input_sha256,
+                    "model_result": workflow_result.get("model_result"),
+                }
+                return {
+                    "protocol_version": PRESENTER_PROTOCOL,
+                    "status": "continue",
+                    "model_result": workflow_result.get("model_result"),
+                }
+            active["workflow_checkpoint"] = workflow_result["checkpoint"]
+            try:
+                artifact = await asyncio.to_thread(
+                    execute_terminal_presenter,
+                    self.profile_root,
+                    workflow_result["presenter_id"],
+                    workflow_result["presenter_input"],
+                )
+            except TerminalPresenterError as exc:
+                return {
+                    "protocol_version": PRESENTER_PROTOCOL,
+                    "status": "failed",
+                    "error": {"code": exc.code, "message": str(exc)[:500]},
+                }
+            artifact["invocation_id"] = f"present_{uuid.uuid4().hex}"
+            artifact["workflow_id"] = workflow_result["workflow_id"]
+            artifact["workflow_version"] = workflow_result["workflow_version"]
+            artifact["producer_sha256"] = workflow_result["producer_sha256"]
+            artifact["mapper_sha256"] = workflow_result["mapper_sha256"]
+            active["artifact"] = artifact
+            return {
+                "protocol_version": PRESENTER_PROTOCOL,
+                "status": "completed",
+                "content": artifact["content"],
+                "sha256": artifact["sha256"],
+                "invocation_id": artifact["invocation_id"],
             }
         presenter_id = request.get("presenter_id")
         presenter_input = request.get("input")
@@ -861,6 +1064,13 @@ class PersistentSpecialistWorker:
                 and (accepted is None or TERMINAL_PRESENTER_CAPABILITY in accepted)
             ):
                 capabilities.append(TERMINAL_PRESENTER_CAPABILITY)
+            if (
+                self._terminal_workflows
+                and self._terminal_workflow_runtime_supported
+                and TERMINAL_PRESENTER_CAPABILITY in capabilities
+                and (accepted is None or TERMINAL_WORKFLOW_CAPABILITY in accepted)
+            ):
+                capabilities.append(TERMINAL_WORKFLOW_CAPABILITY)
             await self._write(writer, {
                 "protocol_version": hello["protocol_version"],
                 "request_id": hello["request_id"],
@@ -880,6 +1090,13 @@ class PersistentSpecialistWorker:
             request["_terminal_presenter_negotiated"] = (
                 request.get("protocol_version") == PROTOCOL_V3
                 and TERMINAL_PRESENTER_CAPABILITY in capabilities
+            )
+            request["_terminal_workflow_negotiated"] = (
+                request.get("protocol_version") == PROTOCOL_V3
+                and TERMINAL_WORKFLOW_CAPABILITY in capabilities
+                and isinstance(request.get("accepted_capabilities"), list)
+                and TERMINAL_WORKFLOW_CAPABILITY
+                in request["accepted_capabilities"]
             )
             response = await self.handle_request(request)
             await self._write(writer, response)
@@ -1249,6 +1466,11 @@ class PersistentSpecialistWorker:
                         and request.get("_terminal_presenter_negotiated") is True
                         and bool(self._terminal_presenters)
                     )
+                    terminal_workflow_enabled = (
+                        terminal_presenter_enabled
+                        and request.get("_terminal_workflow_negotiated") is True
+                        and bool(self._terminal_workflows)
+                    )
                     if terminal_presenter_enabled:
                         self._begin_presenter_turn(request)
                         presenter_turn_active = True
@@ -1259,6 +1481,7 @@ class PersistentSpecialistWorker:
                     prompt = _bridge_prompt(
                         request["envelope"],
                         terminal_presenter=terminal_presenter_enabled,
+                        terminal_workflow=terminal_workflow_enabled,
                     )
                     model_started = time.monotonic()
                     model_task: asyncio.Task[Any] | None = None
@@ -1306,6 +1529,13 @@ class PersistentSpecialistWorker:
                             "presenter_sha256": artifact["presenter_sha256"],
                             "invocation_id": artifact["invocation_id"],
                         }
+                        if isinstance(artifact.get("workflow_id"), str):
+                            record["terminal_workflow"] = {
+                                "workflow_id": artifact["workflow_id"],
+                                "workflow_version": artifact["workflow_version"],
+                                "producer_sha256": artifact["producer_sha256"],
+                                "mapper_sha256": artifact.get("mapper_sha256"),
+                            }
                     payloads = None
                     if request["protocol_version"] == PROTOCOL:
                         payloads = _extract_render_payloads(candidate)

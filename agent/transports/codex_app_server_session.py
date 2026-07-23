@@ -660,6 +660,18 @@ class CodexAppServerSession:
             projection = projector.project(note)
             if projection.messages:
                 result.projected_messages.extend(projection.messages)
+                if any(
+                    message.get("terminal_workflow_completed") is True
+                    for message in projection.messages
+                    if isinstance(message, dict)
+                ):
+                    # The worker already owns the validated terminal artifact.
+                    # Stop Codex before it spends another inference step
+                    # acknowledging or re-orchestrating the deterministic
+                    # producer→mapper→presenter chain.
+                    self._issue_interrupt(result.turn_id)
+                    result.final_text = "Terminal workflow completed."
+                    turn_complete = True
             if projection.is_tool_iteration:
                 result.tool_iterations += 1
                 # Arm/refresh the post-tool quiet watchdog whenever a

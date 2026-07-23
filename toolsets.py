@@ -170,6 +170,12 @@ TOOLSETS = {
         "tools": ["finalize_telegram_presentation"],
         "includes": [],
     },
+
+    "terminal_workflow": {
+        "description": "Profile-owned read-only producer-to-presenter workflows",
+        "tools": ["run_terminal_workflow"],
+        "includes": [],
+    },
     
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",

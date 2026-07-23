@@ -1120,6 +1120,45 @@ class TestSessionRetirement:
         r = s.run_turn("hi", turn_timeout=1.0)
         assert r.should_retire is False
 
+    def test_terminal_workflow_stops_before_followup_model_inference(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/started",
+            item={
+                "type": "mcpToolCall",
+                "id": "workflow-1",
+                "server": "hermes-tools",
+                "tool": "run_terminal_workflow",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "mcpToolCall",
+                "id": "workflow-1",
+                "server": "hermes-tools",
+                "tool": "run_terminal_workflow",
+                "arguments": {"workflow_id": "lookup", "input": {}},
+                "result": {"content": [{"type": "text", "text": "artifact"}]},
+                "error": None,
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        session = make_session(client)
+
+        result = session.run_turn("lookup", turn_timeout=1.0)
+
+        assert result.final_text == "Terminal workflow completed."
+        assert result.interrupted is False
+        assert result.should_retire is False
+        assert any(
+            method == "turn/interrupt"
+            for method, _params in client.requests
+        )
+
     def test_final_agent_message_without_turn_completed_is_recovered(self):
         """A completed assistant item is still a usable terminal response when
         codex omits turn/completed and then goes quiet.

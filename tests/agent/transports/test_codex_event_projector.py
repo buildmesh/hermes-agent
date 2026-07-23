@@ -286,6 +286,31 @@ class TestMcpToolCallProjection:
         assert domain_messages[0]["codex_tool_batch_size"] == 2
         assert presenter_messages[0]["codex_tool_batch_size"] == 2
 
+    def test_terminal_workflow_continue_does_not_mark_terminal_completion(self) -> None:
+        item = {
+            "type": "mcpToolCall",
+            "id": "workflow-continue",
+            "server": "hermes-tools",
+            "tool": "run_terminal_workflow",
+            "arguments": {},
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": json.dumps({
+                        "outcome": "continue",
+                        "model_result": {"reason": "clarify"},
+                    }),
+                }]
+            },
+            "error": None,
+        }
+
+        messages = CodexEventProjector().project(
+            {"method": "item/completed", "params": {"item": item}}
+        ).messages
+
+        assert "terminal_workflow_completed" not in messages[1]
+
 
 class TestUserAndOpaqueProjection:
     def test_user_message_text_fragments_only(self) -> None:
