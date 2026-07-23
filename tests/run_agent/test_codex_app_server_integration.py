@@ -72,6 +72,99 @@ class TestApiModeAccepted:
 
 
 class TestRunConversationCodexPath:
+    def test_reasoning_effort_is_forwarded_to_session_and_reported(
+        self, monkeypatch
+    ):
+        captured: dict = {}
+
+        def fake_init(self, **kwargs):
+            captured.update(kwargs)
+            self._thread_id = "thread-stub-1"
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+                turn_id="turn-stub-1",
+                thread_id="thread-stub-1",
+                resolved_reasoning_effort="low",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        agent = _make_codex_agent(
+            reasoning_config={"enabled": True, "effort": "low"}
+        )
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello")
+        assert captured["desired_reasoning_effort"] == "low"
+        assert result["runtime_reasoning_effort"] == "low"
+
+    def test_profile_enabled_toolsets_project_only_selected_mcp_servers(
+        self, monkeypatch
+    ):
+        captured: dict = {}
+
+        def fake_init(self, **kwargs):
+            captured.update(kwargs)
+            self._thread_id = "thread-stub-1"
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+                turn_id="turn-stub-1",
+                thread_id="thread-stub-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "mcp_servers": {
+                    "gmail": {"enabled": True, "url": "https://example.invalid"},
+                    "browser": {"enabled": True, "url": "https://example.invalid"},
+                }
+            },
+        ), patch(
+            "hermes_cli.codex_runtime_plugin_migration.configured_codex_mcp_server_names",
+            return_value={"shared-calendar", "hermes-tools"},
+        ):
+            agent = _make_codex_agent(enabled_toolsets=["gmail"])
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                agent.run_conversation("hello")
+        assert captured["mcp_server_projection"] == {
+            "gmail": True,
+            "browser": False,
+            "shared-calendar": False,
+        }
+
+    def test_disabled_reasoning_is_forwarded_as_none(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_init(self, **kwargs):
+            captured.update(kwargs)
+            self._thread_id = "thread-stub-1"
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "run_turn",
+            lambda self, user_input, **kwargs: TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+            ),
+        )
+        agent = _make_codex_agent(
+            reasoning_config={"enabled": False},
+        )
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("hello")
+        assert captured["desired_reasoning_effort"] == "none"
+
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
         # No background review fork during tests
@@ -759,4 +852,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-

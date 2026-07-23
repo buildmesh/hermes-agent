@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -53,6 +54,26 @@ MIGRATION_MARKER = (
 MIGRATION_END_MARKER = (
     "# end hermes-agent managed section"
 )
+
+
+def configured_codex_mcp_server_names(
+    codex_home: Optional[Path] = None,
+) -> set[str]:
+    """Read MCP server names from Codex config without importing their values."""
+    root = codex_home
+    if root is None:
+        configured = os.environ.get("CODEX_HOME")
+        root = Path(configured) if configured else Path.home() / ".codex"
+    target = root / "config.toml"
+    try:
+        with target.open("rb") as stream:
+            payload = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError):
+        return set()
+    servers = payload.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return set()
+    return {str(name) for name in servers}
 
 
 @dataclass
@@ -606,7 +627,11 @@ def _build_hermes_tools_mcp_entry() -> dict:
     return out
 
 
-def hermes_tools_mcp_app_server_args(*, enabled: bool = True) -> list[str]:
+def hermes_tools_mcp_app_server_args(
+    *,
+    enabled: bool = True,
+    allowed_tools: Optional[set[str]] = None,
+) -> list[str]:
     """Return per-process Codex overrides for the Hermes tools MCP callback.
 
     The global migration remains useful for interactive Codex sessions, but
@@ -626,10 +651,31 @@ def hermes_tools_mcp_app_server_args(*, enabled: bool = True) -> list[str]:
             **entry.get("env", {}),
             "HERMES_HOME": active_hermes_home,
         }
+    if allowed_tools is not None:
+        entry["env"] = {
+            **entry.get("env", {}),
+            "HERMES_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
+        }
     prefix = f"mcp_servers.{_quote_key('hermes-tools')}"
     args: list[str] = []
     for key, value in entry.items():
         args.extend(["-c", f"{prefix}.{_quote_key(key)}={_format_toml_value(value)}"])
+    return args
+
+
+def mcp_server_projection_app_server_args(
+    projection: dict[str, bool],
+) -> list[str]:
+    """Return process-local enable overrides for profile-known MCP servers."""
+    args: list[str] = []
+    for name in sorted(projection):
+        prefix = f"mcp_servers.{_quote_key(name)}"
+        args.extend(
+            [
+                "-c",
+                f"{prefix}.enabled={_format_toml_value(bool(projection[name]))}",
+            ]
+        )
     return args
 
 

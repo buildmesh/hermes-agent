@@ -83,6 +83,7 @@ class TurnResult:
     # silently otherwise).
     resolved_model: Optional[str] = None
     resolved_model_provider: Optional[str] = None
+    resolved_reasoning_effort: Optional[str] = None
     # Hint to the caller that the underlying codex subprocess is likely
     # wedged (turn-level timeout fired, post-tool watchdog tripped, or
     # token-refresh failure killed the child). The caller should retire
@@ -213,8 +214,10 @@ class CodexAppServerSession:
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
         desired_model: Optional[str] = None,
+        desired_reasoning_effort: Optional[str] = None,
         developer_instructions: Optional[str] = None,
         required_mcp_tools: Optional[set[str]] = None,
+        mcp_server_projection: Optional[dict[str, bool]] = None,
         resume_thread_id: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
@@ -234,8 +237,16 @@ class CodexAppServerSession:
         # a bad name fails at the first turn and MODEL_MISMATCH-style
         # consumers catch silent substitution).
         self._desired_model = (desired_model or "").strip() or None
+        self._desired_reasoning_effort = (
+            (desired_reasoning_effort or "").strip().lower() or None
+        )
         self._developer_instructions = developer_instructions
         self._required_mcp_tools = frozenset(required_mcp_tools or ())
+        self._mcp_server_projection = (
+            dict(mcp_server_projection)
+            if mcp_server_projection is not None
+            else None
+        )
         self._resume_thread_id = (resume_thread_id or "").strip() or None
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
@@ -252,6 +263,7 @@ class CodexAppServerSession:
         self._thread_id: Optional[str] = None
         self._resolved_model: Optional[str] = None
         self._resolved_model_provider: Optional[str] = None
+        self._resolved_reasoning_effort: Optional[str] = None
         self._interrupt_event = threading.Event()
         # Pending file-change items, keyed by item id. Populated on
         # item/started for fileChange items; consumed by the approval
@@ -270,16 +282,30 @@ class CodexAppServerSession:
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
-            extra_args = None
+            extra_args: list[str] = []
             if self._required_mcp_tools:
                 from hermes_cli.codex_runtime_plugin_migration import (
                     hermes_tools_mcp_app_server_args,
                 )
-                extra_args = hermes_tools_mcp_app_server_args()
+                extra_args.extend(
+                    hermes_tools_mcp_app_server_args(
+                        allowed_tools=set(self._required_mcp_tools)
+                    )
+                )
+            if self._mcp_server_projection is not None:
+                from hermes_cli.codex_runtime_plugin_migration import (
+                    mcp_server_projection_app_server_args,
+                )
+
+                extra_args.extend(
+                    mcp_server_projection_app_server_args(
+                        self._mcp_server_projection
+                    )
+                )
             self._client = self._client_factory(
                 codex_bin=self._codex_bin,
                 codex_home=self._codex_home,
-                extra_args=extra_args,
+                extra_args=extra_args or None,
             )
         self._client.initialize(
             client_name="hermes",
@@ -304,6 +330,10 @@ class CodexAppServerSession:
         params: dict[str, Any] = {"cwd": self._cwd}
         if self._desired_model:
             params["model"] = self._desired_model
+        if self._desired_reasoning_effort:
+            params["config"] = {
+                "model_reasoning_effort": self._desired_reasoning_effort
+            }
         if self._developer_instructions:
             params["developerInstructions"] = self._developer_instructions
         method = "thread/start"
@@ -339,10 +369,18 @@ class CodexAppServerSession:
         # model-verification metadata (and the only way to see substitution).
         resolved_model = result.get("model")
         resolved_provider = result.get("modelProvider")
+        resolved_reasoning_effort = result.get("reasoningEffort")
         if isinstance(resolved_model, str) and resolved_model.strip():
             self._resolved_model = resolved_model.strip()
         if isinstance(resolved_provider, str) and resolved_provider.strip():
             self._resolved_model_provider = resolved_provider.strip()
+        if (
+            isinstance(resolved_reasoning_effort, str)
+            and resolved_reasoning_effort.strip()
+        ):
+            self._resolved_reasoning_effort = (
+                resolved_reasoning_effort.strip().lower()
+            )
         if (
             self._desired_model
             and self._resolved_model is not None
@@ -353,6 +391,18 @@ class CodexAppServerSession:
                 "for %s — substitution will surface in runtime_model metadata",
                 self._resolved_model,
                 self._desired_model,
+            )
+        if (
+            self._desired_reasoning_effort
+            and self._resolved_reasoning_effort is not None
+            and self._resolved_reasoning_effort
+            != self._desired_reasoning_effort
+        ):
+            logger.warning(
+                "codex app-server resolved reasoning effort %s despite "
+                "explicit request for %s",
+                self._resolved_reasoning_effort,
+                self._desired_reasoning_effort,
             )
         logger.info(
             "codex app-server thread started: id=%s profile=%s cwd=%s "
@@ -407,10 +457,11 @@ class CodexAppServerSession:
                 pass
             self._client = None
         self._thread_id = None
-        # Drop the resolved-model observation with the thread it belongs to,
-        # so a replacement thread can never inherit a stale attribution.
+        # Drop observations with the thread they belong to, so a replacement
+        # thread can never inherit stale attribution.
         self._resolved_model = None
         self._resolved_model_provider = None
+        self._resolved_reasoning_effort = None
 
     def __enter__(self) -> "CodexAppServerSession":
         return self
@@ -504,6 +555,7 @@ class CodexAppServerSession:
         result.thread_id = self._thread_id
         result.resolved_model = self._resolved_model
         result.resolved_model_provider = self._resolved_model_provider
+        result.resolved_reasoning_effort = self._resolved_reasoning_effort
 
         self._interrupt_event.clear()
         projector = CodexEventProjector()

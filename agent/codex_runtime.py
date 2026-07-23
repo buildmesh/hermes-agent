@@ -394,14 +394,63 @@ def run_codex_app_server_turn(
             except Exception:
                 logger.debug("codex tool-progress callback raised", exc_info=True)
 
+        desired_reasoning_effort = None
+        reasoning_config = getattr(agent, "reasoning_config", None)
+        if isinstance(reasoning_config, dict):
+            if reasoning_config.get("enabled") is False:
+                desired_reasoning_effort = "none"
+            else:
+                configured_effort = reasoning_config.get("effort")
+                if isinstance(configured_effort, str) and configured_effort.strip():
+                    desired_reasoning_effort = configured_effort.strip().lower()
+
+        mcp_server_projection = None
+        enabled_toolsets = getattr(agent, "enabled_toolsets", None)
+        if enabled_toolsets is not None:
+            try:
+                from hermes_cli.config import load_config
+                from hermes_cli.codex_runtime_plugin_migration import (
+                    configured_codex_mcp_server_names,
+                )
+                from hermes_cli.tools_config import enabled_mcp_server_names
+
+                profile_config = load_config()
+                mcp_servers = profile_config.get("mcp_servers")
+                profile_configured_names = (
+                    {str(name) for name in mcp_servers}
+                    if isinstance(mcp_servers, dict)
+                    else set()
+                )
+                configured_names = (
+                    profile_configured_names
+                    | configured_codex_mcp_server_names()
+                ) - {"hermes-tools"}
+                globally_enabled = enabled_mcp_server_names(profile_config)
+                allowed_names = (
+                    set(str(name) for name in enabled_toolsets)
+                    & globally_enabled
+                )
+                mcp_server_projection = {
+                    name: name in allowed_names for name in configured_names
+                }
+            except Exception:
+                logger.warning(
+                    "codex app-server: could not resolve profile MCP projection; "
+                    "leaving Codex MCP configuration unchanged",
+                    exc_info=True,
+                )
+                mcp_server_projection = None
+
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             # Request the configured model explicitly. Otherwise codex falls
             # back to its own mutable defaults and the thread can silently
             # run a different model than agent.model claims.
             desired_model=getattr(agent, "model", None),
+            desired_reasoning_effort=desired_reasoning_effort,
             developer_instructions=getattr(agent, "_cached_system_prompt", None),
             required_mcp_tools=required_mcp_tools,
+            mcp_server_projection=mcp_server_projection,
             resume_thread_id=resume_thread_id,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
@@ -553,6 +602,9 @@ def run_codex_app_server_turn(
         # session implementations simply report no observation.
         "runtime_model": getattr(turn, "resolved_model", None),
         "runtime_model_provider": getattr(turn, "resolved_model_provider", None),
+        "runtime_reasoning_effort": getattr(
+            turn, "resolved_reasoning_effort", None
+        ),
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 
+from pathlib import Path
+
 import pytest
 
 from hermes_cli.codex_runtime_plugin_migration import (
@@ -11,9 +13,11 @@ from hermes_cli.codex_runtime_plugin_migration import (
     _build_hermes_tools_mcp_entry,
     _format_toml_value,
     _looks_like_test_tempdir,
+    mcp_server_projection_app_server_args,
     _strip_existing_managed_block,
     _strip_unmanaged_plugin_tables,
     _translate_one_server,
+    configured_codex_mcp_server_names,
     migrate,
     render_codex_toml_section,
 )
@@ -22,6 +26,28 @@ from hermes_cli.codex_runtime_plugin_migration import (
 # ---- per-server translation ----
 
 class TestTranslateOneServer:
+    def test_reads_shared_codex_mcp_server_names(self, tmp_path: Path):
+        (tmp_path / "config.toml").write_text(
+            '[mcp_servers.gmail]\nurl = "https://example.invalid"\n'
+            '[mcp_servers."work mail"]\nenabled = false\n',
+            encoding="utf-8",
+        )
+        assert configured_codex_mcp_server_names(tmp_path) == {
+            "gmail",
+            "work mail",
+        }
+
+    def test_process_projection_is_stable_and_quotes_server_names(self):
+        args = mcp_server_projection_app_server_args(
+            {"gmail": True, "work mail": False}
+        )
+        assert args == [
+            "-c",
+            "mcp_servers.gmail.enabled=true",
+            "-c",
+            'mcp_servers."work mail".enabled=false',
+        ]
+
     def test_stdio_basic(self):
         cfg, skipped = _translate_one_server("filesystem", {
             "command": "npx",

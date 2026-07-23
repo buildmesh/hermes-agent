@@ -1146,6 +1146,14 @@ class PersistentSpecialistWorker:
         ):
             if isinstance(value, str) and value.strip():
                 fields[key] = value.strip()
+        reasoning_config = getattr(agent, "reasoning_config", None)
+        if isinstance(reasoning_config, dict):
+            if reasoning_config.get("enabled") is False:
+                fields["requested_reasoning_effort"] = "none"
+            else:
+                effort = reasoning_config.get("effort")
+                if isinstance(effort, str) and effort.strip():
+                    fields["requested_reasoning_effort"] = effort.strip().lower()
         runtime_model = result.get("runtime_model")
         if isinstance(runtime_model, str) and runtime_model.strip():
             fields["runtime_model"] = runtime_model.strip()
@@ -1155,6 +1163,9 @@ class PersistentSpecialistWorker:
             api_mode = getattr(agent, "api_mode", None)
             if isinstance(api_mode, str) and api_mode.strip():
                 fields["runtime_api_mode"] = api_mode.strip()
+        runtime_effort = result.get("runtime_reasoning_effort")
+        if isinstance(runtime_effort, str) and runtime_effort.strip():
+            fields["runtime_reasoning_effort"] = runtime_effort.strip().lower()
         return fields
 
     def _base_response(self, request: dict[str, Any], **extra: Any) -> dict[str, Any]:

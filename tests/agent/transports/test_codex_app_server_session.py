@@ -169,6 +169,26 @@ class TestLifecycle:
         assert "mcp_servers.hermes-tools.command" in " ".join(extra_args)
         assert "agent.transports.hermes_tools_mcp_server" in " ".join(extra_args)
         assert "mcp_servers.hermes-tools.enabled=true" in extra_args
+        assert "HERMES_MCP_ALLOWED_TOOLS" in " ".join(extra_args)
+        assert "finalize_telegram_presentation" in " ".join(extra_args)
+
+    def test_profile_mcp_projection_sets_process_local_enable_flags(self):
+        client = FakeClient()
+        captured = {}
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=factory,
+            mcp_server_projection={"gmail": True, "browser": False},
+        )
+        session.ensure_started()
+        extra_args = captured["extra_args"]
+        assert "mcp_servers.gmail.enabled=true" in extra_args
+        assert "mcp_servers.browser.enabled=false" in extra_args
 
     def test_app_server_without_required_tools_preserves_config_opt_out(self):
         client = FakeClient()
@@ -411,6 +431,34 @@ class TestModelResolutionCapture:
         s.ensure_started()
         _, params = next(r for r in client.requests if r[0] == "thread/start")
         assert "model" not in params
+
+    def test_desired_reasoning_effort_uses_thread_config_and_is_observed(self):
+        client = FakeClient()
+        client._request_handler = lambda method, params: (
+            {
+                "thread": {"id": "thread-fake-001"},
+                "reasoningEffort": "low",
+            }
+            if method == "thread/start"
+            else {"turn": {"id": "tu1"}} if method == "turn/start" else {}
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(client, desired_reasoning_effort="LOW")
+        result = s.run_turn("hello", turn_timeout=2.0)
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["config"] == {"model_reasoning_effort": "low"}
+        assert result.resolved_reasoning_effort == "low"
+
+    def test_absent_reasoning_effort_does_not_override_codex_config(self):
+        client = FakeClient()
+        s = make_session(client)
+        s.ensure_started()
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert "config" not in params
 
     def test_substitution_despite_pin_keeps_observation_and_warns(self, caplog):
         # codex echoes what it actually resolved; if that differs from the

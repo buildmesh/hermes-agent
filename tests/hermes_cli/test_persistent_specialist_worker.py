@@ -1656,11 +1656,13 @@ class ModelReportingAgent(FakeAgent):
     model = "gpt-5.3-codex-spark"
     provider = "openai-codex"
     api_mode = "codex_app_server"
+    reasoning_config = {"enabled": True, "effort": "low"}
 
     def run_conversation(self, prompt: str) -> dict:
         result = super().run_conversation(prompt)
         result["runtime_model"] = "gpt-5.6-sol"
         result["runtime_model_provider"] = "openai"
+        result["runtime_reasoning_effort"] = "low"
         return result
 
 
@@ -1704,6 +1706,8 @@ async def test_v2_completed_turn_emits_model_resolution_metadata(tmp_path: Path)
     assert response["runtime_model"] == "gpt-5.6-sol"
     assert response["runtime_provider"] == "openai-codex"
     assert response["runtime_api_mode"] == "codex_app_server"
+    assert response["requested_reasoning_effort"] == "low"
+    assert response["runtime_reasoning_effort"] == "low"
     jsonschema.Draft202012Validator(_v2_response_schema()).validate(response)
     # The durable ledger record replays the same metadata.
     ledger_path = worker._ledger_path("conv_" + "1" * 64, "model-metadata-1")

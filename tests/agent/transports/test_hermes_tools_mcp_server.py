@@ -46,7 +46,11 @@ def _install_test_presenter(root: Path) -> None:
     declaration.write_text(json.dumps(manifest), encoding="utf-8")
 
 
-def _codex_mcp_tool_names(profile_root: Path) -> set[str]:
+def _codex_mcp_tool_names(
+    profile_root: Path,
+    *,
+    allowed_tools: set[str] | None = None,
+) -> set[str]:
     script = (
         "import json\n"
         "from agent.transports.hermes_tools_mcp_server import _build_server\n"
@@ -55,6 +59,8 @@ def _codex_mcp_tool_names(profile_root: Path) -> set[str]:
     )
     env = os.environ.copy()
     env["HERMES_HOME"] = str(profile_root)
+    if allowed_tools is not None:
+        env["HERMES_MCP_ALLOWED_TOOLS"] = ",".join(sorted(allowed_tools))
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=Path(__file__).resolve().parents[3],
@@ -69,6 +75,26 @@ def _codex_mcp_tool_names(profile_root: Path) -> set[str]:
 
 
 class TestModuleSurface:
+    def test_process_allowlist_projects_only_requested_tools(
+        self, tmp_path: Path
+    ):
+        _install_test_presenter(tmp_path)
+        endpoint = tmp_path / "state/persistent-runtime/presenter-endpoint.json"
+        endpoint.parent.mkdir(parents=True)
+        endpoint.write_text(
+            json.dumps({
+                "schema_version": "hermes.terminal_presenter_endpoint.v1",
+                "socket": "state/runtime/worker.sock",
+                "runtime_instance_id": "runtime_test",
+                "turn_token": "present_turn_test",
+            }),
+            encoding="utf-8",
+        )
+        assert _codex_mcp_tool_names(
+            tmp_path,
+            allowed_tools={"finalize_telegram_presentation"},
+        ) == {"finalize_telegram_presentation"}
+
     def test_module_imports_clean(self):
         from agent.transports import hermes_tools_mcp_server as m
         assert callable(m.main)

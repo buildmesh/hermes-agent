@@ -108,6 +108,15 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 )
 
 
+def _projected_tools() -> tuple[str, ...]:
+    """Apply the process-local specialist allowlist when one is supplied."""
+    raw = os.environ.get("HERMES_MCP_ALLOWED_TOOLS")
+    if raw is None:
+        return EXPOSED_TOOLS
+    allowed = {name.strip() for name in raw.split(",") if name.strip()}
+    return tuple(name for name in EXPOSED_TOOLS if name in allowed)
+
+
 def _build_server() -> Any:
     """Create the FastMCP server with Hermes tools attached. Lazy imports
     so the module can be imported without the mcp package installed
@@ -146,7 +155,8 @@ def _build_server() -> Any:
 
     exposed_count = 0
 
-    for name in EXPOSED_TOOLS:
+    projected_tools = _projected_tools()
+    for name in projected_tools:
         spec = all_defs.get(name)
         if spec is None:
             logger.debug(
@@ -228,7 +238,7 @@ def _build_server() -> Any:
     logger.info(
         "hermes-tools MCP server registered %d/%d tools",
         exposed_count,
-        len(EXPOSED_TOOLS),
+        len(projected_tools),
     )
     return mcp
 
