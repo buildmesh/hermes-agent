@@ -606,6 +606,33 @@ def _build_hermes_tools_mcp_entry() -> dict:
     return out
 
 
+def hermes_tools_mcp_app_server_args(*, enabled: bool = True) -> list[str]:
+    """Return per-process Codex overrides for the Hermes tools MCP callback.
+
+    The global migration remains useful for interactive Codex sessions, but
+    Hermes-owned app-server sessions must not depend on a prior mutation of
+    ``~/.codex/config.toml``. Per-process overrides also preserve the active
+    profile's inherited ``HERMES_HOME`` for service-gated tools.
+    """
+    entry = _build_hermes_tools_mcp_entry()
+    entry["enabled"] = enabled
+    # Unlike the durable global migration, these overrides live only for the
+    # current app-server process. Preserve even a temporary profile root so
+    # the MCP subprocess evaluates service gates against the same active
+    # profile as its parent.
+    active_hermes_home = os.environ.get("HERMES_HOME")
+    if active_hermes_home:
+        entry["env"] = {
+            **entry.get("env", {}),
+            "HERMES_HOME": active_hermes_home,
+        }
+    prefix = f"mcp_servers.{_quote_key('hermes-tools')}"
+    args: list[str] = []
+    for key, value in entry.items():
+        args.extend(["-c", f"{prefix}.{_quote_key(key)}={_format_toml_value(value)}"])
+    return args
+
+
 def migrate(
     hermes_config: dict,
     *,

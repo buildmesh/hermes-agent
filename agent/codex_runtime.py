@@ -318,6 +318,27 @@ def run_codex_app_server_turn(
         CodexAppServerSession,
         _ServerRequestRouting,
     )
+    from hermes_cli.terminal_presenter import terminal_presenters_available
+
+    required_mcp_tools = (
+        {"finalize_telegram_presentation"}
+        if terminal_presenters_available()
+        else set()
+    )
+
+    resume_thread_id = getattr(agent, "_codex_resume_thread_id", None)
+    existing_session = getattr(agent, "_codex_session", None)
+    existing_required = getattr(existing_session, "_required_mcp_tools", None)
+    if (
+        existing_session is not None
+        and isinstance(existing_required, frozenset)
+        and existing_required
+        != frozenset(required_mcp_tools)
+    ):
+        resume_thread_id = existing_session._thread_id
+        agent._codex_resume_thread_id = resume_thread_id
+        existing_session.close()
+        agent._codex_session = None
 
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
@@ -379,6 +400,8 @@ def run_codex_app_server_turn(
             # run a different model than agent.model claims.
             desired_model=getattr(agent, "model", None),
             developer_instructions=getattr(agent, "_cached_system_prompt", None),
+            required_mcp_tools=required_mcp_tools,
+            resume_thread_id=resume_thread_id,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -413,6 +436,7 @@ def run_codex_app_server_turn(
             "partial": True,
             "error": str(exc),
         }
+    agent._codex_resume_thread_id = None
 
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess

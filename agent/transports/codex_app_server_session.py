@@ -214,6 +214,8 @@ class CodexAppServerSession:
         permission_profile: Optional[str] = None,
         desired_model: Optional[str] = None,
         developer_instructions: Optional[str] = None,
+        required_mcp_tools: Optional[set[str]] = None,
+        resume_thread_id: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -233,6 +235,8 @@ class CodexAppServerSession:
         # consumers catch silent substitution).
         self._desired_model = (desired_model or "").strip() or None
         self._developer_instructions = developer_instructions
+        self._required_mcp_tools = frozenset(required_mcp_tools or ())
+        self._resume_thread_id = (resume_thread_id or "").strip() or None
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -266,8 +270,16 @@ class CodexAppServerSession:
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
+            extra_args = None
+            if self._required_mcp_tools:
+                from hermes_cli.codex_runtime_plugin_migration import (
+                    hermes_tools_mcp_app_server_args,
+                )
+                extra_args = hermes_tools_mcp_app_server_args()
             self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
+                codex_bin=self._codex_bin,
+                codex_home=self._codex_home,
+                extra_args=extra_args,
             )
         self._client.initialize(
             client_name="hermes",
@@ -294,7 +306,11 @@ class CodexAppServerSession:
             params["model"] = self._desired_model
         if self._developer_instructions:
             params["developerInstructions"] = self._developer_instructions
-        result = self._client.request("thread/start", params, timeout=15)
+        method = "thread/start"
+        if self._resume_thread_id:
+            method = "thread/resume"
+            params["threadId"] = self._resume_thread_id
+        result = self._client.request(method, params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -310,10 +326,12 @@ class CodexAppServerSession:
             raise CodexAppServerError(
                 code=-32603,
                 message=(
-                    "codex thread/start returned no thread id "
+                    f"codex {method} returned no thread id "
                     f"(payload keys: {sorted(result.keys())})"
                 ),
             )
+        if self._required_mcp_tools:
+            self._verify_required_mcp_tools(thread_id)
         self._thread_id = thread_id
         # thread/start echoes the model/provider the app-server resolved for
         # this thread. Hermes never sends a model on this path, so capture
@@ -346,6 +364,37 @@ class CodexAppServerSession:
             self._resolved_model_provider or "unknown",
         )
         return self._thread_id
+
+    def _verify_required_mcp_tools(self, thread_id: str) -> None:
+        """Fail before a model turn if Codex omitted a required Hermes tool."""
+        assert self._client is not None
+        result = self._client.request(
+            "mcpServerStatus/list",
+            {"threadId": thread_id, "detail": "toolsAndAuthOnly"},
+            timeout=30,
+        )
+        servers = result.get("data")
+        if not isinstance(servers, list):
+            raise CodexAppServerError(
+                code=-32603,
+                message="Codex returned an invalid MCP server inventory",
+            )
+        projected: set[str] = set()
+        for server in servers:
+            if not isinstance(server, dict) or server.get("name") != "hermes-tools":
+                continue
+            tools = server.get("tools")
+            if isinstance(tools, dict):
+                projected.update(str(name) for name in tools)
+        missing = sorted(self._required_mcp_tools - projected)
+        if missing:
+            raise CodexAppServerError(
+                code=-32603,
+                message=(
+                    "Codex did not project required Hermes MCP tools: "
+                    + ", ".join(missing)
+                ),
+            )
 
     def close(self) -> None:
         if self._closed:

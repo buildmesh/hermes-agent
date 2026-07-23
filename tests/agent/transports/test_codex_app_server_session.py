@@ -14,6 +14,7 @@ from typing import Any, Optional
 import pytest
 
 import agent.transports.codex_app_server_session as session_mod
+from agent.transports.codex_app_server import CodexAppServerError
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
     _ServerRequestRouting,
@@ -139,6 +140,76 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    def test_app_server_injects_hermes_tools_mcp_overrides(self):
+        client = FakeClient()
+        captured = {}
+        client._request_handler = lambda method, _params: (
+            {
+                "data": [{
+                    "name": "hermes-tools",
+                    "tools": {"finalize_telegram_presentation": {}},
+                }]
+            }
+            if method == "mcpServerStatus/list"
+            else {"thread": {"id": "thread-fake-001"}}
+        )
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=factory,
+            required_mcp_tools={"finalize_telegram_presentation"},
+        )
+        session.ensure_started()
+
+        extra_args = captured["extra_args"]
+        assert "mcp_servers.hermes-tools.command" in " ".join(extra_args)
+        assert "agent.transports.hermes_tools_mcp_server" in " ".join(extra_args)
+        assert "mcp_servers.hermes-tools.enabled=true" in extra_args
+
+    def test_app_server_without_required_tools_preserves_config_opt_out(self):
+        client = FakeClient()
+        captured = {}
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(cwd="/tmp", client_factory=factory)
+        session.ensure_started()
+
+        assert captured["extra_args"] is None
+
+    def test_replacement_session_resumes_existing_thread(self):
+        client = FakeClient()
+
+        def handler(method, params):
+            if method == "thread/resume":
+                assert params["threadId"] == "thread-existing"
+                return {"thread": {"id": "thread-existing"}}
+            if method == "mcpServerStatus/list":
+                return {
+                    "data": [{
+                        "name": "hermes-tools",
+                        "tools": {"finalize_telegram_presentation": {}},
+                    }]
+                }
+            return {}
+
+        client._request_handler = handler
+        session = make_session(
+            client,
+            resume_thread_id="thread-existing",
+            required_mcp_tools={"finalize_telegram_presentation"},
+        )
+
+        assert session.ensure_started() == "thread-existing"
+        assert any(method == "thread/resume" for method, _ in client.requests)
+        assert not any(method == "thread/start" for method, _ in client.requests)
+
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
         s = make_session(client)
@@ -148,6 +219,52 @@ class TestLifecycle:
         # thread/start should be called exactly once
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
+
+    def test_required_mcp_tool_is_verified_before_thread_becomes_ready(self):
+        client = FakeClient()
+
+        def handler(method, _params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-required-tool"}}
+            if method == "mcpServerStatus/list":
+                return {
+                    "data": [{
+                        "name": "hermes-tools",
+                        "tools": {"finalize_telegram_presentation": {}},
+                    }]
+                }
+            return {}
+
+        client._request_handler = handler
+        session = make_session(
+            client,
+            required_mcp_tools={"finalize_telegram_presentation"},
+        )
+
+        assert session.ensure_started() == "thread-required-tool"
+
+    def test_missing_required_mcp_tool_fails_before_thread_becomes_ready(self):
+        client = FakeClient()
+
+        def handler(method, _params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-missing-tool"}}
+            if method == "mcpServerStatus/list":
+                return {"data": [{"name": "hermes-tools", "tools": {}}]}
+            return {}
+
+        client._request_handler = handler
+        session = make_session(
+            client,
+            required_mcp_tools={"finalize_telegram_presentation"},
+        )
+
+        with pytest.raises(
+            CodexAppServerError,
+            match="did not project required Hermes MCP tools",
+        ):
+            session.ensure_started()
+        assert session._thread_id is None
 
     def test_thread_start_passes_cwd_only(self):
         """thread/start carries cwd. We intentionally do NOT pass `permissions`

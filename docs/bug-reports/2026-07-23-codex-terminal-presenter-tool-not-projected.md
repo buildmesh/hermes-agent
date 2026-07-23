@@ -2,7 +2,7 @@
 
 Date: 2026-07-23
 
-Status: Open
+Status: Resolved
 
 ## Summary
 
@@ -89,3 +89,19 @@ Inspect the boundary between:
 The endpoint and turn token existed, so presenter loading and turn activation had succeeded. The
 failure appears later, in registration visibility or projection into Codex.
 
+## Resolution
+
+Hermes-owned Codex app-server processes now receive an isolated, per-process Hermes MCP
+registration whenever the negotiated presenter tool is required. The registration carries the
+active profile root, explicitly enables the server for that eligible turn, and is verified through
+Codex's own MCP inventory before the model turn begins. The MCP handler also exposes the
+finalizer's concrete `presenter_id` and `input` schema instead of a generic keyword-arguments
+wrapper.
+
+Capability transitions restart only the app-server process and resume the same persisted Codex
+thread, preserving conversation continuity. A failed projection retains that thread ID for the
+next retry. Downgraded turns do not receive the per-process Hermes MCP registration or the
+finalizer-specific prompt.
+
+Regression coverage includes the real Codex app-server inventory and tool-call path, endpoint
+invocation, downgrade behavior, projection failure, and capability-transition thread resumption.

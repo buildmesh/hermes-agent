@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import signal
+import shutil
 import stat
 import sys
 import threading
@@ -15,6 +16,10 @@ import jsonschema
 import pytest
 
 import hermes_cli.persistent_specialist_worker as persistent_worker
+from agent.transports.codex_app_server import CodexAppServerClient
+from hermes_cli.codex_runtime_plugin_migration import (
+    hermes_tools_mcp_app_server_args,
+)
 from hermes_cli.persistent_specialist_worker import (
     PROTOCOL,
     PROTOCOL_V2,
@@ -254,6 +259,103 @@ def install_test_presenter(root: Path) -> None:
         }],
     }
     (root / "contract/terminal-presenters.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    shutil.which("codex") is None,
+    reason="real Codex app-server acceptance test requires the codex binary",
+)
+async def test_codex_app_server_projects_and_invokes_active_terminal_presenter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_test_presenter(tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="projection-test",
+        agent_factory=FakeAgent,
+    )
+    await worker.start()
+    serve = asyncio.create_task(worker.serve_forever())
+    worker._begin_presenter_turn(v3_request("codex-projection"))
+    payloads = [{"schema_version": "telegram.bridge.render_payload.v1"}]
+
+    def exercise_codex_projection(
+        *,
+        invoke: bool,
+    ) -> tuple[dict, dict | None]:
+        client = CodexAppServerClient(
+            extra_args=hermes_tools_mcp_app_server_args() if invoke else None,
+        )
+        try:
+            client.initialize(
+                client_name="hermes-test",
+                client_title="Hermes Test",
+                client_version="test",
+            )
+            started = client.request(
+                "thread/start",
+                {"cwd": str(tmp_path)},
+                timeout=15,
+            )
+            thread_id = started["thread"]["id"]
+            inventory = client.request(
+                "mcpServerStatus/list",
+                {"threadId": thread_id, "detail": "toolsAndAuthOnly"},
+                timeout=30,
+            )
+            result = None
+            if invoke:
+                result = client.request(
+                    "mcpServer/tool/call",
+                    {
+                        "server": "hermes-tools",
+                        "tool": "finalize_telegram_presentation",
+                        "arguments": {
+                            "presenter_id": "test-presenter",
+                            "input": {"payloads": payloads},
+                        },
+                        "threadId": thread_id,
+                    },
+                    timeout=30,
+                )
+            return inventory, result
+        finally:
+            client.close()
+
+    try:
+        inventory, result = await asyncio.to_thread(
+            exercise_codex_projection,
+            invoke=True,
+        )
+        worker._end_presenter_turn()
+        downgraded_inventory, _ = await asyncio.to_thread(
+            exercise_codex_projection,
+            invoke=False,
+        )
+    finally:
+        serve.cancel()
+        await asyncio.gather(serve, return_exceptions=True)
+        await worker.stop()
+
+    hermes_server = next(
+        item for item in inventory["data"] if item["name"] == "hermes-tools"
+    )
+    assert "finalize_telegram_presentation" in hermes_server["tools"]
+    assert result is not None
+    assert result.get("isError") is not True
+    assert any(
+        item.get("text") == json.dumps(payloads, separators=(",", ":"))
+        for item in result["content"]
+        if isinstance(item, dict)
+    )
+    assert all(
+        "finalize_telegram_presentation" not in item.get("tools", {})
+        for item in downgraded_inventory["data"]
+    )
 
 
 class TerminalPresenterAgent(FakeAgent):

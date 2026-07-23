@@ -107,6 +107,93 @@ def test_new_codex_session_receives_cached_system_prompt(monkeypatch):
     assert captured_kwargs["developer_instructions"] == agent._cached_system_prompt
 
 
+def test_presenter_capability_transition_resumes_existing_thread(monkeypatch):
+    """Changing MCP projection must preserve the Codex conversation thread."""
+    captured_kwargs = {}
+
+    class CapturingSession:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        def run_turn(self, *, user_input):
+            return _make_turn()
+
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        CapturingSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.terminal_presenter.terminal_presenters_available",
+        lambda: True,
+    )
+    agent = _make_agent(session_db=None)
+    previous = agent._codex_session
+    previous._required_mcp_tools = frozenset()
+    previous._thread_id = "thread-preserved"
+
+    run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    previous.close.assert_called_once()
+    assert captured_kwargs["resume_thread_id"] == "thread-preserved"
+    assert captured_kwargs["required_mcp_tools"] == {
+        "finalize_telegram_presentation"
+    }
+
+
+def test_failed_capability_transition_preserves_resume_id_for_retry(monkeypatch):
+    captured = []
+
+    class FailingSession:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+        def run_turn(self, *, user_input):
+            raise RuntimeError("transient projection failure")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        FailingSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.terminal_presenter.terminal_presenters_available",
+        lambda: True,
+    )
+    agent = _make_agent(session_db=None)
+    agent._codex_session._required_mcp_tools = frozenset()
+    agent._codex_session._thread_id = "thread-retry"
+
+    first = run_codex_app_server_turn(
+        agent,
+        user_message="first",
+        original_user_message="first",
+        messages=[{"role": "user", "content": "first"}],
+        effective_task_id="task-1",
+    )
+    second = run_codex_app_server_turn(
+        agent,
+        user_message="retry",
+        original_user_message="retry",
+        messages=[{"role": "user", "content": "retry"}],
+        effective_task_id="task-1",
+    )
+
+    assert first["completed"] is False
+    assert second["completed"] is False
+    assert [item["resume_thread_id"] for item in captured] == [
+        "thread-retry",
+        "thread-retry",
+    ]
+
+
 def test_codex_turn_persists_each_message_exactly_once():
     """The user turn (flushed at turn start) must not be duplicated; the
     projected assistant message must land once.  Uses a real SessionDB and the

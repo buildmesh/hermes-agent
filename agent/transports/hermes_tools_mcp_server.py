@@ -162,6 +162,24 @@ def _build_server() -> Any:
         # input schema (FastMCP's @tool() decorator inspects type hints,
         # which we can't get from a JSON schema at runtime).
         def _make_handler(tool_name: str):
+            if tool_name == "finalize_telegram_presentation":
+                def _dispatch_terminal_presenter(
+                    presenter_id: str,
+                    input: dict[str, Any],
+                ) -> str:
+                    try:
+                        return handle_function_call(
+                            tool_name,
+                            {"presenter_id": presenter_id, "input": input},
+                        )
+                    except Exception as exc:
+                        logger.exception("tool %s raised", tool_name)
+                        return json.dumps({"error": str(exc), "tool": tool_name})
+
+                _dispatch_terminal_presenter.__name__ = tool_name
+                _dispatch_terminal_presenter.__doc__ = description
+                return _dispatch_terminal_presenter
+
             def _dispatch(**kwargs: Any) -> str:
                 try:
                     return handle_function_call(tool_name, kwargs or {})
