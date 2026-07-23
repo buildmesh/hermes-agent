@@ -20,6 +20,7 @@ from hermes_cli.persistent_specialist_worker import (
     PROTOCOL_V2,
     PROTOCOL_V3,
     PersistentSpecialistWorker,
+    _bridge_prompt,
     _initialize_worker_process_context,
     _extract_render_payloads,
     _terminal_presenter_is_final_and_unbatched,
@@ -82,6 +83,28 @@ def test_terminal_presenter_finality_allows_failed_retry_but_rejects_calls_after
         {"role": "tool", "tool_call_id": "call_late", "content": "{\"error\":true}"},
     ])
     assert not _terminal_presenter_is_final_and_unbatched(result, "prompt", "artifact")
+
+
+def test_bridge_prompt_without_terminal_presenter_requires_render_json() -> None:
+    prompt = _bridge_prompt({"event_id": "evt_1", "chat_id": 123})
+
+    assert "Use this render envelope contract for every response" in prompt
+    assert "finalize_telegram_presentation" not in prompt
+
+
+def test_bridge_prompt_with_terminal_presenter_has_non_conflicting_completion_paths() -> None:
+    prompt = _bridge_prompt(
+        {"event_id": "evt_1", "chat_id": 123},
+        terminal_presenter=True,
+    )
+
+    assert "Choose exactly one completion path" in prompt
+    assert "you must invoke finalize_telegram_presentation" in prompt
+    assert "as the final, unbatched tool call" in prompt
+    assert "only when the profile does not declare a supported" in prompt
+    assert "For the model-render completion path, return only" in prompt
+    assert "for every response" not in prompt
+    assert "Return only a JSON array" not in prompt
 
 
 class FakeAgent:

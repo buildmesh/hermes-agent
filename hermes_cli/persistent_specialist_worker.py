@@ -19,7 +19,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from agent.telegram_bridge_render_contract import CANONICAL_RENDER_ENVELOPE_INSTRUCTIONS
+from agent.telegram_bridge_render_contract import (
+    CANONICAL_RENDER_ENVELOPE_INSTRUCTIONS,
+    MODEL_RENDER_ENVELOPE_INSTRUCTIONS,
+)
 
 from agent.render_correction_companion import (
     CorrectionCompanionTimeout,
@@ -313,21 +316,30 @@ def _repair_missing_container_close(text: str, error_pos: int) -> str | None:
 
 
 def _bridge_prompt(envelope: dict[str, Any], *, terminal_presenter: bool = False) -> str:
-    presenter_instruction = (
-        " If you use finalize_telegram_presentation, invoke it only after all domain work and as "
-        "the final tool. Its exact presenter output becomes the Telegram response, so after the "
-        "tool result reply only with a brief acknowledgement and do not reproduce the JSON."
-        if terminal_presenter
-        else ""
-    )
+    if terminal_presenter:
+        completion_instruction = (
+            "The negotiated finalize_telegram_presentation tool is available for this turn. "
+            "Choose exactly one completion path. When the installed profile declares a supported "
+            "presentation for the result, you must invoke finalize_telegram_presentation after all "
+            "domain work and as the final, unbatched tool call. Do not inspect or invoke the "
+            "presenter implementation directly, copy or modify its artifact, or return render JSON "
+            "after successful finalization. After the tool result, reply only with a brief "
+            "acknowledgement; the runtime uses the captured artifact as the Telegram response. "
+            "Use the model-render path below only when the profile does not declare a supported "
+            "terminal presentation for the result. Do not call Telegram directly. Preserve "
+            "event_id as correlation_id and use the envelope chat_id as the send target. "
+            + MODEL_RENDER_ENVELOPE_INSTRUCTIONS
+        )
+    else:
+        completion_instruction = (
+            "Do not call Telegram directly. Preserve event_id as correlation_id and use the "
+            "envelope chat_id as the send target. "
+            + CANONICAL_RENDER_ENVELOPE_INSTRUCTIONS
+        )
     return (
         "Handle the following Telegram Bridge specialist envelope using this profile's skills and "
-        "instructions. Return only a JSON array of telegram.bridge.render_payload.v1 objects. "
-        "Do not call Telegram directly. Preserve event_id as correlation_id and use the envelope "
-        "chat_id as the send target."
-        + presenter_instruction
-        + " "
-        + CANONICAL_RENDER_ENVELOPE_INSTRUCTIONS
+        "instructions. "
+        + completion_instruction
         + "\n\nEnvelope JSON:\n"
         + json.dumps(envelope, ensure_ascii=False, sort_keys=True)
     )

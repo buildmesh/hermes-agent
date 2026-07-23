@@ -1,8 +1,7 @@
-"""Shared prompt contract for Telegram Bridge specialist render payloads."""
+"""Shared prompt contracts for Telegram Bridge specialist render payloads."""
 
-CANONICAL_RENDER_ENVELOPE_INSTRUCTIONS = (
-    "Use this render envelope contract for every response. Return only a non-empty JSON array of "
-    "telegram.bridge.render_payload.v1 objects. Keep schema_version, message_id, correlation_id, "
+_RENDER_ENVELOPE_DETAILS = (
+    "Keep schema_version, message_id, correlation_id, "
     "action, target, and render at their schema-defined levels. "
     "One text-only, non-exclusive example is: "
     '{"schema_version":"telegram.bridge.render_payload.v1",'
@@ -16,4 +15,16 @@ CANONICAL_RENDER_ENVELOPE_INSTRUCTIONS = (
     "and task instructions to choose the supported presentation that fits the response. "
     "Never put chat_id or text at the payload top level. "
     "Never wrap the object in payload."
+)
+
+CANONICAL_RENDER_ENVELOPE_INSTRUCTIONS = (
+    "Use this render envelope contract for every response. Return only a non-empty JSON array of "
+    "telegram.bridge.render_payload.v1 objects. "
+    + _RENDER_ENVELOPE_DETAILS
+)
+
+MODEL_RENDER_ENVELOPE_INSTRUCTIONS = (
+    "For the model-render completion path, return only a non-empty JSON array of "
+    "telegram.bridge.render_payload.v1 objects. "
+    + _RENDER_ENVELOPE_DETAILS
 )
