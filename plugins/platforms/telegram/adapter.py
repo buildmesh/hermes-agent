@@ -8036,7 +8036,7 @@ class TelegramAdapter(BasePlatformAdapter):
         envelope: dict[str, Any] | None,
         bridge_config: dict[str, Any] | None,
         error: Exception,
-    ) -> bool:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]] | None:
         if envelope is None:
             return False
         repair_fn = getattr(dispatcher, "request_specialist_render_repair", None)
@@ -8051,7 +8051,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         if not repaired_payloads:
             return False
-        await dispatcher.render_payloads_to_telegram(
+        delivery_results = await dispatcher.render_payloads_to_telegram(
             repaired_payloads,
             bot=self._bot,
             inline_keyboard_button_cls=InlineKeyboardButton,
@@ -8059,7 +8059,26 @@ class TelegramAdapter(BasePlatformAdapter):
             parse_mode_markdown_v2=ParseMode.MARKDOWN_V2,
             bridge_config=bridge_config,
         )
-        return True
+        return repaired_payloads, delivery_results
+
+    @staticmethod
+    def _record_telegram_bridge_delivery(
+        dispatcher: Any,
+        profile_root: _Path,
+        result: Any,
+        rendered_payloads: list[dict[str, Any]],
+        delivery_results: list[dict[str, Any]],
+    ) -> None:
+        record_delivery = getattr(dispatcher, "record_specialist_delivery", None)
+        if not callable(record_delivery):
+            return
+        record_delivery(
+            profile_root,
+            getattr(result, "envelope", None),
+            delivery_results,
+            dispatch_reason=getattr(result, "reason", None),
+            rendered_payloads=rendered_payloads,
+        )
 
     @staticmethod
     def _telegram_bridge_delivery_outcome_unknown(error: Exception) -> bool:
@@ -8119,7 +8138,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if not result.handled:
                 return False
             try:
-                await self._render_telegram_bridge_payloads(dispatcher, result.payloads, result.bridge_config)
+                delivery_results = await self._render_telegram_bridge_payloads(
+                    dispatcher, result.payloads, result.bridge_config
+                )
+                self._record_telegram_bridge_delivery(
+                    dispatcher, profile_root, result, result.payloads, delivery_results
+                )
             except Exception as exc:
                 if self._telegram_bridge_delivery_outcome_unknown(exc):
                     return True
@@ -8134,6 +8158,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not repaired:
                     render_retry_failed = True
                     raise
+                repaired_payloads, repaired_results = repaired
+                self._record_telegram_bridge_delivery(
+                    dispatcher, profile_root, result, repaired_payloads, repaired_results
+                )
             logger.info("[%s] Telegram bridge handled /%s (%s)", self.name, command, result.reason)
             return True
         except Exception as exc:
@@ -8186,7 +8214,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if not result.handled:
                 return False
             try:
-                await self._render_telegram_bridge_payloads(dispatcher, result.payloads, result.bridge_config)
+                delivery_results = await self._render_telegram_bridge_payloads(
+                    dispatcher, result.payloads, result.bridge_config
+                )
+                self._record_telegram_bridge_delivery(
+                    dispatcher, profile_root, result, result.payloads, delivery_results
+                )
             except Exception as exc:
                 if self._telegram_bridge_delivery_outcome_unknown(exc):
                     return True
@@ -8201,6 +8234,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not repaired:
                     render_retry_failed = True
                     raise
+                repaired_payloads, repaired_results = repaired
+                self._record_telegram_bridge_delivery(
+                    dispatcher, profile_root, result, repaired_payloads, repaired_results
+                )
             logger.info("[%s] Telegram bridge handled text (%s)", self.name, result.reason)
             return True
         except Exception as exc:
@@ -8231,28 +8268,48 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         profile_root, hermes_base = paths
         render_retry_failed = False
+        callback_answered = False
         worker_snapshot: dict[str, asyncio.subprocess.Process] | None = None
         try:
+            fast_callback = getattr(dispatcher, "is_fast_bridge_callback", None)
+            if callable(fast_callback) and fast_callback(data) is True:
+                answer_text_fn = getattr(dispatcher, "fast_bridge_callback_answer", None)
+                answer_text = answer_text_fn(data) if callable(answer_text_fn) else None
+                if answer_text:
+                    await query.answer(text=answer_text)
+                else:
+                    await query.answer()
+                callback_answered = True
             worker_snapshot = dict(
                 getattr(self, "_telegram_bridge_persistent_workers", {})
             )
+            callback_kwargs = {
+                "callback_query_id": str(query.id),
+                "callback_data": data,
+                "chat_id": int(message.chat_id),
+                "user_id": int(getattr(query.from_user, "id", message.chat_id)),
+                "telegram_message_id": int(message.message_id),
+                "update_id": getattr(update, "update_id", None),
+                "text": getattr(message, "text", None),
+            }
+            if callable(fast_callback):
+                callback_kwargs["callback_answered"] = callback_answered
             result = await self._await_telegram_bridge_dispatch(
                 int(message.chat_id),
                 dispatcher.dispatch_callback,
                 profile_root,
                 hermes_base,
-                callback_query_id=str(query.id),
-                callback_data=data,
-                chat_id=int(message.chat_id),
-                user_id=int(getattr(query.from_user, "id", message.chat_id)),
-                telegram_message_id=int(message.message_id),
-                update_id=getattr(update, "update_id", None),
-                text=getattr(message, "text", None),
+                **callback_kwargs,
             )
             if not result.handled:
                 return False
             try:
-                await self._render_telegram_bridge_payloads(dispatcher, result.payloads, result.bridge_config)
+                delivery_results = await self._render_telegram_bridge_payloads(
+                    dispatcher, result.payloads, result.bridge_config
+                )
+                self._record_telegram_bridge_delivery(
+                    dispatcher, profile_root, result, result.payloads, delivery_results
+                )
             except Exception as exc:
                 if self._telegram_bridge_delivery_outcome_unknown(exc):
                     return True
@@ -8267,24 +8324,30 @@ class TelegramAdapter(BasePlatformAdapter):
                 if not repaired:
                     render_retry_failed = True
                     raise
+                repaired_payloads, repaired_results = repaired
+                self._record_telegram_bridge_delivery(
+                    dispatcher, profile_root, result, repaired_payloads, repaired_results
+                )
             logger.info("[%s] Telegram bridge handled callback %s (%s)", self.name, data, result.reason)
             return True
         except Exception as exc:
             await self._recover_telegram_bridge_persistent_worker(exc, worker_snapshot)
             logger.error("[%s] Telegram bridge callback failed: %s", self.name, exc, exc_info=True)
             if render_retry_failed:
+                if not callback_answered:
+                    try:
+                        await query.answer()
+                    except Exception:
+                        pass
+                return True
+            if not callback_answered:
                 try:
-                    await query.answer()
+                    await query.answer(
+                        text="I couldn't complete that action. Please try again.",
+                        show_alert=True,
+                    )
                 except Exception:
                     pass
-                return True
-            try:
-                await query.answer(
-                    text="I couldn't complete that action. Please try again.",
-                    show_alert=True,
-                )
-            except Exception:
-                pass
             return True
 
     async def _ensure_forum_commands(self, message) -> None:

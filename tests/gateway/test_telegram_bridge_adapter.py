@@ -1182,3 +1182,123 @@ async def test_bridge_callback_failed_render_retry_answers_without_alert(tmp_pat
     assert await adapter._maybe_handle_telegram_bridge_callback(SimpleNamespace(update_id=9), query)
     adapter._rerender_telegram_bridge_with_repair.assert_awaited_once()
     query.answer.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_bridge_command_records_successful_delivery(tmp_path):
+    adapter = _make_adapter()
+    delivery_results = [{"action": "send", "status": "sent", "telegram_message_ids": [7001]}]
+    result = SimpleNamespace(
+        handled=True,
+        payloads=[{"action": "send", "message_id": "msg_command"}],
+        bridge_config={},
+        envelope={"event_id": "evt_command"},
+        reason="specialist",
+    )
+    dispatcher = MagicMock()
+    dispatcher.can_handle_command.return_value = True
+    dispatcher.dispatch_command.return_value = result
+    adapter._load_telegram_bridge_dispatcher = MagicMock(return_value=dispatcher)
+    profile_root = tmp_path / "bridge"
+    adapter._telegram_bridge_paths = MagicMock(return_value=(profile_root, tmp_path))
+    adapter._render_telegram_bridge_payloads = AsyncMock(return_value=delivery_results)
+    msg = SimpleNamespace(
+        text="/hello",
+        chat_id=123,
+        message_id=456,
+        from_user=SimpleNamespace(id=789),
+        chat=SimpleNamespace(id=123),
+    )
+
+    assert await adapter._maybe_handle_telegram_bridge_command(SimpleNamespace(update_id=10), msg)
+
+    dispatcher.record_specialist_delivery.assert_called_once_with(
+        profile_root,
+        result.envelope,
+        delivery_results,
+        dispatch_reason="specialist",
+        rendered_payloads=result.payloads,
+    )
+
+
+@pytest.mark.asyncio
+async def test_bridge_callback_fast_acknowledges_before_dispatch(tmp_path):
+    adapter = _make_adapter()
+    result = SimpleNamespace(
+        handled=True,
+        payloads=[{"action": "send", "message_id": "msg_boundary"}],
+        bridge_config={},
+        envelope={"event_id": "evt_boundary"},
+        reason="conversation_boundary_continue",
+    )
+    query = SimpleNamespace(
+        id="cbq_boundary",
+        data="tba_ctx.myhomestead.token.c",
+        from_user=SimpleNamespace(id=789),
+        message=SimpleNamespace(chat_id=123, message_id=456, text="choice"),
+        answer=AsyncMock(),
+    )
+
+    def dispatch_callback(*_args, **kwargs):
+        assert query.answer.await_count == 1
+        assert kwargs["callback_answered"] is True
+        return result
+
+    dispatcher = MagicMock()
+    dispatcher.is_fast_bridge_callback.side_effect = lambda data: data.startswith("tba_ctx.")
+    dispatcher.fast_bridge_callback_answer.return_value = "Continuing your previous conversation…"
+    dispatcher.dispatch_callback.side_effect = dispatch_callback
+    adapter._load_telegram_bridge_dispatcher = MagicMock(return_value=dispatcher)
+    adapter._telegram_bridge_paths = MagicMock(return_value=(tmp_path / "bridge", tmp_path))
+    adapter._render_telegram_bridge_payloads = AsyncMock(return_value=[])
+
+    assert await adapter._maybe_handle_telegram_bridge_callback(SimpleNamespace(update_id=11), query)
+
+    query.answer.assert_awaited_once_with(text="Continuing your previous conversation…")
+
+
+@pytest.mark.asyncio
+async def test_bridge_callback_records_repaired_delivery(tmp_path):
+    adapter = _make_adapter()
+    repaired_payloads = [{"action": "send", "message_id": "msg_repaired"}]
+    repaired_results = [{
+        "bridge_message_id": "msg_repaired",
+        "action": "send",
+        "status": "sent",
+        "telegram_message_ids": [7002],
+    }]
+    result = SimpleNamespace(
+        handled=True,
+        payloads=[{"action": "send", "message_id": "msg_boundary"}],
+        bridge_config={},
+        envelope={"event_id": "evt_boundary"},
+        reason="conversation_boundary_fresh",
+    )
+    dispatcher = MagicMock(dispatch_callback=MagicMock(return_value=result))
+    dispatcher.is_fast_bridge_callback.return_value = True
+    dispatcher.fast_bridge_callback_answer.return_value = "Starting with fresh context…"
+    adapter._load_telegram_bridge_dispatcher = MagicMock(return_value=dispatcher)
+    profile_root = tmp_path / "bridge"
+    adapter._telegram_bridge_paths = MagicMock(return_value=(profile_root, tmp_path))
+    adapter._render_telegram_bridge_payloads = AsyncMock(side_effect=RuntimeError("render failed"))
+    adapter._rerender_telegram_bridge_with_repair = AsyncMock(
+        return_value=(repaired_payloads, repaired_results)
+    )
+    query = SimpleNamespace(
+        id="cbq_repaired",
+        data="tba_ctx.myhomestead.token.f",
+        from_user=SimpleNamespace(id=789),
+        message=SimpleNamespace(chat_id=123, message_id=456, text="choice"),
+        answer=AsyncMock(),
+    )
+
+    assert await adapter._maybe_handle_telegram_bridge_callback(SimpleNamespace(update_id=12), query)
+
+    dispatcher.record_specialist_delivery.assert_called_once_with(
+        profile_root,
+        result.envelope,
+        repaired_results,
+        dispatch_reason="conversation_boundary_fresh",
+        rendered_payloads=repaired_payloads,
+    )
+    query.answer.assert_awaited_once_with(text="Starting with fresh context…")
