@@ -8,6 +8,63 @@ build helper assembles a server when the SDK is present.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+def _install_test_presenter(root: Path) -> None:
+    handler = root / "skills/test/present.py"
+    schema = root / "contract/test.input.schema.json"
+    handler.parent.mkdir(parents=True)
+    schema.parent.mkdir(parents=True)
+    handler.write_text("import sys\nsys.stdout.write(sys.stdin.read())\n", encoding="utf-8")
+    schema.write_text(
+        json.dumps({"type": "object", "additionalProperties": False}),
+        encoding="utf-8",
+    )
+    manifest = {
+        "schema_version": "telegram.bridge.terminal_presenters.v1",
+        "presenters": [{
+            "presenter_id": "test-presenter",
+            "version": "1.0.0",
+            "description": "Render a test payload.",
+            "handler": "skills/test/present.py",
+            "sha256": "sha256:" + hashlib.sha256(handler.read_bytes()).hexdigest(),
+            "input_schema": "contract/test.input.schema.json",
+            "input_schema_sha256": "sha256:" + hashlib.sha256(schema.read_bytes()).hexdigest(),
+            "command": ["python3", "{handler}"],
+            "timeout_seconds": 2,
+            "max_output_bytes": 4096,
+        }],
+    }
+    declaration = root / "contract/terminal-presenters.json"
+    declaration.parent.mkdir(parents=True, exist_ok=True)
+    declaration.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _codex_mcp_tool_names(profile_root: Path) -> set[str]:
+    script = (
+        "import json\n"
+        "from agent.transports.hermes_tools_mcp_server import _build_server\n"
+        "server = _build_server()\n"
+        "print(json.dumps(sorted(tool.name for tool in server._tool_manager.list_tools())))\n"
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(profile_root)
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[3],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return set(json.loads(result.stdout.strip().splitlines()[-1]))
+
 
 
 
@@ -48,6 +105,36 @@ class TestModuleSurface:
             "skill_view",
         ):
             assert required in EXPOSED_TOOLS, f"missing {required!r}"
+
+    def test_terminal_presenter_projection_requires_active_negotiated_turn(
+        self, tmp_path: Path
+    ):
+        """Codex sees the finalizer only while the worker publishes a turn token."""
+        _install_test_presenter(tmp_path)
+        endpoint = tmp_path / "state/persistent-runtime/presenter-endpoint.json"
+        endpoint.parent.mkdir(parents=True)
+        endpoint.write_text(
+            json.dumps({
+                "schema_version": "hermes.terminal_presenter_endpoint.v1",
+                "socket": "state/runtime/worker.sock",
+                "runtime_instance_id": "runtime_test",
+            }),
+            encoding="utf-8",
+        )
+
+        assert "finalize_telegram_presentation" not in _codex_mcp_tool_names(tmp_path)
+
+        endpoint.write_text(
+            json.dumps({
+                "schema_version": "hermes.terminal_presenter_endpoint.v1",
+                "socket": "state/runtime/worker.sock",
+                "runtime_instance_id": "runtime_test",
+                "turn_token": "present_turn_test",
+            }),
+            encoding="utf-8",
+        )
+
+        assert "finalize_telegram_presentation" in _codex_mcp_tool_names(tmp_path)
 
     def test_agent_loop_tools_not_exposed(self):
         """delegate_task / memory / session_search / todo require the
