@@ -2,7 +2,7 @@
 
 Date: 2026-07-23
 
-Status: Open
+Status: Resolved
 
 ## Summary
 
@@ -77,3 +77,18 @@ by `_terminal_presenter_is_final_and_unbatched`. The deployed transcript represe
 tool as a namespaced MCP function call and its completion as `mcp_tool_call_end`; the existing
 finality logic may expect only the older assistant `tool_calls` plus `role == "tool"` shape.
 
+## Resolution
+
+The Codex event projector now retains a SHA-256 correlation marker for successful
+`hermes-tools.finalize_telegram_presentation` MCP results. Finality validation compares that marker
+with the worker-owned presenter's exact artifact digest, avoiding byte comparison against Codex's
+JSON-wrapped display content while keeping the call ID, tool name, ordering, and success checks.
+
+The projector also preserves conservative batch membership when tool-item lifetimes overlap.
+Consequently, a projected finalizer invoked in parallel with another tool remains rejected even if
+the other tool completes first. Failed retries and later-call rejection retain their previous
+behavior.
+
+Regression coverage feeds the real Codex app-server/FastMCP result shape through projection and
+finality validation, verifies exact artifact promotion and terminal-presenter provenance, and
+covers projected batching, later calls, and failed-then-successful retries.

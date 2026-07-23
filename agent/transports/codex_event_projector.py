@@ -52,6 +52,32 @@ def _format_tool_args(d: dict) -> str:
     return json.dumps(d, ensure_ascii=False, sort_keys=True)
 
 
+def _terminal_presenter_content_sha256(result: Any) -> Optional[str]:
+    """Identify the exact presenter artifact inside a FastMCP result.
+
+    Codex preserves MCP content as nested content items whose text is the
+    string returned by the Hermes callback. Preserve only its digest for
+    correlation with the worker-owned artifact; do not duplicate the full
+    raw MCP result into conversation metadata.
+    """
+    if isinstance(result, str):
+        return hashlib.sha256(result.encode("utf-8")).hexdigest()
+    if isinstance(result, dict):
+        text = result.get("text")
+        if isinstance(text, str):
+            return hashlib.sha256(text.encode("utf-8")).hexdigest()
+        for key in ("content", "structuredContent", "result"):
+            found = _terminal_presenter_content_sha256(result.get(key))
+            if found:
+                return found
+    elif isinstance(result, list):
+        for item in result:
+            found = _terminal_presenter_content_sha256(item)
+            if found:
+                return found
+    return None
+
+
 @dataclass
 class ProjectionResult:
     """Output of projecting one Codex item.
@@ -74,12 +100,35 @@ class CodexEventProjector:
 
     def __init__(self) -> None:
         self._pending_reasoning: list[str] = []
+        self._active_tool_items: set[str] = set()
+        self._tool_batch_sizes: dict[str, int] = {}
 
     def project(self, notification: dict) -> ProjectionResult:
         """Project a single notification. Idempotent for non-completion events;
         only `item/completed` and `turn/completed` materialize messages."""
         method = notification.get("method", "")
         params = notification.get("params", {}) or {}
+
+        if method == "item/started":
+            item = params.get("item") or {}
+            item_type = item.get("type") or ""
+            item_id = item.get("id") or ""
+            if item_id and item_type in {
+                "commandExecution",
+                "fileChange",
+                "mcpToolCall",
+                "dynamicToolCall",
+            }:
+                batch = self._active_tool_items | {item_id}
+                if len(batch) > 1:
+                    batch_size = len(batch)
+                    for active_id in batch:
+                        self._tool_batch_sizes[active_id] = max(
+                            batch_size,
+                            self._tool_batch_sizes.get(active_id, 1),
+                        )
+                self._active_tool_items.add(item_id)
+            return ProjectionResult()
 
         # We only materialize messages on `item/completed`. Streaming deltas
         # (`item/<type>/outputDelta`, `item/<type>/delta`) are display-only and
@@ -98,14 +147,25 @@ class CodexEventProjector:
             self._pending_reasoning.extend(item.get("summary") or [])
             self._pending_reasoning.extend(item.get("content") or [])
             return ProjectionResult()
-        if item_type == "commandExecution":
-            return self._project_command(item, item_id)
-        if item_type == "fileChange":
-            return self._project_file_change(item, item_id)
-        if item_type == "mcpToolCall":
-            return self._project_mcp_tool_call(item, item_id)
-        if item_type == "dynamicToolCall":
-            return self._project_dynamic_tool_call(item, item_id)
+        if item_type in {
+            "commandExecution",
+            "fileChange",
+            "mcpToolCall",
+            "dynamicToolCall",
+        }:
+            batch_size = self._tool_batch_sizes.pop(item_id, 1)
+            self._active_tool_items.discard(item_id)
+            if item_type == "commandExecution":
+                projected = self._project_command(item, item_id)
+            elif item_type == "fileChange":
+                projected = self._project_file_change(item, item_id)
+            elif item_type == "mcpToolCall":
+                projected = self._project_mcp_tool_call(item, item_id)
+            else:
+                projected = self._project_dynamic_tool_call(item, item_id)
+            if batch_size > 1 and projected.messages:
+                projected.messages[0]["codex_tool_batch_size"] = batch_size
+            return projected
         if item_type == "userMessage":
             return self._project_user_message(item)
 
@@ -253,6 +313,14 @@ class CodexEventProjector:
             "tool_call_id": call_id,
             "content": content,
         }
+        if (
+            server.replace("_", "-") == "hermes-tools"
+            and tool == "finalize_telegram_presentation"
+            and not error
+        ):
+            content_sha256 = _terminal_presenter_content_sha256(result)
+            if content_sha256:
+                tool_msg["terminal_presenter_content_sha256"] = content_sha256
         return ProjectionResult(
             messages=[assistant_msg, tool_msg], is_tool_iteration=True
         )

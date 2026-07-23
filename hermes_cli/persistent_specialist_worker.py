@@ -349,6 +349,7 @@ def _terminal_presenter_is_final_and_unbatched(
     result: dict[str, Any],
     prompt: str,
     artifact_content: str,
+    artifact_sha256: str | None = None,
 ) -> bool:
     messages = result.get("messages")
     if not isinstance(messages, list):
@@ -368,7 +369,13 @@ def _terminal_presenter_is_final_and_unbatched(
         if not isinstance(message, dict):
             continue
         if message.get("role") == "assistant" and isinstance(message.get("tool_calls"), list):
-            batch_size = len(message["tool_calls"])
+            projected_batch_size = message.get("codex_tool_batch_size")
+            batch_size = max(
+                len(message["tool_calls"]),
+                projected_batch_size
+                if type(projected_batch_size) is int and projected_batch_size > 0
+                else 1,
+            )
             for call in message["tool_calls"]:
                 function = call.get("function") if isinstance(call, dict) else None
                 call_id = call.get("id") if isinstance(call, dict) else None
@@ -377,8 +384,15 @@ def _terminal_presenter_is_final_and_unbatched(
                     calls.append((call_id, name, batch_size))
         elif (
             message.get("role") == "tool"
-            and message.get("content") == artifact_content
             and isinstance(message.get("tool_call_id"), str)
+            and (
+                message.get("content") == artifact_content
+                or (
+                    isinstance(artifact_sha256, str)
+                    and message.get("terminal_presenter_content_sha256")
+                    == artifact_sha256
+                )
+            )
         ):
             successful_call_ids.add(message["tool_call_id"])
     if not calls or not successful_call_ids:
@@ -1278,6 +1292,7 @@ class PersistentSpecialistWorker:
                             result,
                             prompt,
                             str(artifact["content"]),
+                            str(artifact["sha256"]),
                         ):
                             raise TerminalPresenterError(
                                 "TERMINAL_PRESENTER_NOT_FINAL",

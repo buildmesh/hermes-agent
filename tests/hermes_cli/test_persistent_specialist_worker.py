@@ -17,6 +17,7 @@ import pytest
 
 import hermes_cli.persistent_specialist_worker as persistent_worker
 from agent.transports.codex_app_server import CodexAppServerClient
+from agent.transports.codex_event_projector import CodexEventProjector
 from hermes_cli.codex_runtime_plugin_migration import (
     hermes_tools_mcp_app_server_args,
 )
@@ -88,6 +89,83 @@ def test_terminal_presenter_finality_allows_failed_retry_but_rejects_calls_after
         {"role": "tool", "tool_call_id": "call_late", "content": "{\"error\":true}"},
     ])
     assert not _terminal_presenter_is_final_and_unbatched(result, "prompt", "artifact")
+
+
+def test_terminal_presenter_finality_accepts_projected_mcp_result_marker() -> None:
+    artifact = "exact artifact not present in projected display content"
+    result = {"messages": [
+        {"role": "user", "content": "prompt"},
+        {"role": "assistant", "tool_calls": [{
+            "id": "codex_mcp_present",
+            "function": {
+                "name": "mcp.hermes_tools.finalize_telegram_presentation",
+            },
+        }]},
+        {
+            "role": "tool",
+            "tool_call_id": "codex_mcp_present",
+            "content": json.dumps({
+                "content": [{"text": "FastMCP-wrapped result"}],
+            }),
+            "terminal_presenter_content_sha256": hashlib.sha256(
+                artifact.encode("utf-8")
+            ).hexdigest(),
+        },
+        {"role": "assistant", "content": "Done."},
+    ]}
+
+    assert _terminal_presenter_is_final_and_unbatched(
+        result,
+        "prompt",
+        artifact,
+        hashlib.sha256(artifact.encode("utf-8")).hexdigest(),
+    )
+
+    result["messages"].extend([
+        {"role": "assistant", "tool_calls": [{
+            "id": "call_late",
+            "function": {"name": "domain_tool"},
+        }]},
+        {"role": "tool", "tool_call_id": "call_late", "content": "late"},
+    ])
+    assert not _terminal_presenter_is_final_and_unbatched(
+        result,
+        "prompt",
+        artifact,
+        hashlib.sha256(artifact.encode("utf-8")).hexdigest(),
+    )
+
+
+def test_terminal_presenter_finality_rejects_projected_codex_batch() -> None:
+    artifact = "artifact"
+    result = {"messages": [
+        {"role": "user", "content": "prompt"},
+        {
+            "role": "assistant",
+            "codex_tool_batch_size": 2,
+            "tool_calls": [{
+                "id": "codex_mcp_present",
+                "function": {
+                    "name": "mcp.hermes_tools.finalize_telegram_presentation",
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "codex_mcp_present",
+            "content": "wrapped",
+            "terminal_presenter_content_sha256": hashlib.sha256(
+                artifact.encode("utf-8")
+            ).hexdigest(),
+        },
+    ]}
+
+    assert not _terminal_presenter_is_final_and_unbatched(
+        result,
+        "prompt",
+        artifact,
+        hashlib.sha256(artifact.encode("utf-8")).hexdigest(),
+    )
 
 
 def test_bridge_prompt_without_terminal_presenter_requires_render_json() -> None:
@@ -331,6 +409,31 @@ async def test_codex_app_server_projects_and_invokes_active_terminal_presenter(
             exercise_codex_projection,
             invoke=True,
         )
+        artifact = worker._active_presenter_turn["artifact"]
+        projected = CodexEventProjector().project({
+            "method": "item/completed",
+            "params": {"item": {
+                "type": "mcpToolCall",
+                "id": "real-presenter-call",
+                "server": "hermes-tools",
+                "tool": "finalize_telegram_presentation",
+                "status": "completed",
+                "arguments": {},
+                "result": result,
+                "error": None,
+            }},
+        }).messages
+        projected_result = {"messages": [
+            {"role": "user", "content": "prompt"},
+            *projected,
+            {"role": "assistant", "content": "Done."},
+        ]}
+        assert _terminal_presenter_is_final_and_unbatched(
+            projected_result,
+            "prompt",
+            artifact["content"],
+            artifact["sha256"],
+        )
         worker._end_presenter_turn()
         downgraded_inventory, _ = await asyncio.to_thread(
             exercise_codex_projection,
@@ -401,6 +504,24 @@ class TerminalPresenterAgent(FakeAgent):
                 {"role": "assistant", "content": "model prose must not win"},
             ],
         }
+
+
+class ProjectedMcpTerminalPresenterAgent(TerminalPresenterAgent):
+    def run_conversation(self, prompt: str) -> dict:
+        result = super().run_conversation(prompt)
+        tool_call = result["messages"][1]["tool_calls"][0]
+        tool_call["function"]["name"] = (
+            "mcp.hermes_tools.finalize_telegram_presentation"
+        )
+        artifact = result["messages"][2]["content"]
+        result["messages"][2]["content"] = json.dumps({
+            "content": [{"type": "text", "text": artifact}],
+        })
+        result["messages"][2]["terminal_presenter_content_sha256"] = (
+            hashlib.sha256(artifact.encode("utf-8")).hexdigest()
+        )
+        result["messages"][3]["content"] = "Done."
+        return result
 
 
 def correction_request(event_id: str, attempt_id: str = "corr_attempt_1") -> dict:
@@ -1214,14 +1335,19 @@ async def test_v2_completed_turn_persists_raw_malformed_render_candidate(tmp_pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "agent_class",
+    [TerminalPresenterAgent, ProjectedMcpTerminalPresenterAgent],
+)
 async def test_v3_terminal_presenter_promotes_exact_output_and_replays(
     tmp_path: Path,
+    agent_class: type[TerminalPresenterAgent],
 ) -> None:
     install_test_presenter(tmp_path)
     agents: list[TerminalPresenterAgent] = []
 
     def factory() -> TerminalPresenterAgent:
-        agent = TerminalPresenterAgent()
+        agent = agent_class()
         agents.append(agent)
         return agent
 

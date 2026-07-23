@@ -5,6 +5,7 @@ plus synthetic ones for item types we couldn't auth-test live."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -223,6 +224,67 @@ class TestMcpToolCallProjection:
             {"method": "item/completed", "params": {"item": item}}
         ).messages
         assert "error" in msgs[1]["content"]
+
+    def test_terminal_presenter_preserves_artifact_correlation(self) -> None:
+        artifact = "[{\"render\":{\"text\":\"inventory\"}}]"
+        item = {
+            "type": "mcpToolCall",
+            "id": "present-call",
+            "server": "hermes_tools",
+            "tool": "finalize_telegram_presentation",
+            "status": "completed",
+            "arguments": {},
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": artifact,
+                }]
+            },
+            "error": None,
+        }
+
+        messages = CodexEventProjector().project(
+            {"method": "item/completed", "params": {"item": item}}
+        ).messages
+
+        assert messages[1]["terminal_presenter_content_sha256"] == (
+            hashlib.sha256(artifact.encode("utf-8")).hexdigest()
+        )
+
+    def test_overlapping_codex_tools_preserve_batch_membership(self) -> None:
+        projector = CodexEventProjector()
+        domain = {
+            "type": "mcpToolCall",
+            "id": "domain-call",
+            "server": "domain",
+            "tool": "lookup",
+            "arguments": {},
+            "result": {"content": [{"text": "domain"}]},
+        }
+        presenter = {
+            "type": "mcpToolCall",
+            "id": "present-call",
+            "server": "hermes-tools",
+            "tool": "finalize_telegram_presentation",
+            "arguments": {},
+            "result": {"content": [{"text": "artifact"}]},
+        }
+        projector.project(
+            {"method": "item/started", "params": {"item": domain}}
+        )
+        projector.project(
+            {"method": "item/started", "params": {"item": presenter}}
+        )
+
+        domain_messages = projector.project(
+            {"method": "item/completed", "params": {"item": domain}}
+        ).messages
+        presenter_messages = projector.project(
+            {"method": "item/completed", "params": {"item": presenter}}
+        ).messages
+
+        assert domain_messages[0]["codex_tool_batch_size"] == 2
+        assert presenter_messages[0]["codex_tool_batch_size"] == 2
 
 
 class TestUserAndOpaqueProjection:
