@@ -1092,6 +1092,36 @@ async def test_bridge_callback_exception_alerts_with_safe_user_message(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_bridge_acknowledged_callback_dispatch_exception_sends_safe_chat_message(tmp_path):
+    adapter = _make_adapter()
+    dispatcher = MagicMock()
+    dispatcher.is_fast_bridge_callback.return_value = True
+    dispatcher.fast_bridge_callback_answer.return_value = "Starting with fresh context…"
+    dispatcher.dispatch_callback.side_effect = RuntimeError("sensitive callback failure")
+    adapter._load_telegram_bridge_dispatcher = MagicMock(return_value=dispatcher)
+    adapter._telegram_bridge_paths = MagicMock(return_value=(tmp_path / "bridge", tmp_path))
+    adapter.send = AsyncMock()
+    query = SimpleNamespace(
+        id="cbq_acknowledged_failure",
+        data="tba_ctx.myhomestead.token.f",
+        from_user=SimpleNamespace(id=789),
+        message=SimpleNamespace(chat_id=123, message_id=456, text="choice"),
+        answer=AsyncMock(),
+    )
+
+    assert await adapter._maybe_handle_telegram_bridge_callback(
+        SimpleNamespace(update_id=61),
+        query,
+    )
+
+    query.answer.assert_awaited_once_with(text="Starting with fresh context…")
+    adapter.send.assert_awaited_once_with(
+        "123",
+        "I couldn't complete that request just now. Please try again.",
+    )
+
+
+@pytest.mark.asyncio
 async def test_bridge_command_failed_render_retry_does_not_send_generic_message(tmp_path):
     """A failed render repair is not followed by a second user-visible message."""
     adapter = _make_adapter()

@@ -8269,6 +8269,7 @@ class TelegramAdapter(BasePlatformAdapter):
         profile_root, hermes_base = paths
         render_retry_failed = False
         callback_answered = False
+        delivery_started = False
         worker_snapshot: dict[str, asyncio.subprocess.Process] | None = None
         try:
             fast_callback = getattr(dispatcher, "is_fast_bridge_callback", None)
@@ -8304,6 +8305,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if not result.handled:
                 return False
             try:
+                delivery_started = True
                 delivery_results = await self._render_telegram_bridge_payloads(
                     dispatcher, result.payloads, result.bridge_config
                 )
@@ -8339,6 +8341,15 @@ class TelegramAdapter(BasePlatformAdapter):
                         await query.answer()
                     except Exception:
                         pass
+                return True
+            if callback_answered and not delivery_started:
+                try:
+                    await self.send(
+                        str(message.chat_id),
+                        "I couldn't complete that request just now. Please try again.",
+                    )
+                except Exception:
+                    pass
                 return True
             if not callback_answered:
                 try:
