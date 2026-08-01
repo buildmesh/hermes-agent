@@ -45,6 +45,14 @@ from hermes_cli.terminal_workflow import (
     execute_terminal_workflow,
     load_terminal_workflows,
 )
+from hermes_cli.terminal_mutation import (
+    MUTATION_CAPABILITY,
+    TerminalMutationError,
+    execute_terminal_mutation,
+    load_terminal_mutations,
+    record_terminal_mutation_presentation,
+    recover_terminal_mutation_journal,
+)
 
 
 PROTOCOL = "telegram.bridge.persistent_service.v1"
@@ -52,6 +60,7 @@ PROTOCOL_V2 = "telegram.bridge.persistent_service.v2"
 PROTOCOL_V3 = "telegram.bridge.persistent_service.v3"
 TERMINAL_PRESENTER_CAPABILITY = "terminal_presenter_finalization.v1"
 TERMINAL_WORKFLOW_CAPABILITY = "terminal_workflow_chaining.v1"
+TERMINAL_MUTATION_CAPABILITY = MUTATION_CAPABILITY
 MAX_LINE_BYTES = 1024 * 1024
 MAX_CANDIDATE_BYTES = 512 * 1024
 LEDGER_RETENTION = timedelta(days=30)
@@ -327,6 +336,7 @@ def _bridge_prompt(
     *,
     terminal_presenter: bool = False,
     terminal_workflow: bool = False,
+    terminal_mutation: bool = False,
 ) -> str:
     if terminal_presenter:
         completion_instruction = (
@@ -336,6 +346,15 @@ def _bridge_prompt(
                 "matches the requested domain operation; it runs the producer, profile-owned "
                 "mapping, and presenter as one final, unbatched framework tool call. "
                 if terminal_workflow
+                else ""
+            )
+            + (
+                "The negotiated run_terminal_mutation tool is available for installed "
+                "immediate mutations. It changes domain state without a framework "
+                "confirmation prompt. Use it only when the request is clear and any "
+                "confirmation required by specialist policy has already occurred. It "
+                "must be the final, unbatched tool call. "
+                if terminal_mutation
                 else ""
             )
             + "The negotiated finalize_telegram_presentation tool is available for this turn. "
@@ -430,10 +449,13 @@ def _is_terminal_presenter_tool(name: str) -> bool:
     return (
         name == "finalize_telegram_presentation"
         or name == "run_terminal_workflow"
+        or name == "run_terminal_mutation"
         or name.endswith(".finalize_telegram_presentation")
         or name.endswith(".run_terminal_workflow")
+        or name.endswith(".run_terminal_mutation")
         or name.endswith("__finalize_telegram_presentation")
         or name.endswith("__run_terminal_workflow")
+        or name.endswith("__run_terminal_mutation")
     )
 
 
@@ -526,6 +548,18 @@ class PersistentSpecialistWorker:
         except TerminalPresenterError:
             self._terminal_workflows = {}
         try:
+            self._terminal_mutations = load_terminal_mutations(
+                self.profile_root
+            )
+            self._terminal_mutation_journal_healthy = (
+                recover_terminal_mutation_journal(self.profile_root)
+                if self._terminal_mutations
+                else False
+            )
+        except TerminalPresenterError:
+            self._terminal_mutations = {}
+            self._terminal_mutation_journal_healthy = False
+        try:
             import yaml
 
             profile_config = yaml.safe_load(
@@ -543,8 +577,13 @@ class PersistentSpecialistWorker:
                 and str(model_config.get("openai_runtime") or "").strip().lower()
                 == "codex_app_server"
             )
+            self._terminal_mutation_runtime_supported = (
+                self._terminal_workflow_runtime_supported
+                and self._terminal_mutation_journal_healthy
+            )
         except (OSError, UnicodeDecodeError, ValueError, TypeError):
             self._terminal_workflow_runtime_supported = False
+            self._terminal_mutation_runtime_supported = False
 
     def _log_event(self, event: str, **fields: Any) -> None:
         value = {
@@ -574,6 +613,7 @@ class PersistentSpecialistWorker:
         turn_token: str | None = None,
         *,
         terminal_workflow: bool = False,
+        terminal_mutation: bool = False,
     ) -> None:
         endpoint = {
             "schema_version": "hermes.terminal_presenter_endpoint.v1",
@@ -583,6 +623,7 @@ class PersistentSpecialistWorker:
         if turn_token is not None:
             endpoint["turn_token"] = turn_token
             endpoint["terminal_workflow"] = terminal_workflow
+            endpoint["terminal_mutation"] = terminal_mutation
         _atomic_json(self._presenter_endpoint_path, endpoint)
 
     def _begin_presenter_turn(self, request: dict[str, Any]) -> None:
@@ -594,11 +635,15 @@ class PersistentSpecialistWorker:
             "artifact": None,
             "violation": None,
             "terminal_workflow": request.get("_terminal_workflow_negotiated") is True,
+            "terminal_mutation": request.get("_terminal_mutation_negotiated") is True,
             "workflow_lock": asyncio.Lock(),
         }
         self._write_presenter_endpoint(
             token,
             terminal_workflow=self._active_presenter_turn["terminal_workflow"],
+            terminal_mutation=self._active_presenter_turn[
+                "terminal_mutation"
+            ],
         )
 
     def _end_presenter_turn(self) -> None:
@@ -829,11 +874,14 @@ class PersistentSpecialistWorker:
         operation = request.get("operation")
         allowed = (
             {"protocol_version", "operation", "turn_token", "workflow_id", "input"}
-            if operation == "workflow"
+            if operation in {"workflow", "mutation"}
             else {"protocol_version", "operation", "turn_token", "presenter_id", "input"}
         )
         active = self._active_presenter_turn
-        if set(request) != allowed or operation not in {"present", "workflow"}:
+        if (
+            set(request) != allowed
+            or operation not in {"present", "workflow", "mutation"}
+        ):
             return {
                 "protocol_version": PRESENTER_PROTOCOL,
                 "status": "failed",
@@ -852,7 +900,7 @@ class PersistentSpecialistWorker:
                     "message": "no eligible persistent presenter turn is active",
                 },
             }
-        if operation == "workflow" and not workflow_locked:
+        if operation in {"workflow", "mutation"} and not workflow_locked:
             workflow_lock = active.get("workflow_lock")
             if workflow_lock is None:
                 return {
@@ -877,6 +925,145 @@ class PersistentSpecialistWorker:
                     "code": "TERMINAL_PRESENTER_NOT_FINAL",
                     "message": "the turn already has a successful terminal presenter",
                 },
+            }
+        if operation == "mutation":
+            if active.get("terminal_mutation") is not True:
+                return {
+                    "protocol_version": PRESENTER_PROTOCOL,
+                    "status": "failed",
+                    "error": {
+                        "code": "MUTATION_NOT_NEGOTIATED",
+                        "message": "terminal mutation capability was not negotiated",
+                    },
+                }
+            workflow_id = request.get("workflow_id")
+            workflow_input = request.get("input")
+            if (
+                not isinstance(workflow_id, str)
+                or workflow_id not in self._terminal_mutations
+                or not isinstance(workflow_input, dict)
+            ):
+                return {
+                    "protocol_version": PRESENTER_PROTOCOL,
+                    "status": "failed",
+                    "error": {
+                        "code": "MUTATION_NOT_DECLARED",
+                        "message": "mutation workflow is not declared",
+                    },
+                }
+            try:
+                mutation_result = await asyncio.to_thread(
+                    execute_terminal_mutation,
+                    self.profile_root,
+                    specialist_id=self.agent_id,
+                    conversation_id=str(active["conversation_id"]),
+                    event_id=str(active["event_id"]),
+                    workflow_id=workflow_id,
+                    workflow_input=workflow_input,
+                )
+            except TerminalMutationError as exc:
+                if exc.sealed:
+                    active["mutation_sealed"] = True
+                    active["mutation_error_code"] = exc.code
+                return {
+                    "protocol_version": PRESENTER_PROTOCOL,
+                    "status": "failed",
+                    "sealed": exc.sealed,
+                    "error": {"code": exc.code, "message": str(exc)[:500]},
+                }
+            active["mutation_sealed"] = True
+            try:
+                artifact = await asyncio.to_thread(
+                    execute_terminal_presenter,
+                    self.profile_root,
+                    mutation_result["presenter_id"],
+                    mutation_result["presenter_input"],
+                )
+            except TerminalMutationError as exc:
+                self.last_error_code = exc.code
+                unknown = "OUTCOME_UNKNOWN" in exc.code
+                response = self._failure(
+                    request,
+                    exc.code,
+                    str(exc),
+                    False,
+                    "outcome_unknown" if unknown else "completed",
+                    timing_ms=_timing_ms(
+                        started,
+                        queue=queue_ms,
+                        initialization=(
+                            initialization_ms
+                            if request["operation"] == "turn"
+                            else 0
+                        ),
+                        model_and_tools=(
+                            int((time.monotonic() - model_started) * 1000)
+                            if request["operation"] == "turn"
+                            else 0
+                        ),
+                    ),
+                )
+                record["state"] = (
+                    "outcome_unknown" if unknown else "failed"
+                )
+                record["execution_state"] = (
+                    "outcome_unknown" if unknown else "completed"
+                )
+                record["response"] = response
+                self._log_terminal_response("turn_failed", request, response)
+            except TerminalPresenterError as exc:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(
+                        record_terminal_mutation_presentation,
+                        self.profile_root,
+                        mutation_result["journal_path"],
+                        error_code=exc.code,
+                    )
+                return {
+                    "protocol_version": PRESENTER_PROTOCOL,
+                    "status": "failed",
+                    "sealed": True,
+                    "error": {"code": exc.code, "message": str(exc)[:500]},
+                }
+            artifact["invocation_id"] = f"present_{uuid.uuid4().hex}"
+            artifact["mutation_workflow_id"] = mutation_result["workflow_id"]
+            artifact["mutation_workflow_version"] = mutation_result[
+                "workflow_version"
+            ]
+            artifact["mutation_handler_sha256"] = mutation_result[
+                "handler_sha256"
+            ]
+            artifact["mutation_mapper_sha256"] = mutation_result[
+                "mapper_sha256"
+            ]
+            artifact["mutation_outcome"] = mutation_result["outcome"]
+            try:
+                await asyncio.to_thread(
+                    record_terminal_mutation_presentation,
+                    self.profile_root,
+                    mutation_result["journal_path"],
+                    artifact=artifact,
+                )
+            except Exception:
+                active["mutation_error_code"] = (
+                    "MUTATION_PRESENTATION_FAILED"
+                )
+                return {
+                    "protocol_version": PRESENTER_PROTOCOL,
+                    "status": "failed",
+                    "sealed": True,
+                    "error": {
+                        "code": "MUTATION_PRESENTATION_FAILED",
+                        "message": "mutation presentation provenance could not be persisted",
+                    },
+                }
+            active["artifact"] = artifact
+            return {
+                "protocol_version": PRESENTER_PROTOCOL,
+                "status": "completed",
+                "content": artifact["content"],
+                "sha256": artifact["sha256"],
+                "invocation_id": artifact["invocation_id"],
             }
         if operation == "workflow":
             if active.get("terminal_workflow") is not True:
@@ -1071,6 +1258,13 @@ class PersistentSpecialistWorker:
                 and (accepted is None or TERMINAL_WORKFLOW_CAPABILITY in accepted)
             ):
                 capabilities.append(TERMINAL_WORKFLOW_CAPABILITY)
+            if (
+                self._terminal_mutations
+                and self._terminal_mutation_runtime_supported
+                and TERMINAL_PRESENTER_CAPABILITY in capabilities
+                and (accepted is None or TERMINAL_MUTATION_CAPABILITY in accepted)
+            ):
+                capabilities.append(TERMINAL_MUTATION_CAPABILITY)
             await self._write(writer, {
                 "protocol_version": hello["protocol_version"],
                 "request_id": hello["request_id"],
@@ -1096,6 +1290,13 @@ class PersistentSpecialistWorker:
                 and TERMINAL_WORKFLOW_CAPABILITY in capabilities
                 and isinstance(request.get("accepted_capabilities"), list)
                 and TERMINAL_WORKFLOW_CAPABILITY
+                in request["accepted_capabilities"]
+            )
+            request["_terminal_mutation_negotiated"] = (
+                request.get("protocol_version") == PROTOCOL_V3
+                and TERMINAL_MUTATION_CAPABILITY in capabilities
+                and isinstance(request.get("accepted_capabilities"), list)
+                and TERMINAL_MUTATION_CAPABILITY
                 in request["accepted_capabilities"]
             )
             response = await self.handle_request(request)
@@ -1482,6 +1683,11 @@ class PersistentSpecialistWorker:
                         and request.get("_terminal_workflow_negotiated") is True
                         and bool(self._terminal_workflows)
                     )
+                    terminal_mutation_enabled = (
+                        terminal_presenter_enabled
+                        and request.get("_terminal_mutation_negotiated") is True
+                        and bool(self._terminal_mutations)
+                    )
                     if terminal_presenter_enabled:
                         self._begin_presenter_turn(request)
                         presenter_turn_active = True
@@ -1493,6 +1699,7 @@ class PersistentSpecialistWorker:
                         request["envelope"],
                         terminal_presenter=terminal_presenter_enabled,
                         terminal_workflow=terminal_workflow_enabled,
+                        terminal_mutation=terminal_mutation_enabled,
                     )
                     model_started = time.monotonic()
                     model_task: asyncio.Task[Any] | None = None
@@ -1516,6 +1723,21 @@ class PersistentSpecialistWorker:
                     candidate_source: dict[str, Any] = {"kind": "model_final"}
                     active_presenter = self._active_presenter_turn if presenter_turn_active else None
                     artifact = active_presenter.get("artifact") if active_presenter else None
+                    if (
+                        active_presenter
+                        and active_presenter.get("mutation_sealed") is True
+                        and not isinstance(artifact, dict)
+                    ):
+                        raise TerminalMutationError(
+                            str(
+                                active_presenter.get(
+                                    "mutation_error_code",
+                                    "MUTATION_TERMINAL_FAILURE",
+                                )
+                            ),
+                            "terminal mutation ended without a valid presenter artifact",
+                            sealed=True,
+                        )
                     if isinstance(artifact, dict):
                         if active_presenter.get("violation"):
                             raise TerminalPresenterError(
@@ -1546,6 +1768,25 @@ class PersistentSpecialistWorker:
                                 "workflow_version": artifact["workflow_version"],
                                 "producer_sha256": artifact["producer_sha256"],
                                 "mapper_sha256": artifact.get("mapper_sha256"),
+                            }
+                        if isinstance(
+                            artifact.get("mutation_workflow_id"),
+                            str,
+                        ):
+                            record["terminal_mutation"] = {
+                                "workflow_id": artifact[
+                                    "mutation_workflow_id"
+                                ],
+                                "workflow_version": artifact[
+                                    "mutation_workflow_version"
+                                ],
+                                "handler_sha256": artifact[
+                                    "mutation_handler_sha256"
+                                ],
+                                "mapper_sha256": artifact.get(
+                                    "mutation_mapper_sha256"
+                                ),
+                                "outcome": artifact["mutation_outcome"],
                             }
                     payloads = None
                     if request["protocol_version"] == PROTOCOL:

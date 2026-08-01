@@ -7,6 +7,7 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import json
 import time
 from unittest.mock import patch
 from typing import Any, Optional
@@ -1313,6 +1314,66 @@ class TestSessionRetirement:
             for message in second.projected_messages
         )
         assert turn_number == 2
+
+    def test_unknown_terminal_mutation_outcome_retires_warm_thread(self):
+        client = FakeClient()
+
+        def handler(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                client.queue_notification(
+                    "item/completed",
+                    item={
+                        "type": "mcpToolCall",
+                        "id": "mutation-1",
+                        "server": "hermes-tools",
+                        "tool": "run_terminal_mutation",
+                        "arguments": {
+                            "workflow_id": "create_record",
+                            "input": {"title": "example"},
+                        },
+                        "result": {
+                            "content": [{
+                                "type": "text",
+                                "text": json.dumps({
+                                    "error": {
+                                        "code": "MUTATION_OUTCOME_UNKNOWN",
+                                    },
+                                    "sealed": True,
+                                }),
+                            }]
+                        },
+                        "error": None,
+                    },
+                    threadId="thread-fake-001",
+                    turnId="tu1",
+                )
+                client.queue_notification(
+                    "turn/completed",
+                    threadId="thread-fake-001",
+                    turn={
+                        "id": "tu1",
+                        "status": "interrupted",
+                        "error": None,
+                    },
+                )
+                return {"turn": {"id": "tu1"}}
+            if method == "turn/interrupt":
+                return {}
+            return {}
+
+        client._request_handler = handler
+        session = make_session(client)
+
+        result = session.run_turn("create it", turn_timeout=1.0)
+
+        assert result.final_text == "Terminal workflow completed."
+        assert result.should_retire is True
+        assert any(
+            method == "turn/interrupt"
+            for method, _params in client.requests
+        )
 
     def test_stale_completion_cannot_complete_next_warm_turn(self):
         client = FakeClient()

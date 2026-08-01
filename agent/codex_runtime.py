@@ -319,6 +319,7 @@ def run_codex_app_server_turn(
         _ServerRequestRouting,
     )
     from hermes_cli.terminal_presenter import terminal_presenters_available
+    from hermes_cli.terminal_mutation import terminal_mutations_available
     from hermes_cli.terminal_workflow import terminal_workflows_available
 
     required_mcp_tools: set[str] = set()
@@ -326,6 +327,8 @@ def run_codex_app_server_turn(
         required_mcp_tools.add("finalize_telegram_presentation")
     if terminal_workflows_available():
         required_mcp_tools.add("run_terminal_workflow")
+    if terminal_mutations_available():
+        required_mcp_tools.add("run_terminal_mutation")
 
     resume_thread_id = getattr(agent, "_codex_resume_thread_id", None)
     existing_session = getattr(agent, "_codex_session", None)

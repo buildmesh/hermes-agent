@@ -791,8 +791,16 @@ class CodexAppServerSession:
             projection = projector.project(note)
             if projection.messages:
                 result.projected_messages.extend(projection.messages)
+                mutation_outcome_unknown = any(
+                    message.get("terminal_mutation_outcome_unknown") is True
+                    for message in projection.messages
+                    if isinstance(message, dict)
+                )
                 if any(
-                    message.get("terminal_workflow_completed") is True
+                    (
+                        message.get("terminal_workflow_completed") is True
+                        or message.get("terminal_mutation_completed") is True
+                    )
                     for message in projection.messages
                     if isinstance(message, dict)
                 ):
@@ -802,6 +810,8 @@ class CodexAppServerSession:
                     # producer→mapper→presenter chain.
                     self._issue_interrupt(result.turn_id)
                     result.final_text = "Terminal workflow completed."
+                    if mutation_outcome_unknown:
+                        result.should_retire = True
                     terminal_workflow_completed = True
                     terminal_interrupt_deadline = min(
                         deadline,

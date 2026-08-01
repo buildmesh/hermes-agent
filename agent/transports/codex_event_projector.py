@@ -104,6 +104,58 @@ def _terminal_workflow_result_is_terminal(result: Any) -> bool:
     return False
 
 
+def _terminal_mutation_result_is_terminal(result: Any) -> bool:
+    if isinstance(result, dict):
+        text = result.get("text")
+        if isinstance(text, str):
+            try:
+                value = json.loads(text)
+            except (TypeError, ValueError):
+                return True
+            return not isinstance(value, dict) or (
+                "error" not in value or value.get("sealed") is True
+            )
+        for key in ("content", "structuredContent", "result"):
+            nested = result.get(key)
+            if nested is not None:
+                return _terminal_mutation_result_is_terminal(nested)
+    if isinstance(result, list):
+        return any(
+            _terminal_mutation_result_is_terminal(item) for item in result
+        )
+    if isinstance(result, str):
+        return _terminal_mutation_result_is_terminal({"text": result})
+    return False
+
+
+def _terminal_mutation_result_is_outcome_unknown(result: Any) -> bool:
+    if isinstance(result, dict):
+        text = result.get("text")
+        if isinstance(text, str):
+            try:
+                value = json.loads(text)
+            except (TypeError, ValueError):
+                return False
+            error = value.get("error") if isinstance(value, dict) else None
+            return (
+                isinstance(error, dict)
+                and "OUTCOME_UNKNOWN" in str(error.get("code") or "")
+            )
+        return any(
+            _terminal_mutation_result_is_outcome_unknown(result.get(key))
+            for key in ("content", "structuredContent", "result")
+            if result.get(key) is not None
+        )
+    if isinstance(result, list):
+        return any(
+            _terminal_mutation_result_is_outcome_unknown(item)
+            for item in result
+        )
+    if isinstance(result, str):
+        return _terminal_mutation_result_is_outcome_unknown({"text": result})
+    return False
+
+
 @dataclass
 class ProjectionResult:
     """Output of projecting one Codex item.
@@ -344,6 +396,7 @@ class CodexEventProjector:
             and tool in {
                 "finalize_telegram_presentation",
                 "run_terminal_workflow",
+                "run_terminal_mutation",
             }
             and not error
         ):
@@ -355,6 +408,13 @@ class CodexEventProjector:
                     and _terminal_workflow_result_is_terminal(result)
                 ):
                     tool_msg["terminal_workflow_completed"] = True
+                if (
+                    tool == "run_terminal_mutation"
+                    and _terminal_mutation_result_is_terminal(result)
+                ):
+                    tool_msg["terminal_mutation_completed"] = True
+                    if _terminal_mutation_result_is_outcome_unknown(result):
+                        tool_msg["terminal_mutation_outcome_unknown"] = True
         return ProjectionResult(
             messages=[assistant_msg, tool_msg], is_tool_iteration=True
         )

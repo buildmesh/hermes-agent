@@ -311,6 +311,40 @@ class TestMcpToolCallProjection:
 
         assert "terminal_workflow_completed" not in messages[1]
 
+    @pytest.mark.parametrize(
+        ("text", "terminal"),
+        [
+            ('{"error":{"code":"MUTATION_INPUT_INVALID"},"sealed":false}', False),
+            ('{"error":{"code":"MUTATION_OUTCOME_UNKNOWN"},"sealed":true}', True),
+            ('[{"render":{"text":"created"}}]', True),
+        ],
+    )
+    def test_terminal_mutation_seals_success_and_post_launch_failure(
+        self,
+        text: str,
+        terminal: bool,
+    ) -> None:
+        item = {
+            "type": "mcpToolCall",
+            "id": "mutation",
+            "server": "hermes-tools",
+            "tool": "run_terminal_mutation",
+            "arguments": {},
+            "result": {
+                "content": [{"type": "text", "text": text}],
+            },
+            "error": None,
+        }
+        messages = CodexEventProjector().project(
+            {"method": "item/completed", "params": {"item": item}}
+        ).messages
+        assert (
+            messages[1].get("terminal_mutation_completed") is True
+        ) is terminal
+        assert (
+            messages[1].get("terminal_mutation_outcome_unknown") is True
+        ) is ("OUTCOME_UNKNOWN" in text)
+
 
 class TestUserAndOpaqueProjection:
     def test_user_message_text_fragments_only(self) -> None:

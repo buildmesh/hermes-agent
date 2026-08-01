@@ -176,6 +176,12 @@ TOOLSETS = {
         "tools": ["run_terminal_workflow"],
         "includes": [],
     },
+
+    "terminal_mutation": {
+        "description": "Profile-owned idempotent mutation-to-presenter workflows",
+        "tools": ["run_terminal_mutation"],
+        "includes": [],
+    },
     
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",

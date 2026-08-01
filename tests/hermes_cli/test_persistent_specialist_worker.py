@@ -659,6 +659,46 @@ class TerminalWorkflowAgent(FakeAgent):
         }
 
 
+class TerminalMutationAgent(FakeAgent):
+    def run_conversation(self, prompt: str) -> dict:
+        from hermes_cli.terminal_mutation import (
+            invoke_terminal_mutation_endpoint,
+        )
+
+        self.turns += 1
+        content = invoke_terminal_mutation_endpoint(
+            "test-create",
+            {"value": "created once"},
+            profile_root=Path(self.session_cwd),
+        )
+        return {
+            "completed": True,
+            "partial": False,
+            "final_response": "Done.",
+            "messages": [
+                {"role": "user", "content": prompt},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_terminal_mutation",
+                            "function": {
+                                "name": "run_terminal_mutation",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_terminal_mutation",
+                    "content": content,
+                },
+                {"role": "assistant", "content": "Done."},
+            ],
+        }
+
+
 def correction_request(event_id: str, attempt_id: str = "corr_attempt_1") -> dict:
     return {
         "protocol_version": PROTOCOL_V2,
@@ -1562,6 +1602,47 @@ async def test_v3_declared_terminal_workflow_promotes_exact_presenter_output(
     )
     assert ledger["terminal_workflow"]["workflow_id"] == "test-workflow"
     assert ledger["terminal_workflow"]["producer_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_v3_terminal_mutation_commits_once_and_promotes_presenter(
+    tmp_path: Path,
+) -> None:
+    from tests.hermes_cli.test_terminal_mutation import install_mutation
+
+    install_mutation(tmp_path)
+    agent = TerminalMutationAgent()
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="mutation-test",
+        agent_factory=lambda: agent,
+    )
+    await worker.start()
+    request_value = v3_request("terminal-mutation")
+    request_value["_terminal_mutation_negotiated"] = True
+    try:
+        response = await worker.handle_request(request_value)
+        replay = await worker.handle_request(request_value)
+    finally:
+        await worker.stop()
+
+    assert response["status"] == "completed", response
+    assert json.loads(response["render_candidate"]["content"])[0][
+        "render"
+    ] == {"text": "created once"}
+    assert response["candidate_source"]["kind"] == "terminal_presenter"
+    assert replay == response
+    assert agent.turns == 1
+    assert (tmp_path / "handler-count.txt").read_text() == "1"
+    ledger = json.loads(
+        worker._ledger_path(
+            "conv_" + "1" * 64,
+            "terminal-mutation",
+        ).read_text(encoding="utf-8")
+    )
+    assert ledger["terminal_mutation"]["workflow_id"] == "test-create"
+    assert ledger["terminal_mutation"]["outcome"] == "committed"
 
 
 @pytest.mark.asyncio
@@ -2764,6 +2845,68 @@ async def test_v3_terminal_workflow_requires_mutual_presenter_and_workflow_accep
     assert "terminal_workflow_chaining.v1" not in workflow_only
     assert "terminal_workflow_chaining.v1" not in presenter_only
     assert "terminal_workflow_chaining.v1" in both
+
+
+@pytest.mark.asyncio
+async def test_v3_terminal_mutation_requires_mutual_capability_acceptance(
+    tmp_path: Path,
+) -> None:
+    from tests.hermes_cli.test_terminal_mutation import install_mutation
+
+    install_mutation(tmp_path)
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="mutation-negotiation",
+        agent_factory=FakeAgent,
+    )
+    await worker.start()
+    serve = asyncio.create_task(worker.serve_forever())
+
+    async def negotiate(accepted: list[str], request_id: str) -> list[str]:
+        reader, writer = await asyncio.open_unix_connection(
+            str(worker.socket_path)
+        )
+        writer.write(
+            json.dumps(
+                {
+                    "protocol_version": PROTOCOL_V3,
+                    "request_id": request_id,
+                    "operation": "hello",
+                    "client": {
+                        "name": "telegram-bridge",
+                        "revision": "test",
+                    },
+                    "accepted_capabilities": accepted,
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        response = json.loads(await reader.readline())
+        writer.close()
+        await writer.wait_closed()
+        return response["capabilities"]
+
+    try:
+        mutation_only = await negotiate(
+            ["terminal_mutation_chaining.v1"],
+            "req_mutation_only",
+        )
+        both = await negotiate(
+            [
+                "terminal_presenter_finalization.v1",
+                "terminal_mutation_chaining.v1",
+            ],
+            "req_mutation_both",
+        )
+    finally:
+        serve.cancel()
+        await asyncio.gather(serve, return_exceptions=True)
+        await worker.stop()
+
+    assert "terminal_mutation_chaining.v1" not in mutation_only
+    assert "terminal_mutation_chaining.v1" in both
 
 
 @pytest.mark.asyncio
