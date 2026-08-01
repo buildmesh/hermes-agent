@@ -33,6 +33,49 @@ from hermes_cli.persistent_specialist_worker import (
 )
 
 
+def _configure_profile_mcp_preflight(
+    monkeypatch: pytest.MonkeyPatch,
+    projected: list[str],
+) -> list[str]:
+    config = {
+        "platform_toolsets": {"cli": ["chief-context"]},
+        "mcp_servers": {
+            "chief-context": {
+                "tools": {
+                    "include": [
+                        "chief_context_catalog",
+                        "chief_context_get",
+                    ],
+                },
+            },
+        },
+    }
+    shutdowns: list[str] = []
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup._discover_mcp_tools_without_interactive_oauth",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.enabled_mcp_server_names",
+        lambda _config: {"chief-context"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools",
+        lambda _config, _platform: ["chief-context"],
+    )
+    monkeypatch.setattr(
+        "tools.mcp_tool.get_mcp_status",
+        lambda: [{"name": "chief-context", "connected": True}],
+    )
+    monkeypatch.setattr(
+        "tools.mcp_tool.shutdown_mcp_servers",
+        lambda: shutdowns.append("shutdown"),
+    )
+    monkeypatch.setattr("toolsets.resolve_toolset", lambda _name: projected)
+    return shutdowns
+
+
 def test_extract_render_payloads_repairs_one_missing_container_close() -> None:
     malformed = (
         '[{"schema_version":"telegram.bridge.render_payload.v1",'
@@ -2645,6 +2688,38 @@ async def test_mcp_startup_failure_is_not_started_and_makes_worker_unavailable(
         assert worker.health()["last_error_code"] == "MCP_STARTUP_FAILED"
     finally:
         await worker.stop()
+
+
+def test_profile_mcp_preflight_compares_canonical_projected_tool_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdowns = _configure_profile_mcp_preflight(
+        monkeypatch,
+        [
+            "mcp__chief_context__chief_context_catalog",
+            "mcp__chief_context__chief_context_get",
+        ],
+    )
+
+    assert persistent_worker._preflight_profile_mcp_servers() is True
+    assert shutdowns == []
+
+
+def test_profile_mcp_preflight_rejects_missing_canonical_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdowns = _configure_profile_mcp_preflight(
+        monkeypatch,
+        ["mcp__chief_context__chief_context_catalog"],
+    )
+
+    with pytest.raises(
+        persistent_worker.PersistentAgentStartupError,
+        match="required profile MCP tool inventory is incomplete: chief-context",
+    ):
+        persistent_worker._preflight_profile_mcp_servers()
+
+    assert shutdowns == ["shutdown"]
 
 
 @pytest.mark.asyncio

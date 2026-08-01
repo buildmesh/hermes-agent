@@ -85,7 +85,11 @@ def _preflight_profile_mcp_servers() -> bool:
         _discover_mcp_tools_without_interactive_oauth,
     )
     from hermes_cli.tools_config import enabled_mcp_server_names
-    from tools.mcp_tool import get_mcp_status, shutdown_mcp_servers
+    from tools.mcp_tool import (
+        get_mcp_status,
+        mcp_prefixed_tool_name,
+        shutdown_mcp_servers,
+    )
 
     config = load_config()
     enabled = enabled_mcp_server_names(config)
@@ -123,7 +127,11 @@ def _preflight_profile_mcp_servers() -> bool:
             tools = declaration.get("tools") or {}
             include = tools.get("include") or []
             projected = set(resolve_toolset(name))
-            if include and not {str(tool) for tool in include}.issubset(projected):
+            expected = {
+                mcp_prefixed_tool_name(name, str(tool))
+                for tool in include
+            }
+            if expected and not expected.issubset(projected):
                 incomplete.append(name)
         if incomplete:
             raise PersistentAgentStartupError(
