@@ -74,6 +74,86 @@ RFC3339_RE = re.compile(
 _UNQUIESCED_WORKERS: set[Any] = set()
 
 
+class PersistentAgentStartupError(RuntimeError):
+    """The resident agent could not establish required startup capability."""
+
+
+def _preflight_profile_mcp_servers() -> bool:
+    """Synchronously verify profile-selected MCPs before worker readiness."""
+    from hermes_cli.config import load_config
+    from hermes_cli.mcp_startup import (
+        _discover_mcp_tools_without_interactive_oauth,
+    )
+    from hermes_cli.tools_config import enabled_mcp_server_names
+    from tools.mcp_tool import get_mcp_status, shutdown_mcp_servers
+
+    config = load_config()
+    enabled = enabled_mcp_server_names(config)
+    if not enabled:
+        return False
+
+    try:
+        _discover_mcp_tools_without_interactive_oauth()
+        from hermes_cli.tools_config import _get_platform_tools
+        from toolsets import resolve_toolset
+
+        selected = set(_get_platform_tools(config, "cli")) & enabled
+        if not selected:
+            shutdown_mcp_servers()
+            return False
+        status = {
+            str(entry.get("name") or ""): entry
+            for entry in get_mcp_status()
+            if isinstance(entry, dict)
+        }
+        missing = sorted(
+            name
+            for name in selected
+            if not status.get(name, {}).get("connected")
+        )
+        if missing:
+            raise PersistentAgentStartupError(
+                "required profile MCP servers failed startup: "
+                + ", ".join(missing)
+            )
+        servers = config.get("mcp_servers") or {}
+        incomplete: list[str] = []
+        for name in sorted(selected):
+            declaration = servers.get(name) or {}
+            tools = declaration.get("tools") or {}
+            include = tools.get("include") or []
+            projected = set(resolve_toolset(name))
+            if include and not {str(tool) for tool in include}.issubset(projected):
+                incomplete.append(name)
+        if incomplete:
+            raise PersistentAgentStartupError(
+                "required profile MCP tool inventory is incomplete: "
+                + ", ".join(incomplete)
+            )
+        return True
+    except Exception:
+        shutdown_mcp_servers()
+        raise
+
+
+def _prepare_codex_specialist_agent(agent: Any) -> None:
+    """Start the real Codex thread and verify its MCP inventory without a turn."""
+    from agent.codex_runtime import run_codex_app_server_turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="",
+        original_user_message="",
+        messages=[],
+        effective_task_id="persistent-startup",
+        prepare_only=True,
+    )
+    if not result.get("completed", False) or result.get("partial"):
+        raise PersistentAgentStartupError(
+            str(result.get("error") or "required profile MCP startup failed")
+        )
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -501,6 +581,8 @@ class PersistentSpecialistWorker:
         self.queue_limit = max(1, int(queue_limit))
         self.idle_conversation_seconds = max(60.0, float(idle_conversation_seconds))
         self.agent_factory = agent_factory or self._default_agent_factory
+        self._uses_default_agent_factory = agent_factory is None
+        self._owns_profile_mcp_servers = False
         resolver = correction_companion_resolver or resolve_companion_descriptor
         try:
             descriptor = resolver(self.profile_root)
@@ -750,16 +832,60 @@ class PersistentSpecialistWorker:
             stream.close()
             raise RuntimeError("another persistent specialist worker owns this profile") from exc
         self._instance_lock = stream
-        self._recover_and_compact_ledger()
-        if self.socket_path.exists():
-            if stat.S_ISSOCK(self.socket_path.lstat().st_mode):
-                self.socket_path.unlink()
-            else:
-                raise RuntimeError("refusing to replace a non-socket runtime path")
-        self._server = await asyncio.start_unix_server(self._handle_connection, path=str(self.socket_path))
-        os.chmod(self.socket_path, 0o600)
-        self._write_presenter_endpoint()
-        self._log_event("worker_ready", socket=str(self.socket_path))
+        try:
+            if self._uses_default_agent_factory:
+                has_profile_mcp = await asyncio.to_thread(
+                    _preflight_profile_mcp_servers
+                )
+                if has_profile_mcp:
+                    self._agent = await asyncio.to_thread(self._construct_agent)
+                    if getattr(self._agent, "api_mode", None) == "codex_app_server":
+                        from tools.mcp_tool import shutdown_mcp_servers
+
+                        await asyncio.to_thread(shutdown_mcp_servers)
+                        await asyncio.to_thread(
+                            _prepare_codex_specialist_agent,
+                            self._agent,
+                        )
+                    else:
+                        self._owns_profile_mcp_servers = True
+            self._recover_and_compact_ledger()
+            if self.socket_path.exists():
+                if stat.S_ISSOCK(self.socket_path.lstat().st_mode):
+                    self.socket_path.unlink()
+                else:
+                    raise RuntimeError("refusing to replace a non-socket runtime path")
+            self._server = await asyncio.start_unix_server(
+                self._handle_connection,
+                path=str(self.socket_path),
+            )
+            os.chmod(self.socket_path, 0o600)
+            self._write_presenter_endpoint()
+            self._log_event("worker_ready", socket=str(self.socket_path))
+        except Exception:
+            if self._server is not None:
+                self._server.close()
+                with contextlib.suppress(Exception):
+                    await self._server.wait_closed()
+                self._server = None
+            self._presenter_endpoint_path.unlink(missing_ok=True)
+            if self.socket_path.exists() and stat.S_ISSOCK(
+                self.socket_path.lstat().st_mode
+            ):
+                self.socket_path.unlink(missing_ok=True)
+            if self._uses_default_agent_factory:
+                from tools.mcp_tool import shutdown_mcp_servers
+
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(shutdown_mcp_servers)
+                self._owns_profile_mcp_servers = False
+            if self._agent is not None:
+                with contextlib.suppress(Exception):
+                    await self._retire_agent()
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            stream.close()
+            self._instance_lock = None
+            raise
 
     async def stop(self) -> None:
         self._stopping = True
@@ -783,6 +909,11 @@ class PersistentSpecialistWorker:
             self.last_error_code = "MODEL_QUIESCE_TIMEOUT"
             self._log_event("worker_quiesce_timeout", timeout_seconds=MODEL_QUIESCE_TIMEOUT_SECONDS)
             return
+        if self._owns_profile_mcp_servers:
+            from tools.mcp_tool import shutdown_mcp_servers
+
+            await asyncio.to_thread(shutdown_mcp_servers)
+            self._owns_profile_mcp_servers = False
         _UNQUIESCED_WORKERS.discard(self)
         if self._instance_lock is not None:
             with contextlib.suppress(OSError):
@@ -1717,6 +1848,11 @@ class PersistentSpecialistWorker:
                         if model_task is not None and model_task.done() and self._active_model_task is model_task:
                             self._active_model_task = None
                     if not result.get("completed", True) or result.get("partial"):
+                        if result.get("error_code") == "MCP_STARTUP_FAILED":
+                            raise PersistentAgentStartupError(
+                                result.get("error")
+                                or "required profile MCP startup failed"
+                            )
                         raise RuntimeError(result.get("error") or "model turn did not complete")
                     render_started = time.monotonic()
                     candidate = result.get("final_response") or ""
@@ -1850,6 +1986,28 @@ class PersistentSpecialistWorker:
                 )
                 record["state"] = "failed"
                 record["execution_state"] = "completed"
+                record["response"] = response
+                self._log_terminal_response("turn_failed", request, response)
+            except PersistentAgentStartupError as exc:
+                self._unhealthy = True
+                self.last_error_code = "MCP_STARTUP_FAILED"
+                response = self._failure(
+                    request,
+                    self.last_error_code,
+                    str(exc)[:500],
+                    False,
+                    "not_started",
+                    timing_ms=_timing_ms(
+                        started,
+                        queue=queue_ms,
+                        initialization=initialization_ms,
+                        model_and_tools=int(
+                            (time.monotonic() - model_started) * 1000
+                        ),
+                    ),
+                )
+                record["state"] = "failed"
+                record["execution_state"] = "not_started"
                 record["response"] = response
                 self._log_terminal_response("turn_failed", request, response)
             except asyncio.TimeoutError:

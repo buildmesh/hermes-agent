@@ -141,6 +141,13 @@ class TestRunConversationCodexPath:
             "browser": False,
             "shared-calendar": False,
         }
+        assert captured["profile_mcp_servers"] == {
+            "gmail": {
+                "enabled": True,
+                "url": "https://example.invalid",
+            }
+        }
+        assert captured["required_mcp_servers"] == {"gmail"}
 
     def test_disabled_reasoning_is_forwarded_as_none(self, monkeypatch):
         captured: dict = {}
@@ -663,6 +670,34 @@ class TestReviewForkApiModeDowngrade:
 
 
 class TestErrorHandling:
+    def test_prepare_only_starts_inventory_without_model_turn(self, monkeypatch):
+        calls: list[str] = []
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda _self: calls.append("ensure") or "thread-ready",
+        )
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "run_turn",
+            lambda *_args, **_kwargs: calls.append("turn"),
+        )
+        agent = _make_codex_agent()
+
+        from agent.codex_runtime import run_codex_app_server_turn
+
+        result = run_codex_app_server_turn(
+            agent,
+            user_message="",
+            original_user_message="",
+            messages=[],
+            effective_task_id="startup",
+            prepare_only=True,
+        )
+
+        assert result["completed"] is True
+        assert calls == ["ensure"]
+
     def test_session_exception_returns_partial_with_error(self, monkeypatch):
         def boom_run_turn(self, user_input, **kwargs):
             raise RuntimeError("subprocess died")
@@ -678,6 +713,86 @@ class TestErrorHandling:
         assert result["partial"] is True
         assert "subprocess died" in result["error"]
         assert "codex-runtime auto" in result["final_response"]
+
+    def test_profile_mcp_startup_exception_is_typed_not_started(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "run_turn",
+            lambda self, user_input, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("chief-context failed startup")
+            ),
+        )
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "mcp_servers": {
+                    "chief-context": {"command": "/opt/chief/context-mcp"}
+                }
+            },
+        ):
+            agent = _make_codex_agent(enabled_toolsets=["chief-context"])
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                result = agent.run_conversation("hi")
+
+        assert result["error_code"] == "MCP_STARTUP_FAILED"
+        assert result["execution_state"] == "not_started"
+
+    def test_reused_profile_mcp_session_preserves_original_turn_error(
+        self, monkeypatch
+    ):
+        calls = 0
+
+        def run_turn(_self, user_input, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                _self._thread_id = "thread-1"
+                return TurnResult(
+                    final_text="ok",
+                    projected_messages=[],
+                    turn_id="turn-1",
+                    thread_id="thread-1",
+                )
+            raise RuntimeError("reused session failed")
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", run_turn)
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "mcp_servers": {
+                    "chief-context": {"command": "/opt/chief/context-mcp"}
+                }
+            },
+        ):
+            agent = _make_codex_agent(enabled_toolsets=["chief-context"])
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                first = agent.run_conversation("one")
+                second = agent.run_conversation("two")
+
+        assert first["completed"] is True
+        assert second["error"] == "reused session failed"
+        assert "error_code" not in second
+
+    def test_profile_mcp_resolution_failure_is_fail_closed(self):
+        with patch(
+            "hermes_cli.config.load_config",
+            side_effect=RuntimeError("broken config"),
+        ):
+            agent = _make_codex_agent(enabled_toolsets=["chief-context"])
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                result = agent.run_conversation("hi")
+
+        assert result["error_code"] == "MCP_STARTUP_FAILED"
+        assert result["execution_state"] == "not_started"
+        assert getattr(agent, "_codex_session", None) is None
 
     def test_interrupted_turn_marked_partial(self, monkeypatch):
         def interrupted_turn(self, user_input, **kwargs):

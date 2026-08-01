@@ -215,6 +215,126 @@ class TestLifecycle:
         assert "mcp_servers.gmail.enabled=true" in extra_args
         assert "mcp_servers.browser.enabled=false" in extra_args
 
+    def test_profile_mcp_server_definition_is_verified_before_ready(self):
+        client = FakeClient()
+        captured = {}
+
+        def handler(method, _params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-profile-mcp"}}
+            if method == "mcpServerStatus/list":
+                return {
+                    "data": [{
+                        "name": "chief-context",
+                        "tools": {
+                            "chief_context_catalog": {},
+                            "chief_context_get": {},
+                        },
+                    }]
+                }
+            return {}
+
+        client._request_handler = handler
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=factory,
+            profile_mcp_servers={
+                "chief-context": {
+                    "command": "/opt/chief/context-mcp",
+                    "env": {"CHIEF_CONTEXT_PATH": "/private/context"},
+                    "tools": {
+                        "include": [
+                            "chief_context_catalog",
+                            "chief_context_get",
+                        ]
+                    },
+                },
+            },
+            required_mcp_servers={"chief-context"},
+        )
+
+        assert session.ensure_started() == "thread-profile-mcp"
+        assert "mcp_servers.chief-context.command" in " ".join(
+            captured["extra_args"]
+        )
+        assert captured["env"] == {
+            "CHIEF_CONTEXT_PATH": "/private/context"
+        }
+        assert "shell_environment_policy.exclude" in " ".join(
+            captured["extra_args"]
+        )
+
+    def test_missing_profile_mcp_server_fails_before_ready(self):
+        client = FakeClient()
+
+        def handler(method, _params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-missing-profile-mcp"}}
+            if method == "mcpServerStatus/list":
+                return {"data": []}
+            return {}
+
+        client._request_handler = handler
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=lambda **_kwargs: client,
+            profile_mcp_servers={
+                "chief-context": {"command": "/opt/chief/context-mcp"},
+            },
+            required_mcp_servers={"chief-context"},
+        )
+
+        with pytest.raises(
+            CodexAppServerError,
+            match="did not start required profile MCP servers: chief-context",
+        ):
+            session.ensure_started()
+        assert session._thread_id is None
+
+    def test_missing_allowlisted_profile_tool_fails_before_ready(self):
+        client = FakeClient()
+
+        def handler(method, _params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-incomplete-profile-mcp"}}
+            if method == "mcpServerStatus/list":
+                return {
+                    "data": [{
+                        "name": "chief-context",
+                        "tools": {"chief_context_catalog": {}},
+                    }]
+                }
+            return {}
+
+        client._request_handler = handler
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=lambda **_kwargs: client,
+            profile_mcp_servers={
+                "chief-context": {
+                    "command": "/opt/chief/context-mcp",
+                    "tools": {
+                        "include": [
+                            "chief_context_catalog",
+                            "chief_context_get",
+                        ]
+                    },
+                },
+            },
+            required_mcp_servers={"chief-context"},
+        )
+
+        with pytest.raises(
+            CodexAppServerError,
+            match="omitted required profile MCP tools.*chief_context_get",
+        ):
+            session.ensure_started()
+
     def test_app_server_without_required_tools_preserves_config_opt_out(self):
         client = FakeClient()
         captured = {}

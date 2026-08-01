@@ -36,6 +36,7 @@ What's NOT migrated (intentional):
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import tomllib
@@ -74,6 +75,28 @@ def configured_codex_mcp_server_names(
     if not isinstance(servers, dict):
         return set()
     return {str(name) for name in servers}
+
+
+def configured_codex_shell_environment_excludes(
+    codex_home: Optional[Path] = None,
+) -> set[str]:
+    """Read existing Codex shell exclusions so process-local hardening merges."""
+    root = codex_home
+    if root is None:
+        configured = os.environ.get("CODEX_HOME")
+        root = Path(configured) if configured else Path.home() / ".codex"
+    try:
+        with (root / "config.toml").open("rb") as stream:
+            payload = tomllib.load(stream)
+    except (OSError, tomllib.TOMLDecodeError):
+        return set()
+    policy = payload.get("shell_environment_policy")
+    excludes = policy.get("exclude") if isinstance(policy, dict) else None
+    return (
+        {str(item) for item in excludes}
+        if isinstance(excludes, list)
+        else set()
+    )
 
 
 @dataclass
@@ -136,6 +159,8 @@ _KNOWN_HERMES_KEYS = {
     "timeout", "connect_timeout",
     # general
     "enabled", "description",
+    # Hermes-only execution/discovery policy handled by projection below.
+    "supports_parallel_tool_calls", "tools",
 }
 
 # Subset that have a direct codex equivalent.
@@ -202,6 +227,18 @@ def _translate_one_server(
             out["startup_timeout_sec"] = float(hermes_cfg["connect_timeout"])
         except (TypeError, ValueError):
             skipped.append("connect_timeout (not numeric)")
+
+    tools = hermes_cfg.get("tools")
+    if isinstance(tools, dict):
+        include = tools.get("include")
+        exclude = tools.get("exclude")
+        if isinstance(include, list):
+            out["enabled_tools"] = [str(name) for name in include]
+        if isinstance(exclude, list):
+            out["disabled_tools"] = [str(name) for name in exclude]
+        for key in tools:
+            if key not in {"include", "exclude", "resources", "prompts"}:
+                skipped.append(f"tools.{key} (unknown Hermes key)")
 
     # Enabled flag (codex defaults to true so we only emit when explicitly false)
     if hermes_cfg.get("enabled") is False:
@@ -677,6 +714,88 @@ def mcp_server_projection_app_server_args(
             ]
         )
     return args
+
+
+def profile_mcp_servers_app_server_config(
+    servers: dict[str, Any],
+    selected_names: set[str],
+) -> tuple[list[str], dict[str, str]]:
+    """Build private Codex overrides for profile-selected MCP servers.
+
+    Unlike ``mcp_server_projection_app_server_args``, this supplies complete
+    server definitions so a source-independent specialist does not depend on
+    shared ``~/.codex/config.toml`` state. Credential-bearing stdio
+    environment values and HTTP headers travel in the child environment,
+    never in process arguments.
+    """
+    args: list[str] = []
+    child_env: dict[str, str] = {}
+    for name in sorted(selected_names):
+        raw = servers.get(name)
+        translated, skipped = _translate_one_server(name, raw)
+        if translated is None:
+            detail = ", ".join(skipped) or "invalid server declaration"
+            raise ValueError(f"MCP server {name!r} cannot be projected: {detail}")
+        unsupported = [
+            item for item in skipped
+            if not item.startswith("transport=sse ")
+        ]
+        if unsupported:
+            raise ValueError(
+                f"MCP server {name!r} uses unsupported Codex settings: "
+                + ", ".join(unsupported)
+            )
+
+        stdio_env = translated.pop("env", {})
+        if isinstance(stdio_env, dict):
+            from tools.mcp_tool import _interpolate_env_vars
+
+            resolved = _interpolate_env_vars(stdio_env)
+            if not isinstance(resolved, dict):
+                raise ValueError(f"MCP server {name!r} has invalid environment")
+            for key, value in resolved.items():
+                key = str(key)
+                value = str(value)
+                if "${" in value:
+                    raise ValueError(
+                        f"MCP server {name!r} environment {key!r} is unresolved"
+                    )
+                existing = child_env.get(key)
+                if existing is not None and existing != value:
+                    raise ValueError(
+                        f"selected MCP servers require conflicting {key!r} values"
+                    )
+                child_env[key] = value
+            if resolved:
+                translated["env_vars"] = sorted(str(key) for key in resolved)
+
+        headers = translated.pop("http_headers", {})
+        if isinstance(headers, dict) and headers:
+            from tools.mcp_tool import _interpolate_env_vars
+
+            resolved_headers = _interpolate_env_vars(headers)
+            env_headers: dict[str, str] = {}
+            for header, value in resolved_headers.items():
+                if "${" in str(value):
+                    raise ValueError(
+                        f"MCP server {name!r} header {header!r} is unresolved"
+                    )
+                digest = hashlib.sha256(
+                    f"{name}\0{header}".encode("utf-8")
+                ).hexdigest()[:20].upper()
+                env_name = f"HERMES_CODEX_MCP_HEADER_{digest}"
+                child_env[env_name] = str(value)
+                env_headers[str(header)] = env_name
+            translated["env_http_headers"] = env_headers
+
+        translated["enabled"] = True
+        translated["required"] = True
+        prefix = f"mcp_servers.{_quote_key(name)}"
+        for key, value in translated.items():
+            args.extend(
+                ["-c", f"{prefix}.{_quote_key(key)}={_format_toml_value(value)}"]
+            )
+    return args, child_env
 
 
 def migrate(

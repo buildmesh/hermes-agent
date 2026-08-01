@@ -250,6 +250,17 @@ class FailingAgent(FakeAgent):
         raise RuntimeError("model failure")
 
 
+class MCPStartupFailingAgent(FakeAgent):
+    def run_conversation(self, prompt: str) -> dict:
+        return {
+            "completed": False,
+            "partial": True,
+            "error": "required server chief-context did not start",
+            "error_code": "MCP_STARTUP_FAILED",
+            "execution_state": "not_started",
+        }
+
+
 class BlockingAgent(FakeAgent):
     def __init__(self, entered: threading.Event, release: threading.Event) -> None:
         super().__init__()
@@ -2613,6 +2624,136 @@ async def test_worker_failure_responses_and_logs_include_complete_timing(tmp_pat
     failure = next(event for event in events if event["event"] == "turn_failed")
     assert failure["trace_id"] == response["trace_id"]
     assert failure["timing_ms"] == response["timing_ms"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_startup_failure_is_not_started_and_makes_worker_unavailable(
+    tmp_path: Path,
+) -> None:
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "w.sock",
+        agent_id="chief",
+        agent_factory=MCPStartupFailingAgent,
+    )
+    await worker.start()
+    try:
+        response = await worker.handle_request(request("mcp-startup-failure"))
+        assert response["error"]["code"] == "MCP_STARTUP_FAILED"
+        assert response["execution_state"] == "not_started"
+        assert worker.health()["ready"] is False
+        assert worker.health()["last_error_code"] == "MCP_STARTUP_FAILED"
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_default_worker_preflights_mcp_before_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "hermes_cli.persistent_specialist_worker._preflight_profile_mcp_servers",
+        lambda: calls.append("preflight") or True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.persistent_specialist_worker._prepare_codex_specialist_agent",
+        lambda _agent: calls.append("codex"),
+    )
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "w.sock",
+        agent_id="chief",
+    )
+    def construct_codex_agent():
+        agent = FakeAgent()
+        agent.api_mode = "codex_app_server"
+        return agent
+
+    monkeypatch.setattr(worker, "_construct_agent", construct_codex_agent)
+
+    await worker.start()
+    try:
+        assert calls == ["preflight", "codex"]
+        assert worker.health()["ready"] is True
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_native_worker_retains_hermes_mcp_without_starting_codex(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "hermes_cli.persistent_specialist_worker._preflight_profile_mcp_servers",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.persistent_specialist_worker._prepare_codex_specialist_agent",
+        lambda _agent: calls.append("codex"),
+    )
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "w.sock",
+        agent_id="native",
+    )
+
+    def construct_native_agent():
+        agent = FakeAgent()
+        agent.api_mode = "chat_completions"
+        return agent
+
+    monkeypatch.setattr(worker, "_construct_agent", construct_native_agent)
+    await worker.start()
+    try:
+        assert calls == []
+        assert worker._owns_profile_mcp_servers is True
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_native_mcp_startup_rollback_releases_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdowns: list[str] = []
+    monkeypatch.setattr(
+        "hermes_cli.persistent_specialist_worker._preflight_profile_mcp_servers",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "tools.mcp_tool.shutdown_mcp_servers",
+        lambda: shutdowns.append("shutdown"),
+    )
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "w.sock",
+        agent_id="native",
+    )
+
+    def construct_native_agent():
+        agent = FakeAgent()
+        agent.api_mode = "chat_completions"
+        return agent
+
+    monkeypatch.setattr(worker, "_construct_agent", construct_native_agent)
+    monkeypatch.setattr(
+        worker,
+        "_recover_and_compact_ledger",
+        lambda: (_ for _ in ()).throw(RuntimeError("recovery failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="recovery failed"):
+        await worker.start()
+
+    assert shutdowns == ["shutdown"]
+    assert worker._instance_lock is None
+    assert worker._owns_profile_mcp_servers is False
+    assert not worker.socket_path.exists()
 
 
 @pytest.mark.asyncio

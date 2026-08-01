@@ -306,6 +306,7 @@ def run_codex_app_server_turn(
     messages: List[Dict[str, Any]],
     effective_task_id: str,
     should_review_memory: bool = False,
+    prepare_only: bool = False,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
@@ -332,6 +333,9 @@ def run_codex_app_server_turn(
 
     resume_thread_id = getattr(agent, "_codex_resume_thread_id", None)
     existing_session = getattr(agent, "_codex_session", None)
+    required_mcp_servers = set(
+        getattr(existing_session, "_required_mcp_servers", ()) or ()
+    )
     existing_required = getattr(existing_session, "_required_mcp_tools", None)
     if (
         existing_session is not None
@@ -408,6 +412,9 @@ def run_codex_app_server_turn(
                     desired_reasoning_effort = configured_effort.strip().lower()
 
         mcp_server_projection = None
+        profile_mcp_servers = None
+        required_mcp_servers = set()
+        mcp_projection_error = None
         enabled_toolsets = getattr(agent, "enabled_toolsets", None)
         if enabled_toolsets is not None:
             try:
@@ -433,16 +440,36 @@ def run_codex_app_server_turn(
                     set(str(name) for name in enabled_toolsets)
                     & globally_enabled
                 )
+                required_mcp_servers = allowed_names & profile_configured_names
+                profile_mcp_servers = {
+                    name: dict(mcp_servers[name])
+                    for name in required_mcp_servers
+                    if isinstance(mcp_servers.get(name), dict)
+                } if isinstance(mcp_servers, dict) else None
                 mcp_server_projection = {
                     name: name in allowed_names for name in configured_names
                 }
             except Exception:
                 logger.warning(
                     "codex app-server: could not resolve profile MCP projection; "
-                    "leaving Codex MCP configuration unchanged",
+                    "failing closed before model execution",
                     exc_info=True,
                 )
-                mcp_server_projection = None
+                mcp_projection_error = (
+                    "profile MCP configuration could not be resolved safely"
+                )
+
+        if mcp_projection_error is not None:
+            return {
+                "final_response": "Required specialist tools are unavailable.",
+                "messages": messages,
+                "api_calls": 0,
+                "completed": False,
+                "partial": True,
+                "error": mcp_projection_error,
+                "error_code": "MCP_STARTUP_FAILED",
+                "execution_state": "not_started",
+            }
 
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
@@ -454,6 +481,8 @@ def run_codex_app_server_turn(
             developer_instructions=getattr(agent, "_cached_system_prompt", None),
             required_mcp_tools=required_mcp_tools,
             mcp_server_projection=mcp_server_projection,
+            profile_mcp_servers=profile_mcp_servers,
+            required_mcp_servers=required_mcp_servers,
             resume_thread_id=resume_thread_id,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
@@ -468,8 +497,21 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
+        if prepare_only:
+            agent._codex_session.ensure_started()
+            return {
+                "final_response": "",
+                "messages": messages,
+                "api_calls": 0,
+                "completed": True,
+                "partial": False,
+            }
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
+        startup_failed = (
+            bool(required_mcp_servers)
+            and getattr(agent._codex_session, "_thread_id", None) is None
+        )
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
@@ -488,6 +530,14 @@ def run_codex_app_server_turn(
             "completed": False,
             "partial": True,
             "error": str(exc),
+            **(
+                {
+                    "error_code": "MCP_STARTUP_FAILED",
+                    "execution_state": "not_started",
+                }
+                if startup_failed
+                else {}
+            ),
         }
     agent._codex_resume_thread_id = None
 

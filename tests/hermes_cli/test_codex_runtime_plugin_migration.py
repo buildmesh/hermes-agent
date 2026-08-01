@@ -14,10 +14,12 @@ from hermes_cli.codex_runtime_plugin_migration import (
     _format_toml_value,
     _looks_like_test_tempdir,
     mcp_server_projection_app_server_args,
+    profile_mcp_servers_app_server_config,
     _strip_existing_managed_block,
     _strip_unmanaged_plugin_tables,
     _translate_one_server,
     configured_codex_mcp_server_names,
+    configured_codex_shell_environment_excludes,
     migrate,
     render_codex_toml_section,
 )
@@ -37,6 +39,16 @@ class TestTranslateOneServer:
             "work mail",
         }
 
+    def test_reads_shared_codex_shell_environment_excludes(self, tmp_path: Path):
+        (tmp_path / "config.toml").write_text(
+            '[shell_environment_policy]\nexclude = ["TOKEN_*", "PRIVATE"]\n',
+            encoding="utf-8",
+        )
+        assert configured_codex_shell_environment_excludes(tmp_path) == {
+            "TOKEN_*",
+            "PRIVATE",
+        }
+
     def test_process_projection_is_stable_and_quotes_server_names(self):
         args = mcp_server_projection_app_server_args(
             {"gmail": True, "work mail": False}
@@ -47,6 +59,73 @@ class TestTranslateOneServer:
             "-c",
             'mcp_servers."work mail".enabled=false',
         ]
+
+    def test_profile_server_projection_supplies_definition_without_argv_secrets(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("CHIEF_TOKEN", "private-value")
+        args, env = profile_mcp_servers_app_server_config(
+            {
+                "chief-context": {
+                    "command": "/opt/chief/context-mcp",
+                    "args": ["--stdio"],
+                    "env": {"CONTEXT_TOKEN": "${CHIEF_TOKEN}"},
+                    "tools": {
+                        "include": [
+                            "chief_context_catalog",
+                            "chief_context_get",
+                        ],
+                        "resources": False,
+                        "prompts": False,
+                    },
+                    "supports_parallel_tool_calls": False,
+                },
+                "unselected": {"command": "/bin/false"},
+            },
+            {"chief-context"},
+        )
+
+        joined = " ".join(args)
+        assert "mcp_servers.chief-context.command" in joined
+        assert "/opt/chief/context-mcp" in joined
+        assert "mcp_servers.unselected" not in joined
+        assert "enabled_tools" in joined
+        assert "env_vars" in joined
+        assert "chief_context_catalog" in joined
+        assert "mcp_servers.chief-context.required=true" in args
+        assert "private-value" not in joined
+        assert env == {"CONTEXT_TOKEN": "private-value"}
+
+    def test_profile_http_headers_use_environment_indirection(self):
+        args, env = profile_mcp_servers_app_server_config(
+            {
+                "context": {
+                    "url": "https://context.invalid/mcp",
+                    "headers": {"Authorization": "Bearer secret"},
+                }
+            },
+            {"context"},
+        )
+
+        joined = " ".join(args)
+        assert "env_http_headers" in joined
+        assert "Bearer secret" not in joined
+        assert list(env.values()) == ["Bearer secret"]
+
+    def test_profile_server_projection_rejects_unresolved_environment(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("MISSING_CONTEXT_TOKEN", raising=False)
+        with pytest.raises(ValueError, match="environment.*is unresolved"):
+            profile_mcp_servers_app_server_config(
+                {
+                    "context": {
+                        "command": "/opt/context-mcp",
+                        "env": {"CONTEXT_TOKEN": "${MISSING_CONTEXT_TOKEN}"},
+                    }
+                },
+                {"context"},
+            )
 
     def test_stdio_basic(self):
         cfg, skipped = _translate_one_server("filesystem", {
