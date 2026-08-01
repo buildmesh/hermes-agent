@@ -88,6 +88,7 @@ def _preflight_profile_mcp_servers() -> bool:
     from tools.mcp_tool import (
         get_mcp_status,
         mcp_prefixed_tool_name,
+        sanitize_mcp_name_component,
         shutdown_mcp_servers,
     )
 
@@ -105,6 +106,21 @@ def _preflight_profile_mcp_servers() -> bool:
         if not selected:
             shutdown_mcp_servers()
             return False
+        canonical_selected = {
+            sanitize_mcp_name_component(name)
+            for name in selected
+        }
+        enabled_by_canonical: dict[str, list[str]] = {}
+        for name in enabled:
+            canonical = sanitize_mcp_name_component(name)
+            enabled_by_canonical.setdefault(canonical, []).append(name)
+        if any(
+            canonical in canonical_selected and len(names) > 1
+            for canonical, names in enabled_by_canonical.items()
+        ):
+            raise PersistentAgentStartupError(
+                "required profile MCP server names have ambiguous projected identities"
+            )
         status = {
             str(entry.get("name") or ""): entry
             for entry in get_mcp_status()
@@ -127,10 +143,15 @@ def _preflight_profile_mcp_servers() -> bool:
             tools = declaration.get("tools") or {}
             include = tools.get("include") or []
             projected = set(resolve_toolset(name))
-            expected = {
+            expected_names = [
                 mcp_prefixed_tool_name(name, str(tool))
                 for tool in include
-            }
+            ]
+            if len(set(expected_names)) != len(expected_names):
+                raise PersistentAgentStartupError(
+                    f"required profile MCP tool names have ambiguous projected identities: {name}"
+                )
+            expected = set(expected_names)
             if expected and not expected.issubset(projected):
                 incomplete.append(name)
         if incomplete:

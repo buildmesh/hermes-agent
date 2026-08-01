@@ -2722,6 +2722,63 @@ def test_profile_mcp_preflight_rejects_missing_canonical_tool(
     assert shutdowns == ["shutdown"]
 
 
+def test_profile_mcp_preflight_rejects_colliding_canonical_tool_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdowns = _configure_profile_mcp_preflight(
+        monkeypatch,
+        ["mcp__chief_context__read_item"],
+    )
+    config = {
+        "platform_toolsets": {"cli": ["chief-context"]},
+        "mcp_servers": {
+            "chief-context": {
+                "tools": {"include": ["read-item", "read_item"]},
+            },
+        },
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+
+    with pytest.raises(
+        persistent_worker.PersistentAgentStartupError,
+        match="tool names have ambiguous projected identities: chief-context",
+    ):
+        persistent_worker._preflight_profile_mcp_servers()
+
+    assert shutdowns == ["shutdown"]
+
+
+def test_profile_mcp_preflight_rejects_colliding_canonical_server_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shutdowns = _configure_profile_mcp_preflight(monkeypatch, [])
+    config = {
+        "platform_toolsets": {"cli": ["chief-context"]},
+        "mcp_servers": {
+            "chief-context": {},
+            "chief_context": {},
+        },
+    }
+    enabled = {"chief-context", "chief_context"}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    monkeypatch.setattr(
+        "hermes_cli.tools_config.enabled_mcp_server_names",
+        lambda _config: enabled,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_platform_tools",
+        lambda _config, _platform: ["chief-context"],
+    )
+
+    with pytest.raises(
+        persistent_worker.PersistentAgentStartupError,
+        match="server names have ambiguous projected identities",
+    ):
+        persistent_worker._preflight_profile_mcp_servers()
+
+    assert shutdowns == ["shutdown"]
+
+
 @pytest.mark.asyncio
 async def test_default_worker_preflights_mcp_before_ready(
     tmp_path: Path,

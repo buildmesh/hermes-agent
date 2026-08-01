@@ -35,6 +35,33 @@ class TestRegisterServerTools:
             assert validate_toolset("my_srv") is True
             assert "mcp__my_srv__my_tool" in resolve_toolset("my_srv")
 
+    def test_hyphenated_server_exposes_exact_included_tools(self, mock_registry):
+        """Protocol names are filtered before projection into a sanitized alias."""
+        server = MCPServerTask("chief-context")
+        server._tools = [
+            _make_mcp_tool("chief_context_catalog"),
+            _make_mcp_tool("chief_context_get"),
+            _make_mcp_tool("chief_context_delete"),
+        ]
+        server.session = MagicMock()
+        from toolsets import resolve_toolset
+
+        config = {
+            "tools": {
+                "include": ["chief_context_catalog", "chief_context_get"],
+                "resources": False,
+                "prompts": False,
+            },
+        }
+        with patch("tools.registry.registry", mock_registry):
+            registered = _register_server_tools("chief-context", server, config)
+
+            assert registered == [
+                "mcp__chief_context__chief_context_catalog",
+                "mcp__chief_context__chief_context_get",
+            ]
+            assert set(resolve_toolset("chief-context")) == set(registered)
+
 
 class TestRefreshTools:
     """Tests for MCPServerTask._refresh_tools nuke-and-repave cycle."""
