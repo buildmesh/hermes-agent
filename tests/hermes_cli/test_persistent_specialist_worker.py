@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -278,6 +279,86 @@ class FakeAgent:
 
     def close(self) -> None:
         self.closed = True
+
+
+class NativeHistoryAgent(FakeAgent):
+    api_mode = "codex_responses"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.histories: list[list[dict]] = []
+
+    def run_conversation(
+        self,
+        prompt: str,
+        conversation_history: list[dict] | None = None,
+    ) -> dict:
+        history = copy.deepcopy(conversation_history or [])
+        self.histories.append(history)
+        self.turns += 1
+        envelope = json.loads(prompt.split("Envelope JSON:\n", 1)[1])
+        payload = [{
+            "schema_version": "telegram.bridge.render_payload.v1",
+            "message_id": f"msg_{envelope['event_id']}",
+            "correlation_id": envelope["event_id"],
+            "action": "send",
+            "target": {"chat_id": envelope["chat_id"]},
+            "render": {"text": f"native turn {self.turns}"},
+        }]
+        final_response = json.dumps(payload)
+        messages = [
+            *history,
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": final_response},
+        ]
+        return {
+            "completed": True,
+            "partial": False,
+            "final_response": final_response,
+            "messages": messages,
+        }
+
+
+class FailingThenNativeHistoryAgent(NativeHistoryAgent):
+    def run_conversation(
+        self,
+        prompt: str,
+        conversation_history: list[dict] | None = None,
+    ) -> dict:
+        if not self.histories:
+            self.histories.append(copy.deepcopy(conversation_history or []))
+            return {
+                "completed": False,
+                "partial": True,
+                "error": "synthetic native failure",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "must not persist"},
+                ],
+            }
+        return super().run_conversation(prompt, conversation_history)
+
+
+class RenderFailingThenNativeHistoryAgent(NativeHistoryAgent):
+    def run_conversation(
+        self,
+        prompt: str,
+        conversation_history: list[dict] | None = None,
+    ) -> dict:
+        if not self.histories:
+            history = copy.deepcopy(conversation_history or [])
+            self.histories.append(history)
+            return {
+                "completed": True,
+                "partial": False,
+                "final_response": {"invalid": "non-string candidate"},
+                "messages": [
+                    *history,
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "must not persist"},
+                ],
+            }
+        return super().run_conversation(prompt, conversation_history)
 
 
 class FakeCodexSession:
@@ -1422,6 +1503,98 @@ async def test_worker_reuses_agent_deduplicates_and_resets(tmp_path: Path) -> No
         assert len(agents) == 2
     finally:
         await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_native_responses_history_is_warm_and_reset_bounded(
+    tmp_path: Path,
+) -> None:
+    agents: list[NativeHistoryAgent] = []
+
+    def factory() -> NativeHistoryAgent:
+        agent = NativeHistoryAgent()
+        agents.append(agent)
+        return agent
+
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="chief",
+        agent_factory=factory,
+    )
+    await worker.start()
+    try:
+        first = await worker.handle_request(request("native-first"))
+        second = await worker.handle_request(request("native-second"))
+        replay = await worker.handle_request(request("native-first"))
+
+        assert first["status"] == second["status"] == "completed"
+        assert replay == first
+        assert len(agents) == 1
+        assert agents[0].histories[0] == []
+        assert [message["role"] for message in agents[0].histories[1]] == [
+            "user",
+            "assistant",
+        ]
+        assert "native-first" in agents[0].histories[1][0]["content"]
+
+        old_instance = second["conversation_instance_id"]
+        reset = await worker.handle_request(request("native-reset", "reset"))
+        third = await worker.handle_request(request("native-third"))
+
+        assert reset["conversation_instance_id"] != old_instance
+        assert third["status"] == "completed"
+        assert len(agents) == 2
+        assert agents[1].histories == [[]]
+    finally:
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_native_responses_turn_does_not_advance_history(
+    tmp_path: Path,
+) -> None:
+    agent = FailingThenNativeHistoryAgent()
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="chief",
+        agent_factory=lambda: agent,
+    )
+    await worker.start()
+    try:
+        failed = await worker.handle_request(request("native-failed"))
+        succeeded = await worker.handle_request(request("native-retry"))
+    finally:
+        await worker.stop()
+
+    assert failed["status"] == "failed"
+    assert succeeded["status"] == "completed"
+    assert agent.histories == [[], []]
+
+
+@pytest.mark.asyncio
+async def test_native_render_preparation_failure_does_not_advance_history(
+    tmp_path: Path,
+) -> None:
+    agent = RenderFailingThenNativeHistoryAgent()
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="chief",
+        agent_factory=lambda: agent,
+    )
+    await worker.start()
+    try:
+        failed = await worker.handle_request(v2_request("native-render-failed"))
+        succeeded = await worker.handle_request(v2_request("native-render-retry"))
+    finally:
+        await worker.stop()
+
+    assert failed["status"] == "failed"
+    assert failed["error"]["code"] == "TURN_FAILED"
+    assert succeeded["status"] == "completed"
+    assert agent.histories == [[], []]
 
 
 @pytest.mark.asyncio

@@ -821,6 +821,42 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["messages"][-1]["content"] == "OK"
 
 
+def test_run_conversation_codex_reports_terminal_runtime_metadata(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    response = _codex_message_response("OK")
+    response.model = "gpt-5.6-sol"
+    response.reasoning = SimpleNamespace(effort="high")
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda _kwargs: response)
+
+    result = agent.run_conversation("Say OK")
+
+    assert result["runtime_model"] == "gpt-5.6-sol"
+    assert result["runtime_reasoning_effort"] == "high"
+
+
+def test_consume_codex_stream_preserves_terminal_runtime_metadata():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    response = _consume_codex_event_stream(
+        _FakeCreateStream([
+            SimpleNamespace(type="response.output_text.delta", delta="OK"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(
+                    status="completed",
+                    model="gpt-5.6-sol",
+                    reasoning=SimpleNamespace(effort="medium"),
+                ),
+            ),
+        ]),
+        model="requested-model",
+    )
+
+    assert response.model == "requested-model"
+    assert response.resolved_model == "gpt-5.6-sol"
+    assert response.resolved_reasoning_effort == "medium"
+
+
 def test_run_conversation_codex_empty_output_with_output_text(monkeypatch):
     """Regression: empty response.output + valid output_text should succeed,
     not trigger retry/fallback. The validation stage must defer to

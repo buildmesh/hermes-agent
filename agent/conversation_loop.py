@@ -565,6 +565,12 @@ def run_conversation(
         except Exception:
             pass
 
+    # Runtime observations are per turn. Clear them before the first provider
+    # request so an empty, interrupted, or failed turn cannot inherit evidence
+    # from a prior successful Responses turn on the resident agent.
+    agent._last_runtime_model = None
+    agent._last_runtime_reasoning_effort = None
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-
@@ -1333,6 +1339,27 @@ def run_conversation(
                     api_call_count=api_call_count,
                     middleware_trace=list(_llm_middleware_trace),
                 )
+
+                if agent.api_mode == "codex_responses" and response is not None:
+                    observed_model = getattr(response, "resolved_model", None)
+                    if observed_model is None and not hasattr(response, "resolved_model"):
+                        observed_model = getattr(response, "model", None)
+                    if isinstance(observed_model, str) and observed_model.strip():
+                        agent._last_runtime_model = observed_model.strip()
+                    observed_effort = getattr(
+                        response, "resolved_reasoning_effort", None
+                    )
+                    if observed_effort is None and not hasattr(
+                        response, "resolved_reasoning_effort"
+                    ):
+                        reasoning = getattr(response, "reasoning", None)
+                        observed_effort = getattr(reasoning, "effort", None)
+                        if observed_effort is None and isinstance(reasoning, dict):
+                            observed_effort = reasoning.get("effort")
+                    if isinstance(observed_effort, str) and observed_effort.strip():
+                        agent._last_runtime_reasoning_effort = (
+                            observed_effort.strip().lower()
+                        )
                 
                 api_duration = time.time() - api_start_time
                 

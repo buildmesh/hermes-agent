@@ -426,6 +426,12 @@ def finalize_turn(
         "cost_source": agent.session_cost_source,
         "session_id": agent.session_id,
     }
+    runtime_model = getattr(agent, "_last_runtime_model", None)
+    if isinstance(runtime_model, str) and runtime_model.strip():
+        result["runtime_model"] = runtime_model.strip()
+    runtime_effort = getattr(agent, "_last_runtime_reasoning_effort", None)
+    if isinstance(runtime_effort, str) and runtime_effort.strip():
+        result["runtime_reasoning_effort"] = runtime_effort.strip().lower()
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a

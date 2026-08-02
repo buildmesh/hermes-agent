@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import contextlib
 import fcntl
 import hashlib
@@ -627,6 +628,7 @@ class PersistentSpecialistWorker:
         self._correction_companion_runner = correction_companion_runner or run_companion_subprocess
         self.runtime_instance_id = f"runtime_{uuid.uuid4().hex}"
         self.conversation_instance_id = f"thread_{uuid.uuid4().hex}"
+        self._native_conversation_history: list[dict[str, Any]] = []
         self.started_at = _utcnow()
         self.last_success_at: str | None = None
         self.last_error_code: str | None = None
@@ -718,6 +720,29 @@ class PersistentSpecialistWorker:
         agent = self.agent_factory()
         agent.session_cwd = str(self.profile_root)
         return agent
+
+    def _run_model_turn(self, prompt: str) -> dict[str, Any]:
+        """Run one turn, supplying worker-owned history on native runtimes."""
+        method = self._agent.run_conversation
+        if getattr(self._agent, "api_mode", None) != "codex_responses":
+            return method(prompt)
+        return method(
+            prompt,
+            conversation_history=copy.deepcopy(
+                self._native_conversation_history
+            ),
+        )
+
+    def _accept_native_conversation_history(self, result: dict[str, Any]) -> None:
+        """Advance native history only after a completed model turn."""
+        if getattr(self._agent, "api_mode", None) != "codex_responses":
+            return
+        messages = result.get("messages")
+        if not isinstance(messages, list) or not all(
+            isinstance(message, dict) for message in messages
+        ):
+            raise RuntimeError("native model turn returned invalid conversation history")
+        self._native_conversation_history = copy.deepcopy(messages)
 
     def _write_presenter_endpoint(
         self,
@@ -1691,6 +1716,7 @@ class PersistentSpecialistWorker:
         ):
             await self._retire_agent()
             self._conversation_id = None
+            self._native_conversation_history = []
             self.conversation_instance_id = f"thread_{uuid.uuid4().hex}"
             self._log_event("conversation_evicted", reason="idle")
         if self._conversation_id not in {None, conversation_id}:
@@ -1811,6 +1837,7 @@ class PersistentSpecialistWorker:
                     remaining = max(0.1, self.reset_timeout - (time.monotonic() - started))
                     await asyncio.wait_for(self._retire_agent(), timeout=remaining)
                     retirement_ms = int((time.monotonic() - retirement_started) * 1000)
+                    self._native_conversation_history = []
                     self.conversation_instance_id = f"thread_{uuid.uuid4().hex}"
                     render_started = time.monotonic()
                     response = self._reset_response(
@@ -1865,7 +1892,7 @@ class PersistentSpecialistWorker:
                     model_task: asyncio.Task[Any] | None = None
                     try:
                         model_task = asyncio.create_task(
-                            asyncio.to_thread(self._agent.run_conversation, prompt)
+                            asyncio.to_thread(self._run_model_turn, prompt)
                         )
                         self._active_model_task = model_task
                         result = await asyncio.wait_for(
@@ -1989,6 +2016,7 @@ class PersistentSpecialistWorker:
                     else:
                         response_fields["render_payloads"] = payloads
                     response = self._base_response(request, **response_fields)
+                    self._accept_native_conversation_history(result)
                 self.last_success_at = _iso(_utcnow())
                 self._last_conversation_activity = time.monotonic()
                 record["state"] = "completed"
