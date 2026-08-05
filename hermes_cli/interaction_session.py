@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import re
@@ -53,6 +54,113 @@ class InteractionSessionDeclaration:
     profile_version: str
     installed_profile_sha256: str
     contexts: dict[str, InteractionContext]
+
+
+def resolve_consumer_context(
+    declaration: InteractionSessionDeclaration | None,
+    kind: str,
+    workflow_id: str,
+) -> InteractionContext | None:
+    if declaration is None:
+        return None
+    matches = [
+        context
+        for context in declaration.contexts.values()
+        if (kind, workflow_id) in context.consumers
+    ]
+    if len(matches) > 1:
+        raise InteractionSessionError(
+            "SESSION_CONTRACT_INVALID",
+            "terminal consumer resolves to more than one interaction context",
+        )
+    return matches[0] if matches else None
+
+
+def terminal_consumer_context(
+    control: dict[str, Any],
+    context: InteractionContext,
+) -> dict[str, Any]:
+    snapshot = control.get("snapshot") if control.get("active") is True else None
+    if snapshot is None:
+        raise InteractionSessionError(
+            "SESSION_CONTEXT_REQUIRED",
+            "the declared terminal consumer requires an active interaction session",
+        )
+    if (
+        snapshot.get("context_type") != context.context_type
+        or snapshot.get("context_version") != context.version
+        or snapshot.get("schema_sha256") != context.schema_sha256
+    ):
+        raise InteractionSessionError(
+            "SESSION_CONTEXT_TYPE_MISMATCH",
+            "the active interaction session does not match the declared terminal consumer",
+        )
+    return copy.deepcopy(
+        {
+            "session_id": snapshot["session_id"],
+            "conversation_generation": control["conversation_generation"],
+            "installed_profile_sha256": control["installed_profile_sha256"],
+            "context_type": snapshot["context_type"],
+            "context_version": snapshot["context_version"],
+            "revision": snapshot["revision"],
+            "state": snapshot["state"],
+        }
+    )
+
+
+def terminal_session_transition(
+    control: dict[str, Any],
+    context: InteractionContext,
+    event_id: str,
+    directive: Any,
+) -> dict[str, Any] | None:
+    if directive is None:
+        return None
+    if not isinstance(directive, dict) or directive.get("operation") not in {"replace", "clear"}:
+        raise InteractionSessionError("SESSION_TRANSITION_INVALID", "terminal session directive is invalid")
+    operation = directive["operation"]
+    expected = {"operation"} if operation == "clear" else {
+        "operation", "context_type", "context_version", "state"
+    }
+    if set(directive) != expected:
+        raise InteractionSessionError("SESSION_TRANSITION_INVALID", "terminal session directive has an invalid shape")
+    snapshot = control.get("snapshot") if control.get("active") is True else None
+    transition: dict[str, Any] = {
+        "operation": operation,
+        "event_id": event_id,
+        "profile": control["profile"],
+        "profile_version": control["profile_version"],
+        "installed_profile_sha256": control["installed_profile_sha256"],
+        "conversation_generation": control["conversation_generation"],
+    }
+    if snapshot is not None:
+        transition.update(
+            prior_session_id=snapshot["session_id"],
+            prior_revision=snapshot["revision"],
+        )
+    if operation == "clear":
+        if snapshot is None:
+            raise InteractionSessionError("SESSION_TRANSITION_INVALID", "cannot clear an inactive interaction session")
+        return transition
+    if (
+        directive.get("context_type") != context.context_type
+        or directive.get("context_version") != context.version
+    ):
+        raise InteractionSessionError("SESSION_TRANSITION_INVALID", "terminal session directive context does not match its consumer")
+    state = directive.get("state")
+    raw = canonical_session_state(state)
+    from jsonschema import Draft202012Validator
+    if list(Draft202012Validator(context.schema).iter_errors(state)):
+        raise InteractionSessionError("SESSION_TRANSITION_INVALID", "terminal session directive state does not satisfy its schema")
+    transition.update(
+        context_type=context.context_type,
+        context_version=context.version,
+        schema_sha256=context.schema_sha256,
+        revision=(snapshot["revision"] + 1 if snapshot else 1),
+        state=copy.deepcopy(state),
+        state_sha256=_digest(raw),
+    )
+    return transition
 
 
 def _canonical(value: Any) -> bytes:

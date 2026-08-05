@@ -11,7 +11,7 @@ import fcntl
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from hermes_constants import get_hermes_home
 from hermes_cli.terminal_presenter import (
@@ -37,6 +37,7 @@ MUTATION_JOURNAL_RELATIVE_PATH = Path(
 )
 MUTATION_CAPABILITY = "terminal_mutation_chaining.v1"
 MUTATION_INVOKE_SCHEMA = "hermes.terminal_mutation.invoke.v1"
+MUTATION_SESSION_INVOKE_SCHEMA = "hermes.terminal_mutation.invoke.v2"
 MUTATION_JOURNAL_RETENTION = timedelta(days=30)
 
 
@@ -328,6 +329,8 @@ def execute_terminal_mutation(
     event_id: str,
     workflow_id: str,
     workflow_input: dict[str, Any],
+    session_context: dict[str, Any] | None = None,
+    session_directive_resolver: Callable[[Any], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Serialize the authoritative invocation key across threads/processes."""
     root = profile_root.resolve()
@@ -349,6 +352,8 @@ def execute_terminal_mutation(
             event_id=event_id,
             workflow_id=workflow_id,
             workflow_input=workflow_input,
+            session_context=session_context,
+            session_directive_resolver=session_directive_resolver,
         )
 
 
@@ -360,6 +365,8 @@ def _execute_terminal_mutation_locked(
     event_id: str,
     workflow_id: str,
     workflow_input: dict[str, Any],
+    session_context: dict[str, Any] | None,
+    session_directive_resolver: Callable[[Any], dict[str, Any] | None] | None,
 ) -> dict[str, Any]:
     root = profile_root.resolve()
     mutation = load_terminal_mutations(root).get(workflow_id)
@@ -380,6 +387,10 @@ def _execute_terminal_mutation_locked(
             "mutation input failed validation",
         ) from exc
     input_sha256 = hashlib.sha256(_canonical(workflow_input)).hexdigest()
+    session_context_sha256 = (
+        hashlib.sha256(_canonical(session_context)).hexdigest()
+        if session_context is not None else None
+    )
     invocation_key = _invocation_key(
         specialist_id,
         conversation_id,
@@ -396,6 +407,7 @@ def _execute_terminal_mutation_locked(
         "workflow_id": mutation.workflow_id,
         "workflow_version": mutation.version,
         "input_sha256": input_sha256,
+        "session_context_sha256": session_context_sha256,
         "handler_sha256": mutation.handler.handler_sha256,
         "mapper_sha256": (
             mutation.mapper.handler_sha256 if mutation.mapper else None
@@ -454,12 +466,18 @@ def _execute_terminal_mutation_locked(
     record["updated_at"] = _now()
     _atomic_json(journal_path, record)
     invocation = {
-        "schema_version": MUTATION_INVOKE_SCHEMA,
+        "schema_version": (
+            MUTATION_SESSION_INVOKE_SCHEMA
+            if session_context is not None
+            else MUTATION_INVOKE_SCHEMA
+        ),
         "operation_id": operation_id,
         "workflow_id": mutation.workflow_id,
         "workflow_version": mutation.version,
         "input": workflow_input,
     }
+    if session_context is not None:
+        invocation["session_context"] = session_context
     permissive_input = {
         "type": "object",
         "additionalProperties": True,
@@ -498,8 +516,23 @@ def _execute_terminal_mutation_locked(
             code = "MUTATION_OUTCOME_UNKNOWN"
             message = "mutation outcome is unknown"
         raise TerminalMutationError(code, message, sealed=True) from exc
+    directive = handler_result.get("session_context")
+    transition = None
+    transition_error = None
+    if directive is not None and session_directive_resolver is None:
+        transition_error = "SESSION_TRANSITION_INVALID"
+    elif session_directive_resolver is not None:
+        try:
+            transition = session_directive_resolver(directive)
+        except Exception as exc:
+            transition_error = str(getattr(exc, "code", "SESSION_TRANSITION_INVALID"))
     record["execution_state"] = outcome
     record["result"] = result
+    record["session_directive_sha256"] = (
+        hashlib.sha256(_canonical(directive)).hexdigest() if directive is not None else None
+    )
+    record["session_transition"] = transition
+    record["session_transition_error"] = transition_error
     record["updated_at"] = _now()
     try:
         _atomic_json(journal_path, record)
@@ -583,6 +616,8 @@ def _prepare_mutation_presentation(
         "presenter_id": mutation.presenter_id,
         "presenter_input": presenter_input,
         "journal_path": str(journal_path),
+        "session_transition": record.get("session_transition"),
+        "session_transition_error": record.get("session_transition_error"),
     }
 
 

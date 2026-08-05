@@ -11,8 +11,9 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from hermes_constants import get_hermes_home
 from hermes_cli.terminal_presenter import (
@@ -402,23 +403,37 @@ def execute_terminal_workflow(
     workflow_input: dict[str, Any],
     *,
     checkpoint: dict[str, Any] | None = None,
+    session_context: dict[str, Any] | None = None,
+    session_directive_resolver: Callable[[Any], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     workflow = load_terminal_workflows(profile_root).get(workflow_id)
     if workflow is None:
         raise TerminalWorkflowError("WORKFLOW_NOT_DECLARED", "workflow is not declared")
+    invocation_input = workflow_input if session_context is None else {
+        "input": workflow_input,
+        "session_context": session_context,
+    }
     input_sha256 = hashlib.sha256(
         json.dumps(
-            workflow_input,
+            invocation_input,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
     if checkpoint is None:
+        producer = workflow.producer
+        if session_context is not None:
+            from jsonschema import Draft202012Validator
+            try:
+                Draft202012Validator(producer.input_schema).validate(workflow_input)
+            except Exception as exc:
+                raise TerminalWorkflowError("WORKFLOW_INPUT_INVALID", "producer input failed validation") from exc
+            producer = replace(producer, input_schema={"type": "object", "additionalProperties": True})
         producer_result = _run_program(
             profile_root,
-            workflow.producer,
-            workflow_input,
+            producer,
+            invocation_input,
             label="producer",
         )
         outcome = producer_result.get("outcome")
@@ -435,11 +450,31 @@ def execute_terminal_workflow(
         domain_result = producer_result.get("result")
         if not isinstance(domain_result, dict):
             raise TerminalWorkflowError("WORKFLOW_OUTPUT_INVALID", "terminal result must be an object")
+        directive = producer_result.get("session_context")
         checkpoint = {
             "workflow_id": workflow.workflow_id,
             "domain_result": domain_result,
             "input_sha256": input_sha256,
+            "session_directive": directive,
         }
+        if directive is not None and session_directive_resolver is None:
+            checkpoint["session_transition_error"] = "SESSION_TRANSITION_INVALID"
+            raise TerminalWorkflowError(
+                "SESSION_TRANSITION_INVALID",
+                "workflow returned a session directive without a declared consumer",
+                checkpoint=checkpoint,
+            )
+        try:
+            transition = session_directive_resolver(directive) if session_directive_resolver else None
+        except Exception as exc:
+            code = str(getattr(exc, "code", "SESSION_TRANSITION_INVALID"))
+            checkpoint["session_transition_error"] = code
+            raise TerminalWorkflowError(
+                code,
+                str(exc),
+                checkpoint=checkpoint,
+            ) from exc
+        checkpoint["session_transition"] = transition
     elif (
         checkpoint.get("workflow_id") != workflow.workflow_id
         or not isinstance(checkpoint.get("domain_result"), dict)
@@ -448,6 +483,12 @@ def execute_terminal_workflow(
         raise TerminalWorkflowError(
             "WORKFLOW_RETRY_MISMATCH",
             "workflow retry input differs from the completed producer input",
+        )
+    if checkpoint.get("session_transition_error") is not None:
+        raise TerminalWorkflowError(
+            str(checkpoint["session_transition_error"]),
+            "workflow session directive previously failed validation",
+            checkpoint=checkpoint,
         )
     domain_result = checkpoint["domain_result"]
     try:
@@ -470,6 +511,8 @@ def execute_terminal_workflow(
         "producer_sha256": workflow.producer.handler_sha256,
         "mapper_sha256": workflow.mapper.handler_sha256 if workflow.mapper else None,
         "checkpoint": checkpoint,
+        "session_directive": checkpoint.get("session_directive"),
+        "session_transition": checkpoint.get("session_transition"),
     }
 
 

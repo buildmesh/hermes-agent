@@ -130,6 +130,39 @@ def test_loads_closed_digest_bound_read_only_workflow(tmp_path: Path) -> None:
     assert workflow.read_only is True
 
 
+def test_session_consumer_receives_runtime_wrapper_and_prepares_directive_before_presenting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_workflow(tmp_path)
+    import hermes_cli.terminal_workflow as module
+
+    observed = []
+    monkeypatch.setattr(
+        module,
+        "_run_program",
+        lambda root, program, value, *, label: (
+            observed.append((label, value))
+            or {
+                "outcome": "terminal_ready",
+                "result": {"payloads": [{"render": {"text": "ready"}}]},
+                "model_result": None,
+                "session_context": {"operation": "clear"},
+            }
+        ),
+    )
+    runtime_context = {"session_id": "sctx_test", "revision": 2, "state": {"period": "Q3"}}
+    result = execute_terminal_workflow(
+        tmp_path,
+        "test-workflow",
+        {"outcome": "terminal_ready", "payloads": []},
+        session_context=runtime_context,
+        session_directive_resolver=lambda directive: {"operation": directive["operation"], "prior_revision": 2},
+    )
+    assert observed == [("producer", {"input": {"outcome": "terminal_ready", "payloads": []}, "session_context": runtime_context})]
+    assert result["session_transition"] == {"operation": "clear", "prior_revision": 2}
+    assert "session_context" not in result["presenter_input"]
+
+
 @pytest.mark.parametrize("mapper", [False, True])
 def test_executes_terminal_ready_with_optional_profile_mapper(
     tmp_path: Path,

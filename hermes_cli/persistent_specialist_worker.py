@@ -61,7 +61,10 @@ from hermes_cli.interaction_session import (
     InteractionSessionError,
     canonical_session_state,
     load_interaction_session_declaration,
+    resolve_consumer_context,
     require_codex_additional_context_support,
+    terminal_consumer_context,
+    terminal_session_transition,
     validate_turn_control,
 )
 
@@ -1091,6 +1094,62 @@ class PersistentSpecialistWorker:
         self._active_interaction_session_turn = None
         self._interaction_session_endpoint_path.unlink(missing_ok=True)
 
+    def _terminal_consumer_invocation(
+        self,
+        kind: str,
+        workflow_id: str,
+    ) -> tuple[dict[str, Any] | None, Any]:
+        context = resolve_consumer_context(
+            self._interaction_session_declaration,
+            kind,
+            workflow_id,
+        )
+        if context is None:
+            return None, None
+        active = self._active_interaction_session_turn
+        if active is None:
+            raise InteractionSessionError(
+                "SESSION_CONTEXT_REQUIRED",
+                "the declared terminal consumer requires an interaction-session turn",
+            )
+        if active.get("transition") is not None:
+            raise InteractionSessionError(
+                "SESSION_TRANSITION_ALREADY_PREPARED",
+                "a session transition is already prepared for this event",
+            )
+        value = terminal_consumer_context(active["control"], context)
+        return value, context
+
+    def _terminal_directive_resolver(self, context: Any):
+        active = self._active_interaction_session_turn
+        if active is None:
+            raise InteractionSessionError(
+                "SESSION_CONTEXT_UNAVAILABLE",
+                "interaction-session turn ended before terminal execution",
+            )
+        return lambda directive: terminal_session_transition(
+            active["control"], context, str(active["event_id"]), directive
+        )
+
+    def _committed_quarantine_transition(self) -> dict[str, Any] | None:
+        active = self._active_interaction_session_turn
+        if active is None:
+            return None
+        control = active["control"]
+        snapshot = control.get("snapshot") if control.get("active") is True else None
+        if snapshot is None:
+            return None
+        return {
+            "operation": "quarantine",
+            "event_id": active["event_id"],
+            "profile": control["profile"],
+            "profile_version": control["profile_version"],
+            "installed_profile_sha256": control["installed_profile_sha256"],
+            "conversation_generation": control["conversation_generation"],
+            "prior_session_id": snapshot["session_id"],
+            "prior_revision": snapshot["revision"],
+        }
+
     async def _handle_interaction_session_request(self, request: dict[str, Any]) -> dict[str, Any]:
         active = self._active_interaction_session_turn
         operation = request.get("operation")
@@ -1491,6 +1550,17 @@ class PersistentSpecialistWorker:
                     },
                 }
             try:
+                session_context, consumer_context = self._terminal_consumer_invocation(
+                    "terminal_mutation", workflow_id
+                )
+            except InteractionSessionError as exc:
+                return {
+                    "protocol_version": PRESENTER_PROTOCOL,
+                    "status": "failed",
+                    "execution_state": "not_started",
+                    "error": {"code": exc.code, "message": str(exc)[:500]},
+                }
+            try:
                 mutation_result = await asyncio.to_thread(
                     execute_terminal_mutation,
                     self.profile_root,
@@ -1499,11 +1569,18 @@ class PersistentSpecialistWorker:
                     event_id=str(active["event_id"]),
                     workflow_id=workflow_id,
                     workflow_input=workflow_input,
+                    session_context=session_context,
+                    session_directive_resolver=(
+                        self._terminal_directive_resolver(consumer_context)
+                        if consumer_context is not None else None
+                    ),
                 )
             except TerminalMutationError as exc:
                 if exc.sealed:
                     active["mutation_sealed"] = True
                     active["mutation_error_code"] = exc.code
+                    if consumer_context is not None:
+                        active["suppress_session_renewal"] = True
                 return {
                     "protocol_version": PRESENTER_PROTOCOL,
                     "status": "failed",
@@ -1511,6 +1588,18 @@ class PersistentSpecialistWorker:
                     "error": {"code": exc.code, "message": str(exc)[:500]},
                 }
             active["mutation_sealed"] = True
+            if consumer_context is not None:
+                transition = mutation_result.get("session_transition")
+                transition_error = mutation_result.get("session_transition_error")
+                if mutation_result["outcome"] == "committed":
+                    if transition_error is not None:
+                        transition = self._committed_quarantine_transition()
+                        active["session_update_error"] = transition_error
+                    active["transition"] = transition
+                else:
+                    # A failed/conflicting domain mutation cannot advance or renew
+                    # the context from which it was attempted.
+                    active["suppress_session_renewal"] = True
             try:
                 artifact = await asyncio.to_thread(
                     execute_terminal_presenter,
@@ -1630,6 +1719,17 @@ class PersistentSpecialistWorker:
                     },
                 }
             try:
+                session_context, consumer_context = self._terminal_consumer_invocation(
+                    "terminal_workflow", workflow_id
+                )
+            except InteractionSessionError as exc:
+                return {
+                    "protocol_version": PRESENTER_PROTOCOL,
+                    "status": "failed",
+                    "execution_state": "not_started",
+                    "error": {"code": exc.code, "message": str(exc)[:500]},
+                }
+            try:
                 continued = active.get("workflow_continue")
                 input_sha256 = hashlib.sha256(
                     json.dumps(
@@ -1676,6 +1776,11 @@ class PersistentSpecialistWorker:
                     workflow_id,
                     workflow_input,
                     checkpoint=checkpoint if isinstance(checkpoint, dict) else None,
+                    session_context=session_context,
+                    session_directive_resolver=(
+                        self._terminal_directive_resolver(consumer_context)
+                        if consumer_context is not None else None
+                    ),
                 )
             except TerminalWorkflowError as exc:
                 if isinstance(exc.checkpoint, dict):
@@ -1697,6 +1802,7 @@ class PersistentSpecialistWorker:
                     "model_result": workflow_result.get("model_result"),
                 }
             active["workflow_checkpoint"] = workflow_result["checkpoint"]
+            prepared_transition = workflow_result.get("session_transition")
             try:
                 artifact = await asyncio.to_thread(
                     execute_terminal_presenter,
@@ -1715,6 +1821,8 @@ class PersistentSpecialistWorker:
             artifact["workflow_version"] = workflow_result["workflow_version"]
             artifact["producer_sha256"] = workflow_result["producer_sha256"]
             artifact["mapper_sha256"] = workflow_result["mapper_sha256"]
+            if prepared_transition is not None:
+                self._active_interaction_session_turn["transition"] = prepared_transition
             active["artifact"] = artifact
             return {
                 "protocol_version": PRESENTER_PROTOCOL,
@@ -2413,7 +2521,13 @@ class PersistentSpecialistWorker:
                     if interaction_session_enabled:
                         transition = self._active_interaction_session_turn.get("transition")
                         snapshot = session_control.get("snapshot") if session_control.get("active") is True else None
-                        if transition is None and snapshot is not None:
+                        if (
+                            transition is None
+                            and snapshot is not None
+                            and self._active_interaction_session_turn.get(
+                                "suppress_session_renewal"
+                            ) is not True
+                        ):
                             transition = {
                                 "operation": "renew", "event_id": event_id,
                                 "profile": session_control["profile"],

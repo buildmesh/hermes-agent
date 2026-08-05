@@ -182,6 +182,56 @@ def execute(root: Path, value: str = "note") -> dict:
     )
 
 
+def test_session_directive_is_journaled_with_outcome_and_replay_never_reinterprets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_mutation(tmp_path)
+    import hermes_cli.terminal_mutation as module
+
+    calls = []
+    monkeypatch.setattr(
+        module,
+        "_run_program",
+        lambda *args, **kwargs: (
+            calls.append("handler")
+            or {
+                "outcome": "committed",
+                "result": {"value": "note", "record_id": "rec-1"},
+                "session_context": {"operation": "clear"},
+            }
+        ),
+    )
+    context = {"session_id": "sctx_test", "revision": 2, "state": {"draft": True}}
+    result = execute_terminal_mutation(
+        tmp_path,
+        specialist_id="test-agent",
+        conversation_id="conv-test",
+        event_id="evt-session",
+        workflow_id="test-create",
+        workflow_input={"value": "note"},
+        session_context=context,
+        session_directive_resolver=lambda directive: {"operation": directive["operation"], "prior_revision": 2},
+    )
+    assert result["session_transition"] == {"operation": "clear", "prior_revision": 2}
+    journal = json.loads(Path(result["journal_path"]).read_text())
+    assert journal["execution_state"] == "committed"
+    assert journal["session_directive_sha256"]
+
+    monkeypatch.setattr(module, "_run_program", lambda *args, **kwargs: pytest.fail("handler reran"))
+    replay = execute_terminal_mutation(
+        tmp_path,
+        specialist_id="test-agent",
+        conversation_id="conv-test",
+        event_id="evt-session",
+        workflow_id="test-create",
+        workflow_input={"value": "note"},
+        session_context=context,
+        session_directive_resolver=lambda directive: pytest.fail("directive was reinterpreted"),
+    )
+    assert replay["session_transition"] == result["session_transition"]
+    assert calls == ["handler"]
+
+
 def test_loads_transactional_operation_id_declaration(
     tmp_path: Path,
 ) -> None:
