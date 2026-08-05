@@ -322,6 +322,7 @@ def run_codex_app_server_turn(
     from hermes_cli.terminal_presenter import terminal_presenters_available
     from hermes_cli.terminal_mutation import terminal_mutations_available
     from hermes_cli.terminal_workflow import terminal_workflows_available
+    from hermes_cli.interaction_session import interaction_sessions_available
 
     required_mcp_tools: set[str] = set()
     if terminal_presenters_available():
@@ -330,6 +331,8 @@ def run_codex_app_server_turn(
         required_mcp_tools.add("run_terminal_workflow")
     if terminal_mutations_available():
         required_mcp_tools.add("run_terminal_mutation")
+    if interaction_sessions_available():
+        required_mcp_tools.add("update_interaction_session")
 
     resume_thread_id = getattr(agent, "_codex_resume_thread_id", None)
     existing_session = getattr(agent, "_codex_session", None)
@@ -483,6 +486,9 @@ def run_codex_app_server_turn(
             mcp_server_projection=mcp_server_projection,
             profile_mcp_servers=profile_mcp_servers,
             required_mcp_servers=required_mcp_servers,
+            enable_experimental_additional_context=(
+                "update_interaction_session" in required_mcp_tools
+            ),
             resume_thread_id=resume_thread_id,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
@@ -506,7 +512,14 @@ def run_codex_app_server_turn(
                 "completed": True,
                 "partial": False,
             }
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        additional_context = getattr(agent, "_interaction_session_additional_context", None)
+        if additional_context is None:
+            turn = agent._codex_session.run_turn(user_input=user_message)
+        else:
+            turn = agent._codex_session.run_turn(
+                user_input=user_message,
+                additional_context=additional_context,
+            )
     except Exception as exc:
         startup_failed = (
             bool(required_mcp_servers)

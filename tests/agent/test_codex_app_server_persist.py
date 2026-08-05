@@ -146,6 +146,55 @@ def test_presenter_capability_transition_resumes_existing_thread(monkeypatch):
     }
 
 
+def test_interaction_session_capability_projects_required_mcp_tool(monkeypatch):
+    captured_kwargs = {}
+
+    class CapturingSession:
+        def __init__(self, **kwargs):
+            captured_kwargs.update(kwargs)
+
+        def run_turn(self, *, user_input):
+            return _make_turn()
+
+    monkeypatch.setattr(
+        "agent.transports.codex_app_server_session.CodexAppServerSession",
+        CapturingSession,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.interaction_session.interaction_sessions_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.terminal_presenter.terminal_presenters_available",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.terminal_workflow.terminal_workflows_available",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.terminal_mutation.terminal_mutations_available",
+        lambda: False,
+    )
+    agent = _make_agent(session_db=None)
+    previous = agent._codex_session
+    previous._required_mcp_tools = frozenset()
+    previous._thread_id = "thread-preserved"
+
+    run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+    previous.close.assert_called_once()
+    assert captured_kwargs["resume_thread_id"] == "thread-preserved"
+    assert captured_kwargs["required_mcp_tools"] == {"update_interaction_session"}
+    assert captured_kwargs["enable_experimental_additional_context"] is True
+
+
 def test_failed_capability_transition_preserves_resume_id_for_retry(monkeypatch):
     captured = []
 

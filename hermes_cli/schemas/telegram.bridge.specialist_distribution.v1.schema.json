@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tba.local/schemas/telegram.bridge.specialist_distribution.v1.schema.json",
+  "title": "Telegram Bridge Specialist Distribution v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profile", "dependencies"],
+  "properties": {
+    "schema_version": {"const": "telegram.bridge.specialist_distribution.v1"},
+    "profile": {"$ref": "#/$defs/profile"},
+    "dependencies": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/dependency"}
+    },
+    "fast_path": {"$ref": "#/$defs/fast_path"}
+  },
+  "$defs": {
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+    },
+    "non_root_relative_path": {
+      "allOf": [
+        {"$ref": "#/$defs/relative_path"},
+        {"not": {"const": "."}}
+      ]
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "required_files", "memory_templates", "runtime_directories"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+        "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"},
+        "required_files": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/non_root_relative_path"}
+        },
+        "memory_templates": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/relative_path", "pattern": "^memories/"}
+        },
+        "runtime_directories": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/non_root_relative_path"}
+        },
+        "preserved_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/preserved_path"}
+        },
+        "interaction_session_contract": {"$ref": "#/$defs/bound_file"}
+      }
+    },
+    "bound_file": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"$ref": "#/$defs/non_root_relative_path", "pattern": "^contract/"},
+        "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "preserved_path": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "kind"],
+      "properties": {
+        "path": {"$ref": "#/$defs/non_root_relative_path"},
+        "kind": {"enum": ["credential", "configuration", "runtime"]}
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package", "executable", "smoke_command", "installation"],
+      "properties": {
+        "package": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "version", "platforms", "digest"],
+          "properties": {
+            "name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"},
+            "version": {"type": "string", "pattern": "^[0-9A-Za-z][0-9A-Za-z.+_-]{0,127}$"},
+            "platforms": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 64}},
+            "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          }
+        },
+        "executable": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"},
+            "path": {"type": "string", "pattern": "^/", "maxLength": 1024}
+          }
+        },
+        "version_probe": {"$ref": "#/$defs/command"},
+        "version_range": {"type": "string", "minLength": 1, "maxLength": 128},
+        "smoke_command": {"$ref": "#/$defs/command"},
+        "environment_names": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"enum": ["LANG", "LC_ALL", "TZ", "NO_COLOR"]}
+        },
+        "installation": {"$ref": "#/$defs/dependency_installation"}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "installation": {
+                "properties": {"ownership": {"const": "external"}},
+                "required": ["ownership"]
+              }
+            }
+          },
+          "then": {
+            "required": ["executable"],
+            "properties": {"executable": {"required": ["path"]}}
+          }
+        }
+      ]
+    },
+    "dependency_installation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ownership"],
+          "properties": {"ownership": {"const": "external"}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ownership", "artifact_path"],
+          "properties": {
+            "ownership": {"const": "installer"},
+            "artifact_path": {"type": "string", "pattern": "^/", "maxLength": 1024}
+          }
+        }
+      ]
+    },
+    "command": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {"type": "string", "minLength": 1, "maxLength": 1024}
+    },
+    "fast_path": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "read_only", "protocol_version", "handler", "sha256", "version", "command",
+        "timeout_seconds", "max_output_bytes", "health_command"
+      ],
+      "properties": {
+        "read_only": {"const": true},
+        "protocol_version": {"const": "telegram.bridge.specialist_fast_path.v1"},
+        "handler": {"$ref": "#/$defs/non_root_relative_path"},
+        "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "version": {"type": "string", "minLength": 1, "maxLength": 128},
+        "command": {"$ref": "#/$defs/command"},
+        "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 30},
+        "max_output_bytes": {"type": "integer", "minimum": 256, "maximum": 1048576},
+        "health_command": {"$ref": "#/$defs/command"}
+      }
+    }
+  }
+}

@@ -29,6 +29,8 @@ from typing import List, Dict, Any, Set, Optional
 # Shared tool list for CLI and all messaging platform toolsets.
 # Edit this once to update all platforms simultaneously.
 _HERMES_CORE_TOOLS = [
+    # Profile-scoped and service-gated; absent unless a persistent specialist opts in.
+    "update_interaction_session",
     # Web
     "web_search", "web_extract",
     # Terminal + process management
@@ -182,7 +184,7 @@ TOOLSETS = {
         "tools": ["run_terminal_mutation"],
         "includes": [],
     },
-    
+
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
         "tools": ["skills_list", "skill_view", "skill_manage"],

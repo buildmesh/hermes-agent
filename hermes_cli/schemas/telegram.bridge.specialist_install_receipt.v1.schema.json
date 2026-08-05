@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tba.local/schemas/telegram.bridge.specialist_install_receipt.v1.schema.json",
+  "title": "Telegram Bridge Specialist Installation Receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profile", "profile_version", "mode", "installed_at", "manifest", "dependencies"],
+  "properties": {
+    "schema_version": {"const": "telegram.bridge.specialist_install_receipt.v1"},
+    "profile": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "profile_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"},
+    "mode": {"const": "production-copy"},
+    "installed_at": {"type": "integer", "minimum": 0},
+    "manifest": {"type": "object"},
+    "dependencies": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/dependency"}
+    }
+  },
+  "$defs": {
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package", "ownership", "resolved_path", "probed_version", "verified_digest"],
+      "properties": {
+        "package": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"},
+        "ownership": {"enum": ["external", "installer"]},
+        "resolved_path": {"type": "string", "pattern": "^/", "maxLength": 4096},
+        "probed_version": {
+          "anyOf": [
+            {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+            {"type": "null"}
+          ]
+        },
+        "verified_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

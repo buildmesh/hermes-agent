@@ -373,6 +373,14 @@ def _compute_tool_definitions(
             # (for token/cost reasons), but that should not strip the kanban
             # worker's completion/block/heartbeat surface.
             effective_enabled_toolsets.append("kanban")
+        if (
+            os.environ.get("HERMES_INTERACTION_SESSION_ENABLED") == "1"
+            and "interaction_session" not in effective_enabled_toolsets
+        ):
+            # Persistent specialist workers explicitly opted in by an installed
+            # manifest must receive the service-gated update tool even when the
+            # profile intentionally uses a narrow CLI toolset inventory.
+            effective_enabled_toolsets.append("interaction_session")
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)

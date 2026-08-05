@@ -165,6 +165,45 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    def test_additional_context_is_experimental_and_turn_scoped(self):
+        client = FakeClient()
+        initialized = {}
+        original_initialize = client.initialize
+
+        def initialize(**kwargs):
+            initialized.update(kwargs)
+            return original_initialize(**kwargs)
+
+        client.initialize = initialize
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        session = make_session(client, enable_experimental_additional_context=True)
+        context = {
+            "telegram_bridge.specialist_interaction_session": {
+                "kind": "untrusted", "value": '{"revision":1}',
+            }
+        }
+
+        session.run_turn("clean bridge prompt", additional_context=context, turn_timeout=2.0)
+
+        assert initialized["capabilities"] == {"experimentalApi": True}
+        params = next(params for method, params in client.requests if method == "turn/start")
+        assert params["input"] == [{"type": "text", "text": "clean bridge prompt"}]
+        assert params["additionalContext"] == context
+
+    def test_additional_context_fails_closed_without_experimental_negotiation(self):
+        client = FakeClient()
+        session = make_session(client)
+        result = session.run_turn(
+            "clean bridge prompt",
+            additional_context={"x": {"kind": "untrusted", "value": "state"}},
+            turn_timeout=2.0,
+        )
+        assert "additionalContext was not negotiated" in str(result.error)
+
     def test_app_server_injects_hermes_tools_mcp_overrides(self):
         client = FakeClient()
         captured = {}

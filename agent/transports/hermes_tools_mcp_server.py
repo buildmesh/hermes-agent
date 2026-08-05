@@ -87,6 +87,7 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "finalize_telegram_presentation",
     "run_terminal_workflow",
     "run_terminal_mutation",
+    "update_interaction_session",
     # Kanban worker handoff tools — gated on HERMES_KANBAN_TASK env var
     # (set by the kanban dispatcher when spawning a worker). Without these
     # in the callback, a worker spawned with openai_runtime=codex_app_server
