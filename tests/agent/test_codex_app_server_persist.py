@@ -76,6 +76,33 @@ def test_codex_success_flushes_and_reports_persisted():
     assert result["agent_persisted"] is True
 
 
+def test_unbound_profile_keeps_app_server_projection_and_persistence_path(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "hermes_cli.interaction_session.interaction_sessions_available",
+        lambda: False,
+    )
+    agent = _make_agent(session_db=None)
+    agent._interaction_session_additional_context = None
+    original_session = agent._codex_session
+    original_session._required_mcp_tools = frozenset()
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="legacy follow-up",
+        original_user_message="legacy follow-up",
+        messages=[{"role": "user", "content": "legacy follow-up"}],
+        effective_task_id="task-unbound",
+    )
+
+    assert result["completed"] is True
+    assert result["agent_persisted"] is True
+    assert agent._codex_session is original_session
+    assert agent._interaction_session_additional_context is None
+    original_session.run_turn.assert_called_once_with(user_input="legacy follow-up")
+
+
 def test_new_codex_session_receives_cached_system_prompt(monkeypatch):
     """The runtime must hand the already-assembled prompt to the session."""
     captured_kwargs = {}

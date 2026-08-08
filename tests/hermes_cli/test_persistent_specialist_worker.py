@@ -440,6 +440,19 @@ def v3_request(event_id: str, operation: str = "turn") -> dict:
     return value
 
 
+def assert_unbound_interaction_session_path(
+    worker: PersistentSpecialistWorker,
+    root: Path,
+    *responses: dict,
+) -> None:
+    assert worker._interaction_session_declaration is None
+    assert worker._active_interaction_session_turn is None
+    assert not worker._interaction_session_endpoint_path.exists()
+    assert not list(root.rglob("*interaction-session*"))
+    for response in responses:
+        assert "interaction_session_transition" not in response
+
+
 def install_test_presenter(root: Path) -> None:
     handler = root / "skills/test/present.py"
     schema = root / "contract/test.input.schema.json"
@@ -583,6 +596,7 @@ async def test_codex_app_server_projects_and_invokes_active_terminal_presenter(
         item for item in inventory["data"] if item["name"] == "hermes-tools"
     )
     assert "finalize_telegram_presentation" in hermes_server["tools"]
+    assert "update_interaction_session" not in hermes_server["tools"]
     assert result is not None
     assert result.get("isError") is not True
     assert any(
@@ -594,6 +608,7 @@ async def test_codex_app_server_projects_and_invokes_active_terminal_presenter(
         "finalize_telegram_presentation" not in item.get("tools", {})
         for item in downgraded_inventory["data"]
     )
+    assert_unbound_interaction_session_path(worker, tmp_path)
 
 
 @pytest.mark.asyncio
@@ -673,6 +688,7 @@ async def test_codex_app_server_projects_declared_terminal_workflow(
         item for item in inventory["data"] if item["name"] == "hermes-tools"
     )
     assert "run_terminal_workflow" in hermes_server["tools"]
+    assert "update_interaction_session" not in hermes_server["tools"]
     projection = CodexEventProjector().project({
         "method": "item/completed",
         "params": {"item": {
@@ -686,6 +702,7 @@ async def test_codex_app_server_projects_declared_terminal_workflow(
         }},
     }).messages
     assert projection[1]["terminal_workflow_completed"] is True
+    assert_unbound_interaction_session_path(worker, tmp_path)
 
 
 class TerminalPresenterAgent(FakeAgent):
@@ -1546,6 +1563,9 @@ async def test_native_responses_history_is_warm_and_reset_bounded(
         assert third["status"] == "completed"
         assert len(agents) == 2
         assert agents[1].histories == [[]]
+        assert_unbound_interaction_session_path(
+            worker, tmp_path, first, second, replay, reset, third,
+        )
     finally:
         await worker.stop()
 
@@ -1789,6 +1809,7 @@ async def test_v3_terminal_presenter_promotes_exact_output_and_replays(
     assert response["candidate_source"]["invocation_id"].startswith("present_")
     assert replay == response
     assert len(agents) == 1 and agents[0].turns == 1
+    assert_unbound_interaction_session_path(worker, tmp_path, response, replay)
 
 
 @pytest.mark.asyncio
@@ -1829,6 +1850,7 @@ async def test_v3_declared_terminal_workflow_promotes_exact_presenter_output(
     )
     assert ledger["terminal_workflow"]["workflow_id"] == "test-workflow"
     assert ledger["terminal_workflow"]["producer_sha256"]
+    assert_unbound_interaction_session_path(worker, tmp_path, response, replay)
 
 
 @pytest.mark.asyncio
@@ -1870,6 +1892,7 @@ async def test_v3_terminal_mutation_commits_once_and_promotes_presenter(
     )
     assert ledger["terminal_mutation"]["workflow_id"] == "test-create"
     assert ledger["terminal_mutation"]["outcome"] == "committed"
+    assert_unbound_interaction_session_path(worker, tmp_path, response, replay)
 
 
 @pytest.mark.asyncio
@@ -2301,6 +2324,15 @@ async def test_v2_app_server_correction_uses_isolated_companion_once_and_is_dura
     assert ledger["correction_attempt_count"] == 1
     assert ledger["corrected_candidate"] == correction["render_candidate"]["content"]
     assert ledger["correction_response"] == correction
+    assert_unbound_interaction_session_path(
+        worker,
+        tmp_path,
+        original,
+        correction,
+        correction_replay,
+        original_replay,
+        second_attempt,
+    )
 
 
 @pytest.mark.asyncio
@@ -2982,6 +3014,7 @@ async def test_default_worker_preflights_mcp_before_ready(
     try:
         assert calls == ["preflight", "codex"]
         assert worker.health()["ready"] is True
+        assert_unbound_interaction_session_path(worker, tmp_path)
     finally:
         await worker.stop()
 
@@ -3016,6 +3049,7 @@ async def test_native_worker_retains_hermes_mcp_without_starting_codex(
     try:
         assert calls == []
         assert worker._owns_profile_mcp_servers is True
+        assert_unbound_interaction_session_path(worker, tmp_path)
     finally:
         await worker.stop()
 

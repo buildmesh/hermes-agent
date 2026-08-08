@@ -174,8 +174,12 @@ def test_opted_app_server_fails_startup_when_schema_preflight_fails(tmp_path: Pa
         PersistentSpecialistWorker(profile_root=tmp_path, socket_path=tmp_path / "worker.sock", agent_id="reports")
 
 
-def test_model_tool_projection_is_service_gated(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_model_tool_and_toolset_inventory_is_unchanged_for_unbound_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from toolsets import get_all_toolsets, resolve_toolset
     from tools.registry import invalidate_check_fn_cache
 
     def names() -> set[str]:
@@ -184,11 +188,66 @@ def test_model_tool_projection_is_service_gated(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.delenv("HERMES_INTERACTION_SESSION_ENABLED", raising=False)
     invalidate_check_fn_cache()
     _clear_tool_defs_cache()
-    assert "update_interaction_session" not in names()
+    baseline_names = names()
+    baseline_toolsets = set(get_all_toolsets())
+    baseline_terminal = resolve_toolset("terminal")
+    assert "update_interaction_session" not in baseline_names
+
     monkeypatch.setenv("HERMES_INTERACTION_SESSION_ENABLED", "1")
     invalidate_check_fn_cache()
     _clear_tool_defs_cache()
     assert "update_interaction_session" in names()
+
+    PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "worker.sock",
+        agent_id="unbound-inventory",
+        agent_factory=lambda: None,
+    )
+    assert "HERMES_INTERACTION_SESSION_ENABLED" not in os.environ
+    assert names() == baseline_names
+    assert set(get_all_toolsets()) == baseline_toolsets
+    assert resolve_toolset("terminal") == baseline_terminal
+
+
+@pytest.mark.asyncio
+async def test_unbound_profile_hello_withholds_session_capability(tmp_path: Path) -> None:
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "worker.sock",
+        agent_id="unbound-hello",
+        agent_factory=lambda: SimpleNamespace(close=lambda: None),
+    )
+    await worker.start()
+    serve = asyncio.create_task(worker.serve_forever())
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(worker.socket_path))
+        writer.write(json.dumps({
+            "protocol_version": "telegram.bridge.persistent_service.v3",
+            "request_id": "req_unbound_hello",
+            "operation": "hello",
+            "client": {"name": "telegram-bridge", "revision": "test"},
+            "accepted_capabilities": ["specialist_interaction_session.v1"],
+        }).encode() + b"\n")
+        await writer.drain()
+        response = json.loads(await reader.readline())
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        serve.cancel()
+        await asyncio.gather(serve, return_exceptions=True)
+        await worker.stop()
+
+    assert response["supported_protocol_versions"] == [
+        "telegram.bridge.persistent_service.v1",
+        "telegram.bridge.persistent_service.v2",
+        "telegram.bridge.persistent_service.v3",
+    ]
+    assert "specialist_interaction_session.v1" not in response["capabilities"]
+    assert "interaction_session_transition" not in response
+    assert worker._interaction_session_declaration is None
+    assert not worker._interaction_session_endpoint_path.exists()
+    assert not list(tmp_path.rglob("*interaction-session*"))
 
 
 @pytest.mark.parametrize(
