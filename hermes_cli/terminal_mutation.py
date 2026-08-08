@@ -59,6 +59,7 @@ class TerminalMutationError(TerminalPresenterError):
     def __init__(self, code: str, message: str, *, sealed: bool = False) -> None:
         super().__init__(code, message)
         self.sealed = sealed
+        self.committed_evidence: dict[str, str] | None = None
 
 
 def _now() -> str:
@@ -440,13 +441,18 @@ def _execute_terminal_mutation_locked(
                     "mutation journal result is invalid",
                     sealed=True,
                 )
-            return _prepare_mutation_presentation(
-                root,
-                mutation,
-                record,
-                journal_path,
-                result,
-            )
+            try:
+                return _prepare_mutation_presentation(
+                    root,
+                    mutation,
+                    record,
+                    journal_path,
+                    result,
+                )
+            except TerminalMutationError as exc:
+                if outcome == "committed":
+                    exc.committed_evidence = _committed_evidence(record)
+                raise
         raise TerminalMutationError(
             "MUTATION_OUTCOME_UNKNOWN",
             "mutation outcome is unknown; inspect authoritative domain state",
@@ -516,12 +522,17 @@ def _execute_terminal_mutation_locked(
             code = "MUTATION_OUTCOME_UNKNOWN"
             message = "mutation outcome is unknown"
         raise TerminalMutationError(code, message, sealed=True) from exc
-    directive = handler_result.get("session_context")
+    # Only an explicitly resolved interaction-session consumer may interpret
+    # this producer field as a control directive.  For every other mutation it
+    # is backward-compatible domain output.
+    directive = (
+        handler_result.get("session_context")
+        if session_directive_resolver is not None
+        else None
+    )
     transition = None
     transition_error = None
-    if directive is not None and session_directive_resolver is None:
-        transition_error = "SESSION_TRANSITION_INVALID"
-    elif session_directive_resolver is not None:
+    if session_directive_resolver is not None:
         try:
             transition = session_directive_resolver(directive)
         except Exception as exc:
@@ -542,13 +553,27 @@ def _execute_terminal_mutation_locked(
             "mutation result could not be persisted",
             sealed=True,
         ) from exc
-    return _prepare_mutation_presentation(
-        root,
-        mutation,
-        record,
-        journal_path,
-        result,
-    )
+    try:
+        return _prepare_mutation_presentation(
+            root,
+            mutation,
+            record,
+            journal_path,
+            result,
+        )
+    except TerminalMutationError as exc:
+        if outcome == "committed":
+            exc.committed_evidence = _committed_evidence(record)
+        raise
+
+
+def _committed_evidence(record: dict[str, Any]) -> dict[str, str]:
+    return {
+        "outcome": "committed",
+        "operation_id": str(record["operation_id"]),
+        "workflow_id": str(record["workflow_id"]),
+        "workflow_version": str(record["workflow_version"]),
+    }
 
 
 def _prepare_mutation_presentation(

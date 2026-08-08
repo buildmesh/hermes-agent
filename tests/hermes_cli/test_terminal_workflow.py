@@ -163,6 +163,32 @@ def test_session_consumer_receives_runtime_wrapper_and_prepares_directive_before
     assert "session_context" not in result["presenter_input"]
 
 
+def test_non_consumer_session_context_field_remains_domain_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_workflow(tmp_path)
+    import hermes_cli.terminal_workflow as module
+
+    monkeypatch.setattr(
+        module,
+        "_run_program",
+        lambda *args, **kwargs: {
+            "outcome": "terminal_ready",
+            "result": {"payloads": [], "session_context": {"domain": "value"}},
+            "model_result": None,
+            "session_context": {"operation": "clear"},
+        },
+    )
+    result = execute_terminal_workflow(
+        tmp_path,
+        "test-workflow",
+        {"outcome": "terminal_ready", "payloads": []},
+    )
+    assert result["session_directive"] is None
+    assert result["session_transition"] is None
+    assert result["presenter_input"]["session_context"] == {"domain": "value"}
+
+
 @pytest.mark.parametrize("mapper", [False, True])
 def test_executes_terminal_ready_with_optional_profile_mapper(
     tmp_path: Path,

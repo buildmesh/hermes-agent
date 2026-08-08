@@ -507,7 +507,7 @@ def _validate_v3_response(response: dict[str, Any]) -> None:
         "event_id", "correction_attempt_id", "requested_model", "requested_provider", "requested_api_mode",
         "requested_reasoning_effort", "runtime_instance_id", "conversation_instance_id", "trace_id",
         "runtime_model", "runtime_provider", "runtime_api_mode", "runtime_reasoning_effort", "framework", "profile",
-        "supported_protocol_versions", "capabilities", "interaction_session_transition", "candidate_source",
+        "supported_protocol_versions", "capabilities", "interaction_session_transition", "terminal_mutation_evidence", "candidate_source",
         "render_candidate", "timing_ms", "health", "error",
     }
     if set(response) - allowed or not {"protocol_version", "request_id", "operation", "status"}.issubset(response):
@@ -582,9 +582,46 @@ def _validate_v3_response(response: dict[str, Any]) -> None:
         if status == "completed" and (response.get("execution_state") != "completed" or response.get("presentation_state") != "correction_candidate_unvalidated" or not {"render_candidate", "candidate_source"}.issubset(response) or response["candidate_source"].get("kind") != "model_correction"):
             raise ValueError("completed correction response is invalid")
     if "interaction_session_transition" in response:
-        if response.get("operation") != "turn" or response.get("status") != "completed":
+        transition = response["interaction_session_transition"]
+        failed_committed_mutation = (
+            response.get("operation") == "turn"
+            and response.get("status") == "failed"
+            and response.get("execution_state") == "completed"
+            and isinstance(transition, dict)
+            and transition.get("operation") == "quarantine"
+            and "terminal_mutation_evidence" in response
+        )
+        if not (
+            response.get("operation") == "turn"
+            and response.get("status") == "completed"
+        ) and not failed_committed_mutation:
             raise ValueError("interaction-session transition is invalid on this response")
-        _validate_interaction_session_transition_wire(response["interaction_session_transition"])
+        _validate_interaction_session_transition_wire(transition)
+    evidence = response.get("terminal_mutation_evidence")
+    if evidence is not None:
+        if (
+            not isinstance(evidence, dict)
+            or set(evidence) != {"outcome", "operation_id", "workflow_id", "workflow_version"}
+            or evidence.get("outcome") != "committed"
+            or not isinstance(evidence.get("operation_id"), str)
+            or re.fullmatch(r"tmut_[0-9a-f]{64}", evidence["operation_id"]) is None
+            or not isinstance(evidence.get("workflow_id"), str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", evidence["workflow_id"]) is None
+            or not isinstance(evidence.get("workflow_version"), str)
+            or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", evidence["workflow_version"]) is None
+            or response.get("operation") != "turn"
+            or response.get("status") != "failed"
+            or response.get("execution_state") != "completed"
+            or not isinstance(response.get("interaction_session_transition"), dict)
+            or response["interaction_session_transition"].get("operation") != "quarantine"
+        ):
+            raise ValueError("invalid terminal mutation evidence")
+    elif (
+        response.get("status") == "failed"
+        and isinstance(response.get("interaction_session_transition"), dict)
+        and response["interaction_session_transition"].get("operation") == "quarantine"
+    ):
+        raise ValueError("committed mutation quarantine is missing evidence")
 
 
 def _extract_render_payloads(text: str) -> list[dict[str, Any]]:
@@ -1150,6 +1187,34 @@ class PersistentSpecialistWorker:
             "prior_revision": snapshot["revision"],
         }
 
+    def _committed_mutation_failure_fields(self) -> dict[str, Any]:
+        """Return the closed v3 proof needed to quarantine a stale session.
+
+        The evidence is installed only after the durable mutation journal says
+        ``committed``.  Keeping it on the active turn also means a presenter or
+        finality failure can report the result without re-running the handler.
+        """
+        active = self._active_presenter_turn
+        if active is None:
+            return {}
+        evidence = active.get("committed_mutation_evidence")
+        transition = self._committed_quarantine_transition()
+        if not isinstance(evidence, dict) or transition is None:
+            return {}
+        return {
+            "interaction_session_transition": transition,
+            "terminal_mutation_evidence": copy.deepcopy(evidence),
+        }
+
+    def _set_session_renewal_suppressed(self, suppressed: bool) -> None:
+        active = self._active_interaction_session_turn
+        if active is None:
+            return
+        if suppressed:
+            active["suppress_session_renewal"] = True
+        else:
+            active.pop("suppress_session_renewal", None)
+
     async def _handle_interaction_session_request(self, request: dict[str, Any]) -> dict[str, Any]:
         active = self._active_interaction_session_turn
         operation = request.get("operation")
@@ -1580,7 +1645,11 @@ class PersistentSpecialistWorker:
                     active["mutation_sealed"] = True
                     active["mutation_error_code"] = exc.code
                     if consumer_context is not None:
-                        active["suppress_session_renewal"] = True
+                        self._set_session_renewal_suppressed(True)
+                        if isinstance(exc.committed_evidence, dict):
+                            active["committed_mutation_evidence"] = copy.deepcopy(
+                                exc.committed_evidence
+                            )
                 return {
                     "protocol_version": PRESENTER_PROTOCOL,
                     "status": "failed",
@@ -1592,14 +1661,21 @@ class PersistentSpecialistWorker:
                 transition = mutation_result.get("session_transition")
                 transition_error = mutation_result.get("session_transition_error")
                 if mutation_result["outcome"] == "committed":
+                    active["committed_mutation_evidence"] = {
+                        "outcome": "committed",
+                        "operation_id": mutation_result["operation_id"],
+                        "workflow_id": mutation_result["workflow_id"],
+                        "workflow_version": mutation_result["workflow_version"],
+                    }
                     if transition_error is not None:
                         transition = self._committed_quarantine_transition()
                         active["session_update_error"] = transition_error
+                        active["mutation_error_code"] = transition_error
                     active["transition"] = transition
                 else:
                     # A failed/conflicting domain mutation cannot advance or renew
                     # the context from which it was attempted.
-                    active["suppress_session_renewal"] = True
+                    self._set_session_renewal_suppressed(True)
             try:
                 artifact = await asyncio.to_thread(
                     execute_terminal_presenter,
@@ -1640,6 +1716,8 @@ class PersistentSpecialistWorker:
                 record["response"] = response
                 self._log_terminal_response("turn_failed", request, response)
             except TerminalPresenterError as exc:
+                if consumer_context is not None:
+                    self._set_session_renewal_suppressed(True)
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(
                         record_terminal_mutation_presentation,
@@ -1676,6 +1754,8 @@ class PersistentSpecialistWorker:
                 active["mutation_error_code"] = (
                     "MUTATION_PRESENTATION_FAILED"
                 )
+                if consumer_context is not None:
+                    self._set_session_renewal_suppressed(True)
                 return {
                     "protocol_version": PRESENTER_PROTOCOL,
                     "status": "failed",
@@ -1783,6 +1863,8 @@ class PersistentSpecialistWorker:
                     ),
                 )
             except TerminalWorkflowError as exc:
+                if consumer_context is not None:
+                    self._set_session_renewal_suppressed(True)
                 if isinstance(exc.checkpoint, dict):
                     active["workflow_checkpoint"] = exc.checkpoint
                 return {
@@ -1803,6 +1885,11 @@ class PersistentSpecialistWorker:
                 }
             active["workflow_checkpoint"] = workflow_result["checkpoint"]
             prepared_transition = workflow_result.get("session_transition")
+            if consumer_context is not None:
+                # A deterministic retry that has reached a fresh valid
+                # terminal result may renew/transition normally.  A new mapper
+                # or presenter failure below suppresses renewal again.
+                self._set_session_renewal_suppressed(False)
             try:
                 artifact = await asyncio.to_thread(
                     execute_terminal_presenter,
@@ -1811,6 +1898,8 @@ class PersistentSpecialistWorker:
                     workflow_result["presenter_input"],
                 )
             except TerminalPresenterError as exc:
+                if consumer_context is not None:
+                    self._set_session_renewal_suppressed(True)
                 return {
                     "protocol_version": PRESENTER_PROTOCOL,
                     "status": "failed",
@@ -2451,6 +2540,16 @@ class PersistentSpecialistWorker:
                             sealed=True,
                         )
                     if isinstance(artifact, dict):
+                        if (
+                            active_presenter.get("committed_mutation_evidence")
+                            is not None
+                            and active_presenter.get("session_update_error")
+                            is not None
+                        ):
+                            raise TerminalPresenterError(
+                                str(active_presenter["session_update_error"]),
+                                "committed mutation produced an invalid interaction-session transition",
+                            )
                         if active_presenter.get("violation"):
                             raise TerminalPresenterError(
                                 "TERMINAL_PRESENTER_NOT_FINAL",
@@ -2588,8 +2687,16 @@ class PersistentSpecialistWorker:
                         ),
                     ),
                 )
+                response.update(self._committed_mutation_failure_fields())
                 record["state"] = "failed"
                 record["execution_state"] = "completed"
+                if "interaction_session_transition" in response:
+                    record["interaction_session_transition"] = response[
+                        "interaction_session_transition"
+                    ]
+                    record["terminal_mutation_evidence"] = response[
+                        "terminal_mutation_evidence"
+                    ]
                 record["response"] = response
                 self._log_terminal_response("turn_failed", request, response)
             except PersistentAgentStartupError as exc:

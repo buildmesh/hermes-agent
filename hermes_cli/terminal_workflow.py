@@ -450,20 +450,21 @@ def execute_terminal_workflow(
         domain_result = producer_result.get("result")
         if not isinstance(domain_result, dict):
             raise TerminalWorkflowError("WORKFLOW_OUTPUT_INVALID", "terminal result must be an object")
-        directive = producer_result.get("session_context")
+        # ``session_context`` remains ordinary producer-domain output unless
+        # this exact workflow was resolved as an interaction-session consumer.
+        # Older profiles are allowed to use that field name in their result
+        # contract and must not acquire control semantics by upgrading Hermes.
+        directive = (
+            producer_result.get("session_context")
+            if session_directive_resolver is not None
+            else None
+        )
         checkpoint = {
             "workflow_id": workflow.workflow_id,
             "domain_result": domain_result,
             "input_sha256": input_sha256,
             "session_directive": directive,
         }
-        if directive is not None and session_directive_resolver is None:
-            checkpoint["session_transition_error"] = "SESSION_TRANSITION_INVALID"
-            raise TerminalWorkflowError(
-                "SESSION_TRANSITION_INVALID",
-                "workflow returned a session directive without a declared consumer",
-                checkpoint=checkpoint,
-            )
         try:
             transition = session_directive_resolver(directive) if session_directive_resolver else None
         except Exception as exc:

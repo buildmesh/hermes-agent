@@ -232,6 +232,79 @@ def test_session_directive_is_journaled_with_outcome_and_replay_never_reinterpre
     assert calls == ["handler"]
 
 
+def test_non_consumer_session_context_field_is_not_a_directive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_mutation(tmp_path)
+    import hermes_cli.terminal_mutation as module
+
+    monkeypatch.setattr(
+        module,
+        "_run_program",
+        lambda *args, **kwargs: {
+            "outcome": "committed",
+            "result": {"value": "note", "record_id": "rec-1"},
+            "session_context": {"domain": "value"},
+        },
+    )
+    result = execute(tmp_path)
+    journal = json.loads(Path(result["journal_path"]).read_text())
+    assert result["session_transition"] is None
+    assert result["session_transition_error"] is None
+    assert journal["session_directive_sha256"] is None
+
+
+def test_committed_mapper_failure_replays_evidence_without_handler_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_mutation(tmp_path)
+    import hermes_cli.terminal_mutation as module
+
+    calls: list[str] = []
+
+    def committed_handler(_root, _program, _value, *, label):
+        calls.append(label)
+        return {
+            "outcome": "committed",
+            "result": {"value": "note", "record_id": "rec-1"},
+            "session_context": {"operation": "clear"},
+        }
+
+    monkeypatch.setattr(module, "_run_program", committed_handler)
+    monkeypatch.setattr(
+        module,
+        "_prepare_mutation_presentation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            TerminalMutationError(
+                "MUTATION_PRESENTATION_FAILED", "mapper failed", sealed=True
+            )
+        ),
+    )
+    context = {"session_id": "sctx_test", "revision": 2, "state": {"draft": True}}
+    kwargs = dict(
+        specialist_id="test-agent",
+        conversation_id="conv-test",
+        event_id="evt-committed-failure",
+        workflow_id="test-create",
+        workflow_input={"value": "note"},
+        session_context=context,
+        session_directive_resolver=lambda directive: {"operation": directive["operation"]},
+    )
+    with pytest.raises(TerminalMutationError) as first:
+        execute_terminal_mutation(tmp_path, **kwargs)
+    assert first.value.committed_evidence == {
+        "outcome": "committed",
+        "operation_id": first.value.committed_evidence["operation_id"],
+        "workflow_id": "test-create",
+        "workflow_version": "1.0.0",
+    }
+
+    with pytest.raises(TerminalMutationError) as replay:
+        execute_terminal_mutation(tmp_path, **kwargs)
+    assert replay.value.committed_evidence == first.value.committed_evidence
+    assert calls == ["mutation handler"]
+
+
 def test_loads_transactional_operation_id_declaration(
     tmp_path: Path,
 ) -> None:
