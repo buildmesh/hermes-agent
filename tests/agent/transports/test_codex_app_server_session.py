@@ -236,6 +236,36 @@ class TestLifecycle:
         assert "HERMES_MCP_ALLOWED_TOOLS" in " ".join(extra_args)
         assert "finalize_telegram_presentation" in " ".join(extra_args)
 
+    def test_app_server_projects_interaction_session_gate_to_mcp_child(self):
+        client = FakeClient()
+        captured = {}
+        client._request_handler = lambda method, _params: (
+            {
+                "data": [{
+                    "name": "hermes-tools",
+                    "tools": {"update_interaction_session": {}},
+                }]
+            }
+            if method == "mcpServerStatus/list"
+            else {"thread": {"id": "thread-fake-session"}}
+        )
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=factory,
+            required_mcp_tools={"update_interaction_session"},
+        )
+        session.ensure_started()
+
+        joined = " ".join(captured["extra_args"])
+        assert "HERMES_MCP_ALLOWED_TOOLS" in joined
+        assert "update_interaction_session" in joined
+        assert "HERMES_INTERACTION_SESSION_ENABLED" in joined
+
     def test_profile_mcp_projection_sets_process_local_enable_flags(self):
         client = FakeClient()
         captured = {}

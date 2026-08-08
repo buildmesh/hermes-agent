@@ -1222,6 +1222,16 @@ class PersistentSpecialistWorker:
             {"context_type", "state"} if operation == "replace" else set()
         )
         if set(request) != allowed or operation not in {"replace", "clear"} or active is None or request.get("turn_token") != active.get("turn_token"):
+            self._log_event(
+                "interaction_session_callback_rejected",
+                request_shape_valid=set(request) == allowed,
+                operation_valid=operation in {"replace", "clear"},
+                active_turn=active is not None,
+                turn_token_matches=(
+                    active is not None
+                    and request.get("turn_token") == active.get("turn_token")
+                ),
+            )
             return {"protocol_version": INTERACTION_SESSION_PROTOCOL, "status": "failed", "error": {"code": "SESSION_CONTEXT_UNAVAILABLE", "message": "no eligible interaction-session turn is active"}}
         control = active["control"]
         transition: dict[str, Any] = {

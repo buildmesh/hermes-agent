@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import shutil
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ import pytest
 from hermes_cli.interaction_session import (
     InteractionSessionError,
     canonical_session_state,
+    invoke_interaction_session_endpoint,
     load_interaction_session_declaration,
     require_codex_additional_context_support,
     validate_turn_control,
@@ -494,6 +496,88 @@ async def test_real_socket_v3_negotiates_and_scopes_endpoint(tmp_path: Path) -> 
         assert observed["endpoint_during_turn"] is True
         assert not (tmp_path / "state/persistent-runtime/interaction-session-endpoint.json").exists()
     finally:
+        serve.cancel()
+        await asyncio.gather(serve, return_exceptions=True)
+        await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_real_socket_session_callback_updates_active_model_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declaration, _ = install_declaration(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n  api_mode: codex_responses\n",
+        encoding="utf-8",
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Agent:
+        api_mode = "codex_responses"
+
+        def run_conversation(self, prompt, conversation_history=None):
+            entered.set()
+            assert release.wait(timeout=5)
+            return {
+                "completed": True,
+                "final_response": "[]",
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "[]"},
+                ],
+            }
+
+        def close(self):
+            return None
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "worker.sock",
+        agent_id="reports",
+        agent_factory=Agent,
+    )
+    await worker.start()
+    serve = asyncio.create_task(worker.serve_forever())
+    try:
+        turn = {
+            "protocol_version": "telegram.bridge.persistent_service.v3",
+            "request_id": "req_callback_turn",
+            "operation": "turn",
+            "event_id": "callback-turn",
+            "conversation_id": "conv_" + "c" * 64,
+            "deadline": "2099-01-01T00:00:00+00:00",
+            "envelope": {"event_id": "callback-turn"},
+            "accepted_capabilities": ["specialist_interaction_session.v1"],
+            "interaction_session": {
+                "profile": "reports",
+                "profile_version": "1.0.0",
+                "installed_profile_sha256": declaration.installed_profile_sha256,
+                "conversation_generation": 0,
+                "active": False,
+            },
+            "_interaction_session_negotiated": True,
+        }
+        turn_task = asyncio.create_task(worker.handle_request(turn))
+        assert await asyncio.to_thread(entered.wait, 5)
+
+        callback = json.loads(await asyncio.to_thread(
+            invoke_interaction_session_endpoint,
+            "replace",
+            "report",
+            {"period": "2026-Q4"},
+        ))
+        release.set()
+        response = await turn_task
+
+        assert callback["status"] == "completed"
+        assert response["interaction_session_transition"] == callback["transition"]
+        assert response["interaction_session_transition"]["revision"] == 1
+    finally:
+        release.set()
         serve.cancel()
         await asyncio.gather(serve, return_exceptions=True)
         await worker.stop()

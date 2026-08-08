@@ -214,6 +214,27 @@ def _build_server() -> Any:
                 _dispatch_terminal_operation.__doc__ = description
                 return _dispatch_terminal_operation
 
+            if tool_name == "update_interaction_session":
+                def _dispatch_interaction_session(
+                    operation: str,
+                    context_type: Optional[str] = None,
+                    state: Optional[dict[str, Any]] = None,
+                ) -> str:
+                    try:
+                        arguments: dict[str, Any] = {"operation": operation}
+                        if context_type is not None:
+                            arguments["context_type"] = context_type
+                        if state is not None:
+                            arguments["state"] = state
+                        return handle_function_call(tool_name, arguments)
+                    except Exception as exc:
+                        logger.exception("tool %s raised", tool_name)
+                        return json.dumps({"error": str(exc), "tool": tool_name})
+
+                _dispatch_interaction_session.__name__ = tool_name
+                _dispatch_interaction_session.__doc__ = description
+                return _dispatch_interaction_session
+
             def _dispatch(**kwargs: Any) -> str:
                 try:
                     return handle_function_call(tool_name, kwargs or {})

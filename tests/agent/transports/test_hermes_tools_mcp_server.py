@@ -50,6 +50,7 @@ def _codex_mcp_tool_names(
     profile_root: Path,
     *,
     allowed_tools: set[str] | None = None,
+    interaction_sessions: bool = False,
 ) -> set[str]:
     script = (
         "import json\n"
@@ -61,6 +62,8 @@ def _codex_mcp_tool_names(
     env["HERMES_HOME"] = str(profile_root)
     if allowed_tools is not None:
         env["HERMES_MCP_ALLOWED_TOOLS"] = ",".join(sorted(allowed_tools))
+    if interaction_sessions:
+        env["HERMES_INTERACTION_SESSION_ENABLED"] = "1"
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=Path(__file__).resolve().parents[3],
@@ -94,6 +97,71 @@ class TestModuleSurface:
             tmp_path,
             allowed_tools={"finalize_telegram_presentation"},
         ) == {"finalize_telegram_presentation"}
+
+    def test_process_allowlist_projects_session_tool_with_validated_gate(
+        self, tmp_path: Path
+    ):
+        assert _codex_mcp_tool_names(
+            tmp_path,
+            allowed_tools={"update_interaction_session"},
+            interaction_sessions=True,
+        ) == {"update_interaction_session"}
+
+    def test_process_allowlist_cannot_enable_session_tool_without_gate(
+        self, tmp_path: Path
+    ):
+        assert _codex_mcp_tool_names(
+            tmp_path,
+            allowed_tools={"update_interaction_session"},
+        ) == set()
+
+    def test_session_tool_projects_flat_declared_arguments(
+        self, tmp_path: Path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_INTERACTION_SESSION_ENABLED", "1")
+        monkeypatch.setenv(
+            "HERMES_MCP_ALLOWED_TOOLS",
+            "update_interaction_session",
+        )
+        from agent.transports.hermes_tools_mcp_server import _build_server
+
+        tool = _build_server()._tool_manager.get_tool(
+            "update_interaction_session"
+        )
+
+        assert set(tool.parameters["properties"]) == {
+            "operation",
+            "context_type",
+            "state",
+        }
+        assert tool.parameters["required"] == ["operation"]
+        assert "kwargs" not in tool.parameters["properties"]
+
+        captured = {}
+
+        def invoke(operation, context_type, state):
+            captured.update(
+                operation=operation,
+                context_type=context_type,
+                state=state,
+            )
+            return '{"status":"completed"}'
+
+        monkeypatch.setattr(
+            "tools.interaction_session_tool.invoke_interaction_session_endpoint",
+            invoke,
+        )
+        assert tool.fn(
+            operation="replace",
+            context_type="report",
+            state={"period": "2026-Q4"},
+        ) == '{"status":"completed"}'
+        assert captured == {
+            "operation": "replace",
+            "context_type": "report",
+            "state": {"period": "2026-Q4"},
+        }
 
     def test_module_imports_clean(self):
         from agent.transports import hermes_tools_mcp_server as m

@@ -693,6 +693,12 @@ def hermes_tools_mcp_app_server_args(
             **entry.get("env", {}),
             "HERMES_MCP_ALLOWED_TOOLS": ",".join(sorted(allowed_tools)),
         }
+        if "update_interaction_session" in allowed_tools:
+            # The MCP server is a fresh subprocess and rebuilds the model-tool
+            # registry there. Preserve the worker's validated service gate so
+            # the allowlisted session tool is actually registered in that
+            # child; the tool remains absent for every other projection.
+            entry["env"]["HERMES_INTERACTION_SESSION_ENABLED"] = "1"
     prefix = f"mcp_servers.{_quote_key('hermes-tools')}"
     args: list[str] = []
     for key, value in entry.items():
