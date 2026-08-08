@@ -182,7 +182,7 @@ def execute(root: Path, value: str = "note") -> dict:
     )
 
 
-def test_session_directive_is_journaled_with_outcome_and_replay_never_reinterprets(
+def test_both_role_session_directive_is_journaled_and_replay_never_reinterprets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     install_mutation(tmp_path)
@@ -232,7 +232,55 @@ def test_session_directive_is_journaled_with_outcome_and_replay_never_reinterpre
     assert calls == ["handler"]
 
 
-def test_non_consumer_session_context_field_is_not_a_directive(
+def test_producer_only_mutation_keeps_legacy_input_and_replays_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_mutation(tmp_path)
+    import hermes_cli.terminal_mutation as module
+
+    observed = []
+    monkeypatch.setattr(
+        module,
+        "_run_program",
+        lambda root, program, value, *, label: (
+            observed.append(value)
+            or {
+                "outcome": "committed",
+                "result": {"value": "note", "record_id": "rec-1"},
+                "session_context": {
+                    "operation": "replace",
+                    "context_type": "report",
+                    "context_version": "1.0.0",
+                    "state": {"record_id": "rec-1"},
+                },
+            }
+        ),
+    )
+    kwargs = dict(
+        specialist_id="test-agent",
+        conversation_id="conv-test",
+        event_id="evt-producer-only",
+        workflow_id="test-create",
+        workflow_input={"value": "note"},
+        session_directive_resolver=lambda directive: {
+            "operation": directive["operation"],
+            "revision": 1,
+        },
+    )
+    result = execute_terminal_mutation(tmp_path, **kwargs)
+    assert len(observed) == 1
+    assert observed[0]["schema_version"] == "hermes.terminal_mutation.invoke.v1"
+    assert observed[0]["input"] == {"value": "note"}
+    assert "session_context" not in observed[0]
+    assert result["session_transition"] == {"operation": "replace", "revision": 1}
+
+    monkeypatch.setattr(module, "_run_program", lambda *args, **kwargs: pytest.fail("handler reran"))
+    replay = execute_terminal_mutation(tmp_path, **kwargs)
+    assert replay["session_transition"] == result["session_transition"]
+    assert len(observed) == 1
+
+
+def test_non_producer_session_context_field_is_not_a_directive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     install_mutation(tmp_path)

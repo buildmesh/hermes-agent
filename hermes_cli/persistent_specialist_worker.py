@@ -62,6 +62,7 @@ from hermes_cli.interaction_session import (
     canonical_session_state,
     load_interaction_session_declaration,
     resolve_consumer_context,
+    resolve_producer_context,
     require_codex_additional_context_support,
     terminal_consumer_context,
     terminal_session_transition,
@@ -612,8 +613,13 @@ def _validate_v3_response(response: dict[str, Any]) -> None:
             or response.get("operation") != "turn"
             or response.get("status") != "failed"
             or response.get("execution_state") != "completed"
-            or not isinstance(response.get("interaction_session_transition"), dict)
-            or response["interaction_session_transition"].get("operation") != "quarantine"
+            or (
+                response.get("interaction_session_transition") is not None
+                and (
+                    not isinstance(response["interaction_session_transition"], dict)
+                    or response["interaction_session_transition"].get("operation") != "quarantine"
+                )
+            )
         ):
             raise ValueError("invalid terminal mutation evidence")
     elif (
@@ -971,14 +977,15 @@ class PersistentSpecialistWorker:
             self._terminal_workflow_runtime_supported = False
             self._terminal_mutation_runtime_supported = False
             self._interaction_session_runtime_supported = False
-        supported_consumers: set[tuple[str, str]] = set()
+        supported_terminal_operations: set[tuple[str, str]] = set()
         if self._terminal_workflow_runtime_supported:
-            supported_consumers.update(('terminal_workflow', workflow_id) for workflow_id in self._terminal_workflows)
+            supported_terminal_operations.update(('terminal_workflow', workflow_id) for workflow_id in self._terminal_workflows)
         if self._terminal_mutation_runtime_supported:
-            supported_consumers.update(('terminal_mutation', workflow_id) for workflow_id in self._terminal_mutations)
+            supported_terminal_operations.update(('terminal_mutation', workflow_id) for workflow_id in self._terminal_mutations)
         self._interaction_session_declaration = load_interaction_session_declaration(
             self.profile_root,
-            supported_consumers=supported_consumers,
+            supported_producers=supported_terminal_operations,
+            supported_consumers=supported_terminal_operations,
         )
         if self._interaction_session_declaration is not None and not self._interaction_session_runtime_supported:
             raise InteractionSessionError(
@@ -1131,31 +1138,40 @@ class PersistentSpecialistWorker:
         self._active_interaction_session_turn = None
         self._interaction_session_endpoint_path.unlink(missing_ok=True)
 
-    def _terminal_consumer_invocation(
+    def _terminal_session_invocation(
         self,
         kind: str,
         workflow_id: str,
-    ) -> tuple[dict[str, Any] | None, Any]:
-        context = resolve_consumer_context(
+    ) -> tuple[dict[str, Any] | None, Any, Any]:
+        consumer_context = resolve_consumer_context(
             self._interaction_session_declaration,
             kind,
             workflow_id,
         )
-        if context is None:
-            return None, None
+        producer_context = resolve_producer_context(
+            self._interaction_session_declaration,
+            kind,
+            workflow_id,
+        )
+        if consumer_context is None and producer_context is None:
+            return None, None, None
         active = self._active_interaction_session_turn
         if active is None:
             raise InteractionSessionError(
                 "SESSION_CONTEXT_REQUIRED",
-                "the declared terminal consumer requires an interaction-session turn",
+                "the declared terminal session operation requires an interaction-session turn",
             )
-        if active.get("transition") is not None:
+        if producer_context is not None and active.get("transition") is not None:
             raise InteractionSessionError(
                 "SESSION_TRANSITION_ALREADY_PREPARED",
                 "a session transition is already prepared for this event",
             )
-        value = terminal_consumer_context(active["control"], context)
-        return value, context
+        session_context = (
+            terminal_consumer_context(active["control"], consumer_context)
+            if consumer_context is not None
+            else None
+        )
+        return session_context, consumer_context, producer_context
 
     def _terminal_directive_resolver(self, context: Any):
         active = self._active_interaction_session_turn
@@ -1198,13 +1214,15 @@ class PersistentSpecialistWorker:
         if active is None:
             return {}
         evidence = active.get("committed_mutation_evidence")
-        transition = self._committed_quarantine_transition()
-        if not isinstance(evidence, dict) or transition is None:
+        if not isinstance(evidence, dict):
             return {}
-        return {
-            "interaction_session_transition": transition,
+        fields = {
             "terminal_mutation_evidence": copy.deepcopy(evidence),
         }
+        transition = self._committed_quarantine_transition()
+        if transition is not None:
+            fields["interaction_session_transition"] = transition
+        return fields
 
     def _set_session_renewal_suppressed(self, suppressed: bool) -> None:
         active = self._active_interaction_session_turn
@@ -1600,6 +1618,9 @@ class PersistentSpecialistWorker:
                 },
             }
         if operation == "mutation":
+            # A terminal operation earns implicit renewal only after its
+            # successful outcome and presentation are known.
+            self._set_session_renewal_suppressed(True)
             if active.get("terminal_mutation") is not True:
                 return {
                     "protocol_version": PRESENTER_PROTOCOL,
@@ -1625,7 +1646,7 @@ class PersistentSpecialistWorker:
                     },
                 }
             try:
-                session_context, consumer_context = self._terminal_consumer_invocation(
+                session_context, consumer_context, producer_context = self._terminal_session_invocation(
                     "terminal_mutation", workflow_id
                 )
             except InteractionSessionError as exc:
@@ -1646,20 +1667,19 @@ class PersistentSpecialistWorker:
                     workflow_input=workflow_input,
                     session_context=session_context,
                     session_directive_resolver=(
-                        self._terminal_directive_resolver(consumer_context)
-                        if consumer_context is not None else None
+                        self._terminal_directive_resolver(producer_context)
+                        if producer_context is not None else None
                     ),
                 )
             except TerminalMutationError as exc:
                 if exc.sealed:
                     active["mutation_sealed"] = True
                     active["mutation_error_code"] = exc.code
-                    if consumer_context is not None:
-                        self._set_session_renewal_suppressed(True)
-                        if isinstance(exc.committed_evidence, dict):
-                            active["committed_mutation_evidence"] = copy.deepcopy(
-                                exc.committed_evidence
-                            )
+                    self._set_session_renewal_suppressed(True)
+                    if isinstance(exc.committed_evidence, dict):
+                        active["committed_mutation_evidence"] = copy.deepcopy(
+                            exc.committed_evidence
+                        )
                 return {
                     "protocol_version": PRESENTER_PROTOCOL,
                     "status": "failed",
@@ -1667,7 +1687,7 @@ class PersistentSpecialistWorker:
                     "error": {"code": exc.code, "message": str(exc)[:500]},
                 }
             active["mutation_sealed"] = True
-            if consumer_context is not None:
+            if producer_context is not None:
                 transition = mutation_result.get("session_transition")
                 transition_error = mutation_result.get("session_transition_error")
                 if mutation_result["outcome"] == "committed":
@@ -1682,10 +1702,12 @@ class PersistentSpecialistWorker:
                         active["session_update_error"] = transition_error
                         active["mutation_error_code"] = transition_error
                     active["transition"] = transition
-                else:
-                    # A failed/conflicting domain mutation cannot advance or renew
-                    # the context from which it was attempted.
-                    self._set_session_renewal_suppressed(True)
+            if mutation_result["outcome"] != "committed":
+                # A failed/conflicting domain mutation cannot advance or renew
+                # an active context, regardless of the operation's declared role.
+                self._set_session_renewal_suppressed(True)
+            elif mutation_result.get("session_transition_error") is None:
+                self._set_session_renewal_suppressed(False)
             try:
                 artifact = await asyncio.to_thread(
                     execute_terminal_presenter,
@@ -1726,8 +1748,7 @@ class PersistentSpecialistWorker:
                 record["response"] = response
                 self._log_terminal_response("turn_failed", request, response)
             except TerminalPresenterError as exc:
-                if consumer_context is not None:
-                    self._set_session_renewal_suppressed(True)
+                self._set_session_renewal_suppressed(True)
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(
                         record_terminal_mutation_presentation,
@@ -1764,8 +1785,7 @@ class PersistentSpecialistWorker:
                 active["mutation_error_code"] = (
                     "MUTATION_PRESENTATION_FAILED"
                 )
-                if consumer_context is not None:
-                    self._set_session_renewal_suppressed(True)
+                self._set_session_renewal_suppressed(True)
                 return {
                     "protocol_version": PRESENTER_PROTOCOL,
                     "status": "failed",
@@ -1784,6 +1804,7 @@ class PersistentSpecialistWorker:
                 "invocation_id": artifact["invocation_id"],
             }
         if operation == "workflow":
+            self._set_session_renewal_suppressed(True)
             if active.get("terminal_workflow") is not True:
                 return {
                     "protocol_version": PRESENTER_PROTOCOL,
@@ -1809,7 +1830,7 @@ class PersistentSpecialistWorker:
                     },
                 }
             try:
-                session_context, consumer_context = self._terminal_consumer_invocation(
+                session_context, consumer_context, producer_context = self._terminal_session_invocation(
                     "terminal_workflow", workflow_id
                 )
             except InteractionSessionError as exc:
@@ -1868,13 +1889,12 @@ class PersistentSpecialistWorker:
                     checkpoint=checkpoint if isinstance(checkpoint, dict) else None,
                     session_context=session_context,
                     session_directive_resolver=(
-                        self._terminal_directive_resolver(consumer_context)
-                        if consumer_context is not None else None
+                        self._terminal_directive_resolver(producer_context)
+                        if producer_context is not None else None
                     ),
                 )
             except TerminalWorkflowError as exc:
-                if consumer_context is not None:
-                    self._set_session_renewal_suppressed(True)
+                self._set_session_renewal_suppressed(True)
                 if isinstance(exc.checkpoint, dict):
                     active["workflow_checkpoint"] = exc.checkpoint
                 return {
@@ -1895,11 +1915,10 @@ class PersistentSpecialistWorker:
                 }
             active["workflow_checkpoint"] = workflow_result["checkpoint"]
             prepared_transition = workflow_result.get("session_transition")
-            if consumer_context is not None:
-                # A deterministic retry that has reached a fresh valid
-                # terminal result may renew/transition normally.  A new mapper
-                # or presenter failure below suppresses renewal again.
-                self._set_session_renewal_suppressed(False)
+            # A deterministic retry that has reached a fresh valid terminal
+            # result may renew/transition normally. A presenter failure below
+            # suppresses renewal again.
+            self._set_session_renewal_suppressed(False)
             try:
                 artifact = await asyncio.to_thread(
                     execute_terminal_presenter,
@@ -1908,8 +1927,7 @@ class PersistentSpecialistWorker:
                     workflow_result["presenter_input"],
                 )
             except TerminalPresenterError as exc:
-                if consumer_context is not None:
-                    self._set_session_renewal_suppressed(True)
+                self._set_session_renewal_suppressed(True)
                 return {
                     "protocol_version": PRESENTER_PROTOCOL,
                     "status": "failed",
@@ -2704,6 +2722,7 @@ class PersistentSpecialistWorker:
                     record["interaction_session_transition"] = response[
                         "interaction_session_transition"
                     ]
+                if "terminal_mutation_evidence" in response:
                     record["terminal_mutation_evidence"] = response[
                         "terminal_mutation_evidence"
                     ]

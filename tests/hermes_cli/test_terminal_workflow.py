@@ -130,7 +130,7 @@ def test_loads_closed_digest_bound_read_only_workflow(tmp_path: Path) -> None:
     assert workflow.read_only is True
 
 
-def test_session_consumer_receives_runtime_wrapper_and_prepares_directive_before_presenting(
+def test_both_role_workflow_receives_runtime_wrapper_and_prepares_directive_before_presenting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     install_workflow(tmp_path)
@@ -163,7 +163,46 @@ def test_session_consumer_receives_runtime_wrapper_and_prepares_directive_before
     assert "session_context" not in result["presenter_input"]
 
 
-def test_non_consumer_session_context_field_remains_domain_output(
+def test_producer_only_workflow_keeps_legacy_input_and_prepares_directive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_workflow(tmp_path)
+    import hermes_cli.terminal_workflow as module
+
+    observed = []
+    monkeypatch.setattr(
+        module,
+        "_run_program",
+        lambda root, program, value, *, label: (
+            observed.append(value)
+            or {
+                "outcome": "terminal_ready",
+                "result": {"payloads": []},
+                "model_result": None,
+                "session_context": {
+                    "operation": "replace",
+                    "context_type": "report",
+                    "context_version": "1.0.0",
+                    "state": {"period": "Q4"},
+                },
+            }
+        ),
+    )
+    workflow_input = {"outcome": "terminal_ready", "payloads": []}
+    result = execute_terminal_workflow(
+        tmp_path,
+        "test-workflow",
+        workflow_input,
+        session_directive_resolver=lambda directive: {
+            "operation": directive["operation"],
+            "revision": 1,
+        },
+    )
+    assert observed == [workflow_input]
+    assert result["session_transition"] == {"operation": "replace", "revision": 1}
+
+
+def test_non_producer_session_context_field_remains_domain_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     install_workflow(tmp_path)

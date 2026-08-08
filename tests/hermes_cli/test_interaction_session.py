@@ -40,7 +40,24 @@ def _write_json(path: Path, value: dict) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
-def install_declaration(root: Path, *, bound: bool = True) -> tuple[object, dict]:
+def _replace_bound_declaration(root: Path, declaration: dict) -> None:
+    digest = _write_json(root / "contract/interaction-sessions.json", declaration)
+    receipt_path = root / "state/installed-distribution.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["manifest"]["profile"]["interaction_session_contract"]["sha256"] = digest
+    _write_json(receipt_path, receipt)
+    _write_json(root / "distribution.json", receipt["manifest"])
+
+
+def install_declaration(
+    root: Path,
+    *,
+    bound: bool = True,
+    producers: list[dict] | None = None,
+    consumers: list[dict] | None = None,
+    supported_producers: set[tuple[str, str]] | None = None,
+    supported_consumers: set[tuple[str, str]] | None = None,
+) -> tuple[object, dict]:
     schema = {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
@@ -54,7 +71,8 @@ def install_declaration(root: Path, *, bound: bool = True) -> tuple[object, dict
         "contexts": [{
             "context_type": "report", "version": "1.0.0", "description": "Report parameters",
             "schema": "contract/session.schema.json", "schema_sha256": schema_digest,
-            "ttl_seconds": 1800, "consumers": [],
+            "ttl_seconds": 1800, "consumers": consumers or [],
+            **({"producers": producers} if producers is not None else {}),
         }],
     }
     declaration_digest = _write_json(root / "contract/interaction-sessions.json", declaration)
@@ -78,7 +96,11 @@ def install_declaration(root: Path, *, bound: bool = True) -> tuple[object, dict
         "installed_at": 1, "manifest": manifest, "dependencies": [],
     })
     _write_json(root / "distribution.json", manifest)
-    loaded = load_interaction_session_declaration(root, supported_consumers=set())
+    loaded = load_interaction_session_declaration(
+        root,
+        supported_producers=supported_producers if supported_producers is not None else set(),
+        supported_consumers=supported_consumers if supported_consumers is not None else set(),
+    )
     return loaded, manifest
 
 
@@ -116,6 +138,50 @@ def test_bound_declaration_validates_snapshot_and_identity(tmp_path: Path) -> No
     changed = {**control, "conversation_generation": 4}
     request = {"protocol_version": "telegram.bridge.persistent_service.v3", "operation": "turn", "conversation_id": "conv_" + "a" * 64, "envelope": {}, "interaction_session": control}
     assert _fingerprint(request) != _fingerprint({**request, "interaction_session": changed})
+
+
+def test_optional_producers_default_empty_and_supported_producer_loads(tmp_path: Path) -> None:
+    declaration, _ = install_declaration(tmp_path)
+    assert declaration.contexts["report"].producers == ()
+
+    producer = {"kind": "terminal_workflow", "workflow_id": "start-report"}
+    declaration, _ = install_declaration(
+        tmp_path,
+        producers=[producer],
+        supported_producers={("terminal_workflow", "start-report")},
+    )
+    assert declaration.contexts["report"].producers == (("terminal_workflow", "start-report"),)
+
+
+def test_declared_producer_requires_independent_terminal_support(tmp_path: Path) -> None:
+    producer = {"kind": "terminal_mutation", "workflow_id": "start-report"}
+    with pytest.raises(InteractionSessionError) as unsupported:
+        install_declaration(tmp_path, producers=[producer])
+    assert unsupported.value.code == "SESSION_PRODUCER_UNSUPPORTED"
+
+
+def test_operation_roles_cannot_cross_contexts(tmp_path: Path) -> None:
+    operation = {"kind": "terminal_workflow", "workflow_id": "report"}
+    install_declaration(
+        tmp_path,
+        producers=[operation],
+        supported_producers={("terminal_workflow", "report")},
+    )
+    declaration = json.loads((tmp_path / "contract/interaction-sessions.json").read_text())
+    second = dict(declaration["contexts"][0])
+    second.update(
+        context_type="other-report",
+        producers=[],
+        consumers=[operation],
+    )
+    declaration["contexts"].append(second)
+    _replace_bound_declaration(tmp_path, declaration)
+    with pytest.raises(InteractionSessionError, match="roles must use one context"):
+        load_interaction_session_declaration(
+            tmp_path,
+            supported_producers={("terminal_workflow", "report")},
+            supported_consumers={("terminal_workflow", "report")},
+        )
 
 
 def test_bound_declaration_digest_mismatch_fails_closed(tmp_path: Path) -> None:

@@ -46,6 +46,7 @@ class InteractionContext:
     schema_sha256: str
     schema: dict[str, Any]
     consumers: tuple[tuple[str, str], ...]
+    producers: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,26 @@ def resolve_consumer_context(
         raise InteractionSessionError(
             "SESSION_CONTRACT_INVALID",
             "terminal consumer resolves to more than one interaction context",
+        )
+    return matches[0] if matches else None
+
+
+def resolve_producer_context(
+    declaration: InteractionSessionDeclaration | None,
+    kind: str,
+    workflow_id: str,
+) -> InteractionContext | None:
+    if declaration is None:
+        return None
+    matches = [
+        context
+        for context in declaration.contexts.values()
+        if (kind, workflow_id) in context.producers
+    ]
+    if len(matches) > 1:
+        raise InteractionSessionError(
+            "SESSION_CONTRACT_INVALID",
+            "terminal producer resolves to more than one interaction context",
         )
     return matches[0] if matches else None
 
@@ -146,7 +167,7 @@ def terminal_session_transition(
         directive.get("context_type") != context.context_type
         or directive.get("context_version") != context.version
     ):
-        raise InteractionSessionError("SESSION_TRANSITION_INVALID", "terminal session directive context does not match its consumer")
+        raise InteractionSessionError("SESSION_TRANSITION_INVALID", "terminal session directive context does not match its declared context")
     state = directive.get("state")
     raw = canonical_session_state(state)
     from jsonschema import Draft202012Validator
@@ -278,6 +299,7 @@ def _validate_self_contained_schema(value: Any) -> None:
 def load_interaction_session_declaration(
     profile_root: Path,
     *,
+    supported_producers: set[tuple[str, str]] | None = None,
     supported_consumers: set[tuple[str, str]] | None = None,
 ) -> InteractionSessionDeclaration | None:
     """Load the manifest-bound declaration; an unbound file is deliberately ignored."""
@@ -343,10 +365,12 @@ def load_interaction_session_declaration(
     except ImportError as exc:
         raise InteractionSessionError("SESSION_CONTRACT_INVALID", "jsonschema is required") from exc
     contexts: dict[str, InteractionContext] = {}
+    seen_producers: dict[tuple[str, str], str] = {}
     seen_consumers: set[tuple[str, str]] = set()
     for item in contexts_raw:
         required = {"context_type", "version", "description", "schema", "schema_sha256", "ttl_seconds", "consumers"}
-        if not isinstance(item, dict) or set(item) != required or item.get("ttl_seconds") != 1800:
+        allowed = required | {"producers"}
+        if not isinstance(item, dict) or not required.issubset(item) or set(item) - allowed or item.get("ttl_seconds") != 1800:
             raise InteractionSessionError("SESSION_CONTRACT_INVALID", "interaction-session context shape is invalid")
         context_type = item.get("context_type")
         if not isinstance(context_type, str) or not _ID_RE.fullmatch(context_type) or context_type in contexts:
@@ -369,6 +393,23 @@ def load_interaction_session_declaration(
             raise InteractionSessionError("SESSION_CONTRACT_INVALID", f"invalid schema for {context_type}") from exc
         if schema.get("type") != "object" or schema.get("additionalProperties") is not False or "$ref" in schema:
             raise InteractionSessionError("SESSION_CONTRACT_INVALID", f"session schema for {context_type} must be a closed object")
+        producers_raw = item.get("producers", [])
+        if not isinstance(producers_raw, list) or len(producers_raw) > 32:
+            raise InteractionSessionError("SESSION_CONTRACT_INVALID", "interaction-session producers are invalid")
+        producers: list[tuple[str, str]] = []
+        for producer in producers_raw:
+            if not isinstance(producer, dict) or set(producer) != {"kind", "workflow_id"}:
+                raise InteractionSessionError("SESSION_CONTRACT_INVALID", "interaction-session producer is invalid")
+            pair = (producer.get("kind"), producer.get("workflow_id"))
+            if pair[0] not in {"terminal_workflow", "terminal_mutation"} or not isinstance(pair[1], str) or not _ID_RE.fullmatch(pair[1]):
+                raise InteractionSessionError("SESSION_CONTRACT_INVALID", "interaction-session producer is invalid")
+            if supported_producers is not None and pair not in supported_producers:
+                raise InteractionSessionError("SESSION_PRODUCER_UNSUPPORTED", f"unsupported interaction-session producer: {pair[1]}")
+            if pair in seen_producers:
+                raise InteractionSessionError("SESSION_CONTRACT_INVALID", f"producer may originate only one context: {pair[1]}")
+            seen_producers[pair] = context_type  # type: ignore[index]
+            producers.append(pair)  # type: ignore[arg-type]
+
         consumers_raw = item.get("consumers")
         if not isinstance(consumers_raw, list) or len(consumers_raw) > 32:
             raise InteractionSessionError("SESSION_CONTRACT_INVALID", "interaction-session consumers are invalid")
@@ -383,6 +424,9 @@ def load_interaction_session_declaration(
                 raise InteractionSessionError("SESSION_CONSUMER_UNSUPPORTED", f"unsupported interaction-session consumer: {pair[1]}")
             if pair in seen_consumers:
                 raise InteractionSessionError("SESSION_CONTRACT_INVALID", f"consumer may accept only one context: {pair[1]}")
+            producer_context = seen_producers.get(pair)  # type: ignore[arg-type]
+            if producer_context is not None and producer_context != context_type:
+                raise InteractionSessionError("SESSION_CONTRACT_INVALID", f"operation roles must use one context: {pair[1]}")
             seen_consumers.add(pair)  # type: ignore[arg-type]
             consumers.append(pair)  # type: ignore[arg-type]
         contexts[context_type] = InteractionContext(
@@ -392,8 +436,16 @@ def load_interaction_session_declaration(
             schema_path=schema_path,
             schema_sha256=str(item.get("schema_sha256")),
             schema=schema,
+            producers=tuple(producers),
             consumers=tuple(consumers),
         )
+    for pair, producer_context in seen_producers.items():
+        if pair in seen_consumers:
+            consumer_context = next(
+                context.context_type for context in contexts.values() if pair in context.consumers
+            )
+            if consumer_context != producer_context:
+                raise InteractionSessionError("SESSION_CONTRACT_INVALID", f"operation roles must use one context: {pair[1]}")
     identity = {key: receipt.get(key) for key in ("profile", "profile_version")}
     identity["manifest"] = manifest
     return InteractionSessionDeclaration(

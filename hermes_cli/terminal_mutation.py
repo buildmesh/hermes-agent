@@ -522,7 +522,7 @@ def _execute_terminal_mutation_locked(
             code = "MUTATION_OUTCOME_UNKNOWN"
             message = "mutation outcome is unknown"
         raise TerminalMutationError(code, message, sealed=True) from exc
-    # Only an explicitly resolved interaction-session consumer may interpret
+    # Only an explicitly resolved interaction-session producer may interpret
     # this producer field as a control directive.  For every other mutation it
     # is backward-compatible domain output.
     directive = (

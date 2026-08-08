@@ -451,7 +451,7 @@ def execute_terminal_workflow(
         if not isinstance(domain_result, dict):
             raise TerminalWorkflowError("WORKFLOW_OUTPUT_INVALID", "terminal result must be an object")
         # ``session_context`` remains ordinary producer-domain output unless
-        # this exact workflow was resolved as an interaction-session consumer.
+        # this exact workflow was resolved as an interaction-session producer.
         # Older profiles are allowed to use that field name in their result
         # contract and must not acquire control semantics by upgrading Hermes.
         directive = (
