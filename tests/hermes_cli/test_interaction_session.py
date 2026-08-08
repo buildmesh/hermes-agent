@@ -191,6 +191,108 @@ def test_model_tool_projection_is_service_gated(monkeypatch: pytest.MonkeyPatch)
     assert "update_interaction_session" in names()
 
 
+@pytest.mark.parametrize(
+    ("protocol_version", "expected_payload_field"),
+    [
+        ("telegram.bridge.persistent_service.v1", "render_payloads"),
+        ("telegram.bridge.persistent_service.v2", "render_candidate"),
+        ("telegram.bridge.persistent_service.v3", "render_candidate"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_unchanged_profile_stays_on_pre_session_wire_and_filesystem_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    protocol_version: str,
+    expected_payload_field: str,
+) -> None:
+    """A profile with no declaration must not observe session machinery."""
+    monkeypatch.setenv("HERMES_INTERACTION_SESSION_ENABLED", "stale")
+    prompts: list[str] = []
+
+    class Agent:
+        api_mode = "codex_responses"
+
+        def run_conversation(self, prompt, conversation_history=None):
+            prompts.append(prompt)
+            candidate = json.dumps([{
+                "schema_version": "telegram.bridge.render_payload.v1",
+                "message_id": "msg_compat",
+                "correlation_id": "compat-turn",
+                "action": "send",
+                "target": {"chat_id": 123},
+                "render": {"text": "unchanged"},
+            }])
+            return {
+                "completed": True,
+                "partial": False,
+                "final_response": candidate,
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": candidate},
+                ],
+            }
+
+        def close(self):
+            return None
+
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="unchanged-profile",
+        agent_factory=Agent,
+    )
+    assert worker._interaction_session_declaration is None
+    assert "HERMES_INTERACTION_SESSION_ENABLED" not in os.environ
+
+    envelope = {
+        "schema_version": "telegram.bridge.user_input.v1",
+        "event_id": "compat-turn",
+        "chat_id": 123,
+        "routing": {"resolved_agent": "unchanged-profile"},
+        "message": {"text": "hello"},
+    }
+    turn = {
+        "protocol_version": protocol_version,
+        "request_id": "req_compat_turn",
+        "operation": "turn",
+        "event_id": "compat-turn",
+        "conversation_id": "conv_" + "7" * 64,
+        "deadline": "2099-01-01T00:00:00+00:00",
+        "envelope": envelope,
+    }
+    reset = {
+        **turn,
+        "request_id": "req_compat_reset",
+        "event_id": "compat-reset",
+        "operation": "reset",
+        "envelope": {
+            **envelope,
+            "event_id": "compat-reset",
+            "message": {"command": {"mode": "reset"}},
+        },
+    }
+
+    await worker.start()
+    try:
+        first = await worker.handle_request(turn)
+        replay = await worker.handle_request(turn)
+        reset_response = await worker.handle_request(reset)
+    finally:
+        await worker.stop()
+
+    assert first["status"] == reset_response["status"] == "completed"
+    assert expected_payload_field in first
+    assert replay == first
+    assert prompts == [_bridge_prompt(envelope)]
+    for response in (first, reset_response):
+        assert "interaction_session_transition" not in response
+    assert worker._active_interaction_session_turn is None
+    assert not worker._interaction_session_endpoint_path.exists()
+    assert not list(tmp_path.rglob("*interaction-session*"))
+
+
 @pytest.mark.parametrize("state", [
     {"value": 1.5}, {"value": 9007199254740992}, {"value": "\ud800"},
 ])
