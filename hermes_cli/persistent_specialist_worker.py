@@ -600,6 +600,18 @@ def _validate_v3_response(response: dict[str, Any]) -> None:
         _validate_interaction_session_transition_wire(transition)
     evidence = response.get("terminal_mutation_evidence")
     if evidence is not None:
+        failed_evidence = (
+            response.get("operation") == "turn"
+            and response.get("status") == "failed"
+            and response.get("execution_state") == "completed"
+        )
+        completed_evidence = (
+            response.get("operation") == "turn"
+            and response.get("status") == "completed"
+            and response.get("execution_state") == "completed"
+            and isinstance(response.get("candidate_source"), dict)
+            and response["candidate_source"].get("kind") == "terminal_presenter"
+        )
         if (
             not isinstance(evidence, dict)
             or set(evidence) != {"outcome", "operation_id", "workflow_id", "workflow_version"}
@@ -610,10 +622,15 @@ def _validate_v3_response(response: dict[str, Any]) -> None:
             or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", evidence["workflow_id"]) is None
             or not isinstance(evidence.get("workflow_version"), str)
             or re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", evidence["workflow_version"]) is None
-            or response.get("operation") != "turn"
-            or response.get("status") != "failed"
-            or response.get("execution_state") != "completed"
+            or not (failed_evidence or completed_evidence)
             or (
+                completed_evidence
+                and isinstance(response.get("interaction_session_transition"), dict)
+                and response["interaction_session_transition"].get("operation") == "quarantine"
+            )
+            or (
+                failed_evidence
+                and
                 response.get("interaction_session_transition") is not None
                 and (
                     not isinstance(response["interaction_session_transition"], dict)
@@ -2674,6 +2691,16 @@ class PersistentSpecialistWorker:
                         )
                         if request["protocol_version"] == PROTOCOL_V3:
                             response_fields["candidate_source"] = candidate_source
+                            if (
+                                active_presenter is not None
+                                and isinstance(
+                                    active_presenter.get("committed_mutation_evidence"),
+                                    dict,
+                                )
+                            ):
+                                response_fields["terminal_mutation_evidence"] = copy.deepcopy(
+                                    active_presenter["committed_mutation_evidence"]
+                                )
                         record.update(
                             execution_state="completed",
                             presentation_state="candidate_unvalidated",
@@ -2682,6 +2709,10 @@ class PersistentSpecialistWorker:
                         )
                         if request["protocol_version"] == PROTOCOL_V3:
                             record["candidate_source"] = candidate_source
+                            if "terminal_mutation_evidence" in response_fields:
+                                record["terminal_mutation_evidence"] = copy.deepcopy(
+                                    response_fields["terminal_mutation_evidence"]
+                                )
                     else:
                         response_fields["render_payloads"] = payloads
                     response = self._base_response(request, **response_fields)

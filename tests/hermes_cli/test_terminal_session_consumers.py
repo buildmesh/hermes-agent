@@ -228,6 +228,36 @@ def test_inactive_committed_failure_keeps_evidence_without_a_fake_transition() -
     })
 
 
+def test_completed_terminal_mutation_may_publish_committed_evidence() -> None:
+    _validate_v3_response({
+        "protocol_version": PROTOCOL_V3,
+        "request_id": "req_1",
+        "operation": "turn",
+        "status": "completed",
+        "execution_state": "completed",
+        "presentation_state": "candidate_unvalidated",
+        "event_id": "evt-1",
+        "render_candidate": {
+            "content": "[]",
+            "sha256": "1" * 64,
+            "truncated": False,
+        },
+        "candidate_source": {
+            "kind": "terminal_presenter",
+            "presenter_id": "report-presenter",
+            "presenter_version": "1.0.0",
+            "presenter_sha256": "2" * 64,
+            "invocation_id": "present_1",
+        },
+        "terminal_mutation_evidence": {
+            "outcome": "committed",
+            "operation_id": "tmut_" + "3" * 64,
+            "workflow_id": "save-report",
+            "workflow_version": "1.0.0",
+        },
+    })
+
+
 @pytest.mark.asyncio
 async def test_session_workflow_failure_suppresses_renewal_until_valid_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

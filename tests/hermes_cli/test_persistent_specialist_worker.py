@@ -1896,6 +1896,67 @@ async def test_v3_terminal_mutation_commits_once_and_promotes_presenter(
 
 
 @pytest.mark.asyncio
+async def test_v3_declared_mutation_producer_publishes_committed_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.hermes_cli.test_interaction_session import install_declaration
+    from tests.hermes_cli.test_terminal_mutation import install_mutation
+
+    install_mutation(tmp_path)
+    operation = {"kind": "terminal_mutation", "workflow_id": "test-create"}
+    declaration, _ = install_declaration(
+        tmp_path,
+        producers=[operation],
+        supported_producers={("terminal_mutation", "test-create")},
+    )
+    monkeypatch.setattr(
+        persistent_worker,
+        "require_codex_additional_context_support",
+        lambda: None,
+    )
+    agent = TerminalMutationAgent()
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="mutation-test",
+        agent_factory=lambda: agent,
+    )
+    await worker.start()
+    request_value = v3_request("terminal-mutation-producer")
+    request_value.update(
+        _terminal_mutation_negotiated=True,
+        _interaction_session_negotiated=True,
+        accepted_capabilities=[
+            "specialist_interaction_session.v1",
+            persistent_worker.TERMINAL_MUTATION_CAPABILITY,
+        ],
+        interaction_session={
+            "profile": "reports",
+            "profile_version": "1.0.0",
+            "installed_profile_sha256": declaration.installed_profile_sha256,
+            "conversation_generation": 0,
+            "active": False,
+        },
+    )
+    try:
+        response = await worker.handle_request(request_value)
+        replay = await worker.handle_request(request_value)
+    finally:
+        await worker.stop()
+
+    assert response["status"] == "completed", response
+    assert response["terminal_mutation_evidence"] == {
+        "outcome": "committed",
+        "operation_id": response["terminal_mutation_evidence"]["operation_id"],
+        "workflow_id": "test-create",
+        "workflow_version": "1.0.0",
+    }
+    assert replay == response
+    assert (tmp_path / "handler-count.txt").read_text() == "1"
+
+
+@pytest.mark.asyncio
 async def test_declared_terminal_workflow_continue_creates_no_artifact(
     tmp_path: Path,
 ) -> None:
