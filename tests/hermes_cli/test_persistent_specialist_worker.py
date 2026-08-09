@@ -851,6 +851,19 @@ class TerminalMutationAgent(FakeAgent):
         }
 
 
+class NonFinalTerminalMutationAgent(TerminalMutationAgent):
+    def run_conversation(self, prompt: str) -> dict:
+        result = super().run_conversation(prompt)
+        result["messages"].append({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_after_terminal_mutation",
+                "function": {"name": "another_tool", "arguments": "{}"},
+            }],
+        })
+        return result
+
+
 def correction_request(event_id: str, attempt_id: str = "corr_attempt_1") -> dict:
     return {
         "protocol_version": PROTOCOL_V2,
@@ -1953,6 +1966,92 @@ async def test_v3_declared_mutation_producer_publishes_committed_evidence(
         "workflow_version": "1.0.0",
     }
     assert replay == response
+    assert (tmp_path / "handler-count.txt").read_text() == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("session_role", ["consumer", "undeclared"])
+@pytest.mark.parametrize("presenter_final", [True, False])
+async def test_v3_active_session_mutation_always_publishes_committed_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_role: str,
+    presenter_final: bool,
+) -> None:
+    from tests.hermes_cli.test_interaction_session import install_declaration
+    from tests.hermes_cli.test_terminal_mutation import install_mutation
+
+    install_mutation(tmp_path)
+    operation = {"kind": "terminal_mutation", "workflow_id": "test-create"}
+    declaration, _ = install_declaration(
+        tmp_path,
+        consumers=[operation] if session_role == "consumer" else [],
+        supported_consumers=(
+            {("terminal_mutation", "test-create")}
+            if session_role == "consumer" else set()
+        ),
+    )
+    monkeypatch.setattr(
+        persistent_worker,
+        "require_codex_additional_context_support",
+        lambda: None,
+    )
+    agent = TerminalMutationAgent() if presenter_final else NonFinalTerminalMutationAgent()
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="mutation-test",
+        agent_factory=lambda: agent,
+    )
+    state = {"period": "2026-Q3"}
+    state_raw = json.dumps(state, sort_keys=True, separators=(",", ":")).encode()
+    context = declaration.contexts["report"]
+    request_value = v3_request(f"terminal-mutation-{session_role}-{presenter_final}")
+    request_value.update(
+        _terminal_mutation_negotiated=True,
+        _interaction_session_negotiated=True,
+        accepted_capabilities=[
+            "specialist_interaction_session.v1",
+            persistent_worker.TERMINAL_MUTATION_CAPABILITY,
+        ],
+        interaction_session={
+            "profile": "reports",
+            "profile_version": "1.0.0",
+            "installed_profile_sha256": declaration.installed_profile_sha256,
+            "conversation_generation": 0,
+            "active": True,
+            "snapshot": {
+                "session_id": "sctx_existing",
+                "context_type": "report",
+                "context_version": "1.0.0",
+                "schema_sha256": context.schema_sha256,
+                "revision": 2,
+                "state": state,
+                "state_sha256": "sha256:" + hashlib.sha256(state_raw).hexdigest(),
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+        },
+    )
+    await worker.start()
+    try:
+        response = await worker.handle_request(request_value)
+        replay = await worker.handle_request(request_value)
+    finally:
+        await worker.stop()
+
+    assert response["status"] == ("completed" if presenter_final else "failed"), response
+    assert response["execution_state"] == "completed"
+    assert response["terminal_mutation_evidence"] == {
+        "outcome": "committed",
+        "operation_id": response["terminal_mutation_evidence"]["operation_id"],
+        "workflow_id": "test-create",
+        "workflow_version": "1.0.0",
+    }
+    assert response["interaction_session_transition"]["operation"] == (
+        "renew" if presenter_final else "quarantine"
+    )
+    assert replay == response
+    assert agent.turns == 1
     assert (tmp_path / "handler-count.txt").read_text() == "1"
 
 

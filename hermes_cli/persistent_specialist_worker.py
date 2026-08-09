@@ -1704,16 +1704,24 @@ class PersistentSpecialistWorker:
                     "error": {"code": exc.code, "message": str(exc)[:500]},
                 }
             active["mutation_sealed"] = True
+            if (
+                mutation_result["outcome"] == "committed"
+                and self._active_interaction_session_turn is not None
+            ):
+                # Outcome evidence protects every committed mutation executed
+                # on an opted-in session turn. Producer authorization controls
+                # directives only; existing consumer-only and undeclared
+                # mutations still need replay-safe failure recovery in TBA.
+                active["committed_mutation_evidence"] = {
+                    "outcome": "committed",
+                    "operation_id": mutation_result["operation_id"],
+                    "workflow_id": mutation_result["workflow_id"],
+                    "workflow_version": mutation_result["workflow_version"],
+                }
             if producer_context is not None:
                 transition = mutation_result.get("session_transition")
                 transition_error = mutation_result.get("session_transition_error")
                 if mutation_result["outcome"] == "committed":
-                    active["committed_mutation_evidence"] = {
-                        "outcome": "committed",
-                        "operation_id": mutation_result["operation_id"],
-                        "workflow_id": mutation_result["workflow_id"],
-                        "workflow_version": mutation_result["workflow_version"],
-                    }
                     if transition_error is not None:
                         transition = self._committed_quarantine_transition()
                         active["session_update_error"] = transition_error
