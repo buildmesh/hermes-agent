@@ -1718,15 +1718,16 @@ class PersistentSpecialistWorker:
                     "workflow_id": mutation_result["workflow_id"],
                     "workflow_version": mutation_result["workflow_version"],
                 }
+            prepared_transition = None
             if producer_context is not None:
                 transition = mutation_result.get("session_transition")
                 transition_error = mutation_result.get("session_transition_error")
                 if mutation_result["outcome"] == "committed":
                     if transition_error is not None:
-                        transition = self._committed_quarantine_transition()
                         active["session_update_error"] = transition_error
                         active["mutation_error_code"] = transition_error
-                    active["transition"] = transition
+                    else:
+                        prepared_transition = transition
             if mutation_result["outcome"] != "committed":
                 # A failed/conflicting domain mutation cannot advance or renew
                 # an active context, regardless of the operation's declared role.
@@ -1820,6 +1821,10 @@ class PersistentSpecialistWorker:
                         "message": "mutation presentation provenance could not be persisted",
                     },
                 }
+            if prepared_transition is not None:
+                self._active_interaction_session_turn[
+                    "transition"
+                ] = prepared_transition
             active["artifact"] = artifact
             return {
                 "protocol_version": PRESENTER_PROTOCOL,

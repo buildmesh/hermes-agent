@@ -1970,6 +1970,129 @@ async def test_v3_declared_mutation_producer_publishes_committed_evidence(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["replace", "clear"])
+async def test_v3_declared_mutation_producer_publishes_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    import hermes_cli.terminal_mutation as terminal_mutation
+    from tests.hermes_cli.test_interaction_session import install_declaration
+    from tests.hermes_cli.test_terminal_mutation import install_mutation
+
+    install_mutation(tmp_path)
+    producer = {"kind": "terminal_mutation", "workflow_id": "test-create"}
+    declaration, _ = install_declaration(
+        tmp_path,
+        producers=[producer],
+        supported_producers={("terminal_mutation", "test-create")},
+    )
+    monkeypatch.setattr(
+        persistent_worker,
+        "require_codex_additional_context_support",
+        lambda: None,
+    )
+    handler_calls: list[str] = []
+    directive = (
+        {
+            "operation": "replace",
+            "context_type": "report",
+            "context_version": "1.0.0",
+            "state": {"period": "2026-Q3"},
+        }
+        if operation == "replace"
+        else {"operation": "clear"}
+    )
+
+    def committed_handler(_root, _program, _value, *, label):
+        handler_calls.append(label)
+        return {
+            "outcome": "committed",
+            "result": {"value": "created once", "record_id": "rec-1"},
+            "session_context": directive,
+        }
+
+    monkeypatch.setattr(terminal_mutation, "_run_program", committed_handler)
+    agent = TerminalMutationAgent()
+    worker = PersistentSpecialistWorker(
+        profile_root=tmp_path,
+        socket_path=tmp_path / "state/runtime/worker.sock",
+        agent_id="mutation-test",
+        agent_factory=lambda: agent,
+    )
+    await worker.start()
+    event_id = f"terminal-mutation-{operation}-producer"
+    interaction_session = {
+        "profile": "reports",
+        "profile_version": "1.0.0",
+        "installed_profile_sha256": declaration.installed_profile_sha256,
+        "conversation_generation": 0,
+        "active": False,
+    }
+    if operation == "clear":
+        state = {"period": "2026-Q2"}
+        state_raw = json.dumps(
+            state, sort_keys=True, separators=(",", ":")
+        ).encode()
+        context = declaration.contexts["report"]
+        interaction_session.update(
+            active=True,
+            snapshot={
+                "session_id": "sctx_existing",
+                "context_type": "report",
+                "context_version": "1.0.0",
+                "schema_sha256": context.schema_sha256,
+                "revision": 2,
+                "state": state,
+                "state_sha256": "sha256:"
+                + hashlib.sha256(state_raw).hexdigest(),
+                "expires_at": "2099-01-01T00:00:00Z",
+            },
+        )
+    request_value = v3_request(event_id)
+    request_value.update(
+        _terminal_mutation_negotiated=True,
+        _interaction_session_negotiated=True,
+        accepted_capabilities=[
+            "specialist_interaction_session.v1",
+            persistent_worker.TERMINAL_MUTATION_CAPABILITY,
+        ],
+        interaction_session=interaction_session,
+    )
+    try:
+        response = await worker.handle_request(request_value)
+        replay = await worker.handle_request(request_value)
+    finally:
+        await worker.stop()
+
+    transition = response["interaction_session_transition"]
+    assert response["status"] == "completed", response
+    assert transition["operation"] == operation
+    assert transition["event_id"] == event_id
+    if operation == "replace":
+        assert transition["revision"] == 1
+        assert transition["state"] == {"period": "2026-Q3"}
+    else:
+        assert transition["prior_session_id"] == "sctx_existing"
+        assert transition["prior_revision"] == 2
+        assert "state" not in transition
+    assert replay == response
+    assert handler_calls == ["mutation handler"]
+    journal_path = next(
+        (tmp_path / "state/persistent-runtime/terminal-mutations").glob("*.json")
+    )
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["session_transition"] == transition
+    ledger = json.loads(
+        worker._ledger_path(
+            "conv_" + "1" * 64,
+            event_id,
+        ).read_text(encoding="utf-8")
+    )
+    assert ledger["interaction_session_transition"] == transition
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("session_role", ["consumer", "undeclared"])
 @pytest.mark.parametrize("presenter_final", [True, False])
 async def test_v3_active_session_mutation_always_publishes_committed_evidence(
