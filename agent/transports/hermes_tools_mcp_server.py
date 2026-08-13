@@ -211,6 +211,19 @@ def _build_server() -> Any:
         )
         if isinstance(td, dict) and td.get("type") == "function"
     }
+    # Explicitly selected plugin callbacks can be unavailable until the
+    # owning runtime opens a per-turn endpoint. Advertise their registered
+    # schemas now; the plugin handler retains the authoritative invocation
+    # gate and returns a typed unavailable error outside an eligible turn.
+    if os.environ.get("HERMES_MCP_ALLOWED_TOOLS") is not None:
+        from tools.registry import registry
+
+        for name in plugin_tools:
+            if name in all_defs:
+                continue
+            schema = registry.get_schema(name)
+            if isinstance(schema, dict):
+                all_defs[name] = {**schema, "name": name}
 
     exposed_count = 0
 

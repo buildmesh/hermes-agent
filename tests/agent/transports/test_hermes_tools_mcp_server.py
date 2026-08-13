@@ -102,6 +102,7 @@ class TestModuleSurface:
             "        schema={'name':'profile_catalog','description':'Catalog',"
             "'parameters':{'type':'object','properties':{}}},\n"
             "        handler=lambda args, **kwargs: 'ok',\n"
+            "        check_fn=lambda: False,\n"
             "    )\n"
         )
         (hermes_home / "config.yaml").write_text(
