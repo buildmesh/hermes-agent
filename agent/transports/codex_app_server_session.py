@@ -29,6 +29,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
@@ -284,6 +285,9 @@ class CodexAppServerSession:
         desired_model: Optional[str] = None,
         desired_reasoning_effort: Optional[str] = None,
         developer_instructions: Optional[str] = None,
+        required_mcp_tools: Optional[set[str]] = None,
+        profile_mcp_servers: Optional[dict[str, dict[str, Any]]] = None,
+        required_mcp_servers: Optional[set[str]] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -297,6 +301,22 @@ class CodexAppServerSession:
             (desired_reasoning_effort or "").strip().lower() or None
         )
         self._developer_instructions = developer_instructions
+        self._required_mcp_tools = frozenset(required_mcp_tools or ())
+        self._profile_mcp_servers = dict(profile_mcp_servers or {})
+        self._required_mcp_servers = frozenset(required_mcp_servers or ())
+        self._required_mcp_server_tools = {
+            name: frozenset(
+                str(tool)
+                for tool in (
+                    ((config.get("tools") or {}).get("include") or [])
+                    if isinstance(config, dict)
+                    and isinstance(config.get("tools"), dict)
+                    else []
+                )
+            )
+            for name, config in self._profile_mcp_servers.items()
+            if name in self._required_mcp_servers
+        }
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -333,8 +353,49 @@ class CodexAppServerSession:
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
+            extra_args: list[str] = []
+            client_env: dict[str, str] = {}
+            if self._required_mcp_tools:
+                from hermes_cli.codex_runtime_plugin_migration import (
+                    hermes_tools_mcp_app_server_args,
+                )
+
+                extra_args.extend(
+                    hermes_tools_mcp_app_server_args(
+                        allowed_tools=set(self._required_mcp_tools)
+                    )
+                )
+            if self._profile_mcp_servers:
+                from hermes_cli.codex_runtime_plugin_migration import (
+                    configured_codex_shell_environment_excludes,
+                    profile_mcp_servers_app_server_config,
+                    _format_toml_value,
+                )
+
+                profile_args, profile_env = profile_mcp_servers_app_server_config(
+                    self._profile_mcp_servers,
+                    set(self._required_mcp_servers),
+                )
+                extra_args.extend(profile_args)
+                client_env.update(profile_env)
+                if profile_env:
+                    existing_excludes = configured_codex_shell_environment_excludes(
+                        Path(self._codex_home)
+                        if self._codex_home is not None
+                        else None
+                    )
+                    extra_args.extend([
+                        "-c",
+                        "shell_environment_policy.exclude="
+                        + _format_toml_value(
+                            sorted(existing_excludes | set(profile_env))
+                        ),
+                    ])
             self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
+                codex_bin=self._codex_bin,
+                codex_home=self._codex_home,
+                extra_args=extra_args or None,
+                env=client_env or None,
             )
         self._client.initialize(
             client_name="hermes",
@@ -385,6 +446,8 @@ class CodexAppServerSession:
                     f"(payload keys: {sorted(result.keys())})"
                 ),
             )
+        if self._required_mcp_tools or self._required_mcp_servers:
+            self._verify_required_mcp_inventory(thread_id)
         self._thread_id = thread_id
         resolved_model = result.get("model")
         resolved_provider = result.get("modelProvider")
@@ -407,6 +470,72 @@ class CodexAppServerSession:
             self._cwd,
         )
         return self._thread_id
+
+    def _verify_required_mcp_inventory(self, thread_id: str) -> None:
+        """Fail before a turn when Codex omitted required MCP capability."""
+        assert self._client is not None
+        result = self._client.request(
+            "mcpServerStatus/list",
+            {"threadId": thread_id, "detail": "toolsAndAuthOnly"},
+            timeout=30,
+        )
+        servers = result.get("data")
+        if not isinstance(servers, list):
+            raise CodexAppServerError(
+                code=-32603,
+                message="Codex returned an invalid MCP server inventory",
+            )
+
+        projected_tools: set[str] = set()
+        available_servers: set[str] = set()
+        profile_tools: dict[str, set[str]] = {}
+        for server in servers:
+            if not isinstance(server, dict):
+                continue
+            name = str(server.get("name") or "")
+            tools = server.get("tools")
+            if (
+                name in self._required_mcp_servers
+                and isinstance(tools, dict)
+                and tools
+            ):
+                available_servers.add(name)
+                profile_tools[name] = {str(tool) for tool in tools}
+            if name == "hermes-tools" and isinstance(tools, dict):
+                projected_tools.update(str(tool) for tool in tools)
+
+        missing_tools = sorted(self._required_mcp_tools - projected_tools)
+        if missing_tools:
+            raise CodexAppServerError(
+                code=-32603,
+                message=(
+                    "Codex did not project required Hermes MCP tools: "
+                    + ", ".join(missing_tools)
+                ),
+            )
+        missing_servers = sorted(self._required_mcp_servers - available_servers)
+        if missing_servers:
+            raise CodexAppServerError(
+                code=-32603,
+                message=(
+                    "Codex did not start required profile MCP servers: "
+                    + ", ".join(missing_servers)
+                ),
+            )
+        missing_profile_tools = {
+            name: sorted(required - profile_tools.get(name, set()))
+            for name, required in self._required_mcp_server_tools.items()
+            if required - profile_tools.get(name, set())
+        }
+        if missing_profile_tools:
+            detail = "; ".join(
+                f"{name}: {', '.join(tools)}"
+                for name, tools in sorted(missing_profile_tools.items())
+            )
+            raise CodexAppServerError(
+                code=-32603,
+                message="Codex omitted required profile MCP tools: " + detail,
+            )
 
     def close(self) -> None:
         if self._closed:

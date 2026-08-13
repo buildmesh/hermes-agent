@@ -149,6 +149,22 @@ EXPOSED_TOOLS: tuple[str, ...] = (
 )
 
 
+def _projected_tools(plugin_tools: set[str]) -> tuple[str, ...]:
+    """Resolve the process-local allowlist against safe core and plugin tools."""
+    raw = os.environ.get("HERMES_MCP_ALLOWED_TOOLS")
+    if raw is None:
+        return EXPOSED_TOOLS
+    requested = {name.strip() for name in raw.split(",") if name.strip()}
+    permitted = set(EXPOSED_TOOLS) | plugin_tools
+    rejected = requested - permitted
+    if rejected:
+        logger.warning(
+            "ignoring unregistered Hermes MCP tools: %s",
+            ", ".join(sorted(rejected)),
+        )
+    return tuple(sorted(requested & permitted))
+
+
 def _build_server() -> Any:
     """Create the FastMCP server with Hermes tools attached. Lazy imports
     so the module can be imported without the mcp package installed
@@ -159,6 +175,12 @@ def _build_server() -> Any:
         raise ImportError(
             f"hermes-tools MCP server requires the 'mcp' package: {exc}"
         ) from exc
+
+    # Discover plugins before reading schemas so explicitly selected plugin
+    # tools are registered in this fresh MCP child process.
+    from hermes_cli.plugins import get_plugin_tool_names
+
+    plugin_tools = get_plugin_tool_names()
 
     # Discover Hermes tools so dispatch works.
     from model_tools import (
@@ -181,13 +203,19 @@ def _build_server() -> Any:
     # MCP clients see the same parameter docs Hermes gives the model.
     all_defs = {
         td["function"]["name"]: td["function"]
-        for td in (get_tool_definitions(quiet_mode=True) or [])
+        for td in (
+            get_tool_definitions(
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            ) or []
+        )
         if isinstance(td, dict) and td.get("type") == "function"
     }
 
     exposed_count = 0
 
-    for name in EXPOSED_TOOLS:
+    projected_tools = _projected_tools(plugin_tools)
+    for name in projected_tools:
         spec = all_defs.get(name)
         if spec is None:
             logger.debug(
@@ -240,7 +268,7 @@ def _build_server() -> Any:
     logger.info(
         "hermes-tools MCP server registered %d/%d tools",
         exposed_count,
-        len(EXPOSED_TOOLS),
+        len(projected_tools),
     )
     return mcp
 

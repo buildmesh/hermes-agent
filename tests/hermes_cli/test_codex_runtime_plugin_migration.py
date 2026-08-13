@@ -11,6 +11,7 @@ from hermes_cli.codex_runtime_plugin_migration import (
     _build_hermes_tools_mcp_entry,
     _format_toml_value,
     _looks_like_test_tempdir,
+    profile_mcp_servers_app_server_config,
     _strip_existing_managed_block,
     _strip_unmanaged_plugin_tables,
     _translate_one_server,
@@ -22,6 +23,46 @@ from hermes_cli.codex_runtime_plugin_migration import (
 # ---- per-server translation ----
 
 class TestTranslateOneServer:
+    def test_profile_projection_scopes_definition_and_hides_secret_from_args(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("PROFILE_TOKEN", "private-value")
+
+        args, env = profile_mcp_servers_app_server_config(
+            {
+                "selected": {
+                    "command": "/opt/profile-mcp",
+                    "env": {"TOKEN": "${PROFILE_TOKEN}"},
+                    "tools": {"include": ["catalog"]},
+                },
+                "other": {"command": "/bin/false"},
+            },
+            {"selected"},
+        )
+
+        joined = " ".join(args)
+        assert "mcp_servers.selected.command" in joined
+        assert "mcp_servers.other" not in joined
+        assert "enabled_tools" in joined
+        assert "private-value" not in joined
+        assert env == {"TOKEN": "private-value"}
+
+    def test_profile_projection_rejects_unresolved_environment(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("MISSING_PROFILE_TOKEN", raising=False)
+
+        with pytest.raises(ValueError, match="environment.*is unresolved"):
+            profile_mcp_servers_app_server_config(
+                {
+                    "selected": {
+                        "command": "/opt/profile-mcp",
+                        "env": {"TOKEN": "${MISSING_PROFILE_TOKEN}"},
+                    }
+                },
+                {"selected"},
+            )
+
     def test_stdio_basic(self):
         cfg, skipped = _translate_one_server("filesystem", {
             "command": "npx",

@@ -14,6 +14,7 @@ from typing import Any, Optional
 import pytest
 
 import agent.transports.codex_app_server_session as session_mod
+from agent.transports.codex_app_server import CodexAppServerError
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
     _ServerRequestRouting,
@@ -152,6 +153,68 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    def test_profile_mcp_projection_is_process_local_and_verified(self):
+        client = FakeClient()
+        captured = {}
+
+        def respond(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-profile"}}
+            if method == "mcpServerStatus/list":
+                return {"data": [
+                    {"name": "profile", "tools": {"catalog": {}}},
+                    {"name": "hermes-tools", "tools": {"plugin_catalog": {}}},
+                ]}
+            return {}
+
+        client._request_handler = respond
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=factory,
+            required_mcp_tools={"plugin_catalog"},
+            profile_mcp_servers={
+                "profile": {
+                    "command": "/opt/profile-mcp",
+                    "env": {"PROFILE_PATH": "/private/profile"},
+                    "tools": {"include": ["catalog"]},
+                }
+            },
+            required_mcp_servers={"profile"},
+        )
+
+        assert session.ensure_started() == "thread-profile"
+        joined = " ".join(captured["extra_args"])
+        assert "mcp_servers.profile.command" in joined
+        assert "plugin_catalog" in joined
+        assert captured["env"] == {"PROFILE_PATH": "/private/profile"}
+        assert "shell_environment_policy.exclude" in joined
+
+    def test_missing_required_mcp_capability_fails_before_ready(self):
+        client = FakeClient()
+
+        def respond(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-incomplete"}}
+            if method == "mcpServerStatus/list":
+                return {"data": []}
+            return {}
+
+        client._request_handler = respond
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=lambda **kwargs: client,
+            required_mcp_tools={"plugin_catalog"},
+        )
+
+        with pytest.raises(CodexAppServerError, match="plugin_catalog"):
+            session.ensure_started()
+        assert session._thread_id is None
+
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
         s = make_session(client)

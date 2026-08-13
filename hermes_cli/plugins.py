@@ -2065,6 +2065,11 @@ def discover_plugins(force: bool = False) -> None:
     get_plugin_manager().discover_and_load(force=force)
 
 
+def get_plugin_tool_names() -> Set[str]:
+    """Return a snapshot of tools registered by enabled plugins."""
+    return set(_ensure_plugins_discovered()._plugin_tool_names)
+
+
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Invoke a lifecycle hook on loaded plugins.
 

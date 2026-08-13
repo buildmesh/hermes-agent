@@ -9,6 +9,11 @@ build helper assembles a server when the SDK is present.
 from __future__ import annotations
 
 import inspect
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 from typing import get_args
 
 from agent.transports.hermes_tools_mcp_server import (
@@ -84,6 +89,46 @@ class TestSignatureFromSchema:
 
 
 class TestModuleSurface:
+    def test_explicit_allowlist_projects_enabled_user_plugin(self, tmp_path: Path):
+        hermes_home = tmp_path / "hermes"
+        plugin = hermes_home / "plugins" / "profile_tools"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.yaml").write_text("name: profile_tools\n")
+        (plugin / "__init__.py").write_text(
+            "def register(ctx):\n"
+            "    ctx.register_tool(\n"
+            "        name='profile_catalog',\n"
+            "        toolset='plugin_profile_tools',\n"
+            "        schema={'name':'profile_catalog','description':'Catalog',"
+            "'parameters':{'type':'object','properties':{}}},\n"
+            "        handler=lambda args, **kwargs: 'ok',\n"
+            "    )\n"
+        )
+        (hermes_home / "config.yaml").write_text(
+            "plugins:\n  enabled:\n    - profile_tools\n"
+        )
+        script = (
+            "import json\n"
+            "from agent.transports.hermes_tools_mcp_server import _build_server\n"
+            "server = _build_server()\n"
+            "print(json.dumps(sorted(t.name for t in server._tool_manager.list_tools())))\n"
+        )
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(hermes_home)
+        env["HERMES_MCP_ALLOWED_TOOLS"] = "profile_catalog"
+
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+
+        assert json.loads(result.stdout.strip().splitlines()[-1]) == [
+            "profile_catalog"
+        ]
+
     def test_module_imports_clean(self):
         from agent.transports import hermes_tools_mcp_server as m
         assert callable(m.main)
