@@ -480,37 +480,54 @@ class CodexAppServerSession:
         return self._thread_id
 
     def _verify_required_mcp_inventory(self, thread_id: str) -> None:
-        """Fail before a turn when Codex omitted required MCP capability."""
+        """Wait for Codex MCP startup, then fail if capability is incomplete."""
         assert self._client is not None
-        result = self._client.request(
-            "mcpServerStatus/list",
-            {"threadId": thread_id, "detail": "toolsAndAuthOnly"},
-            timeout=30,
-        )
-        servers = result.get("data")
-        if not isinstance(servers, list):
-            raise CodexAppServerError(
-                code=-32603,
-                message="Codex returned an invalid MCP server inventory",
-            )
-
+        deadline = time.monotonic() + 30.0
         projected_tools: set[str] = set()
         available_servers: set[str] = set()
         profile_tools: dict[str, set[str]] = {}
-        for server in servers:
-            if not isinstance(server, dict):
-                continue
-            name = str(server.get("name") or "")
-            tools = server.get("tools")
-            if (
-                name in self._required_mcp_servers
-                and isinstance(tools, dict)
-                and tools
-            ):
-                available_servers.add(name)
-                profile_tools[name] = {str(tool) for tool in tools}
-            if name == "hermes-tools" and isinstance(tools, dict):
-                projected_tools.update(str(tool) for tool in tools)
+        while True:
+            result = self._client.request(
+                "mcpServerStatus/list",
+                {"threadId": thread_id, "detail": "toolsAndAuthOnly"},
+                timeout=max(1.0, min(30.0, deadline - time.monotonic())),
+            )
+            servers = result.get("data")
+            if not isinstance(servers, list):
+                raise CodexAppServerError(
+                    code=-32603,
+                    message="Codex returned an invalid MCP server inventory",
+                )
+
+            projected_tools = set()
+            available_servers = set()
+            profile_tools = {}
+            for server in servers:
+                if not isinstance(server, dict):
+                    continue
+                name = str(server.get("name") or "")
+                tools = server.get("tools")
+                if (
+                    name in self._required_mcp_servers
+                    and isinstance(tools, dict)
+                    and tools
+                ):
+                    available_servers.add(name)
+                    profile_tools[name] = {str(tool) for tool in tools}
+                if name == "hermes-tools" and isinstance(tools, dict):
+                    projected_tools.update(str(tool) for tool in tools)
+
+            inventory_complete = (
+                self._required_mcp_tools <= projected_tools
+                and self._required_mcp_servers <= available_servers
+                and all(
+                    required <= profile_tools.get(name, set())
+                    for name, required in self._required_mcp_server_tools.items()
+                )
+            )
+            if inventory_complete or time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
 
         missing_tools = sorted(self._required_mcp_tools - projected_tools)
         if missing_tools:

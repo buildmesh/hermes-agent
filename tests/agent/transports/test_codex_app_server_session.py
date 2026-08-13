@@ -260,9 +260,39 @@ class TestLifecycle:
             required_mcp_tools={"plugin_catalog"},
         )
 
-        with pytest.raises(CodexAppServerError, match="plugin_catalog"):
-            session.ensure_started()
+        with patch("agent.transports.codex_app_server_session.time.monotonic", side_effect=[0, 30, 30]):
+            with pytest.raises(CodexAppServerError, match="plugin_catalog"):
+                session.ensure_started()
         assert session._thread_id is None
+
+    def test_required_mcp_inventory_waits_for_delayed_tool_readiness(self):
+        client = FakeClient()
+        inventory_calls = 0
+
+        def respond(method, params):
+            nonlocal inventory_calls
+            if method == "thread/start":
+                return {"thread": {"id": "thread-delayed-tools"}}
+            if method == "mcpServerStatus/list":
+                inventory_calls += 1
+                tools = (
+                    {"plugin_catalog": {}}
+                    if inventory_calls > 1
+                    else {}
+                )
+                return {"data": [{"name": "hermes-tools", "tools": tools}]}
+            return {}
+
+        client._request_handler = respond
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=lambda **kwargs: client,
+            required_mcp_tools={"plugin_catalog"},
+        )
+
+        with patch("agent.transports.codex_app_server_session.time.sleep"):
+            assert session.ensure_started() == "thread-delayed-tools"
+        assert inventory_calls == 2
 
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
