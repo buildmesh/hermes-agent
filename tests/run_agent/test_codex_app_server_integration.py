@@ -73,6 +73,36 @@ class TestApiModeAccepted:
 
 
 class TestRunConversationCodexPath:
+    def test_turn_additional_context_reaches_the_session(self, monkeypatch):
+        captured = {}
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            captured["user_input"] = user_input
+            captured.update(kwargs)
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-context-1",
+                thread_id="thread-context-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-context-1",
+        )
+        agent = _make_codex_agent()
+        context = {
+            "specialist.session": {"kind": "untrusted", "value": "state"}
+        }
+        agent._codex_additional_context = context
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("hello")
+
+        assert captured == {"user_input": "hello", "additional_context": context}
+
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
         # No background review fork during tests

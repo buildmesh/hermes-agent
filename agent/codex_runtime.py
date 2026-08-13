@@ -695,7 +695,14 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        additional_context = getattr(agent, "_codex_additional_context", None)
+        if additional_context is None:
+            turn = agent._codex_session.run_turn(user_input=user_message)
+        else:
+            turn = agent._codex_session.run_turn(
+                user_input=user_message,
+                additional_context=additional_context,
+            )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

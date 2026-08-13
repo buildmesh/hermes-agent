@@ -288,6 +288,7 @@ class CodexAppServerSession:
         required_mcp_tools: Optional[set[str]] = None,
         profile_mcp_servers: Optional[dict[str, dict[str, Any]]] = None,
         required_mcp_servers: Optional[set[str]] = None,
+        enable_experimental_additional_context: bool = False,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -304,6 +305,9 @@ class CodexAppServerSession:
         self._required_mcp_tools = frozenset(required_mcp_tools or ())
         self._profile_mcp_servers = dict(profile_mcp_servers or {})
         self._required_mcp_servers = frozenset(required_mcp_servers or ())
+        self._enable_experimental_additional_context = bool(
+            enable_experimental_additional_context
+        )
         self._required_mcp_server_tools = {
             name: frozenset(
                 str(tool)
@@ -397,10 +401,14 @@ class CodexAppServerSession:
                 extra_args=extra_args or None,
                 env=client_env or None,
             )
+        initialize_kwargs: dict[str, Any] = {}
+        if self._enable_experimental_additional_context:
+            initialize_kwargs["capabilities"] = {"experimentalApi": True}
         self._client.initialize(
             client_name="hermes",
             client_title="Hermes Agent",
             client_version=_get_hermes_version(),
+            **initialize_kwargs,
         )
         # Permission selection is intentionally NOT sent on thread/start.
         # Two reasons (live-tested against codex 0.130.0):
@@ -638,6 +646,7 @@ class CodexAppServerSession:
     def run_turn(
         self,
         user_input: Any,
+        additional_context: Optional[dict[str, dict[str, str]]] = None,
         *,
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
@@ -690,14 +699,18 @@ class CodexAppServerSession:
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
         try:
-            ts = self._client.request(
-                "turn/start",
-                {
-                    "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
-                },
-                timeout=10,
-            )
+            turn_params: dict[str, Any] = {
+                "threadId": self._thread_id,
+                "input": [{"type": "text", "text": user_input_text}],
+            }
+            if additional_context is not None:
+                if not self._enable_experimental_additional_context:
+                    raise CodexAppServerError(
+                        "ADDITIONAL_CONTEXT_UNAVAILABLE",
+                        "turn additionalContext was not negotiated",
+                    )
+                turn_params["additionalContext"] = additional_context
+            ts = self._client.request("turn/start", turn_params, timeout=10)
         except CodexAppServerError as exc:
             # Classify auth/refresh failures so the user gets a clear
             # `codex login` pointer instead of a raw RPC error string.
