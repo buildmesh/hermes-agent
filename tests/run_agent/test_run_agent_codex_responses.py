@@ -688,6 +688,42 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["messages"][-1]["content"] == "OK"
 
 
+def test_run_conversation_codex_reports_terminal_runtime_metadata(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    response = _codex_message_response("OK")
+    response.model = "gpt-runtime"
+    response.reasoning = SimpleNamespace(effort="high")
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda _kwargs: response)
+
+    result = agent.run_conversation("Say OK")
+
+    assert result["runtime_model"] == "gpt-runtime"
+    assert result["runtime_reasoning_effort"] == "high"
+
+
+def test_consume_codex_stream_preserves_terminal_runtime_metadata():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    response = _consume_codex_event_stream(
+        _FakeCreateStream([
+            SimpleNamespace(type="response.output_text.delta", delta="OK"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(
+                    status="completed",
+                    model="gpt-runtime",
+                    reasoning=SimpleNamespace(effort="medium"),
+                ),
+            ),
+        ]),
+        model="requested-model",
+    )
+
+    assert response.model == "requested-model"
+    assert response.resolved_model == "gpt-runtime"
+    assert response.resolved_reasoning_effort == "medium"
+
+
 def test_codex_preflight_defangs_harmony_tokens_before_and_after_middleware(monkeypatch):
     """Both mutable request boundaries must reject literal Harmony wire tokens."""
     agent = _build_agent(monkeypatch)
@@ -1981,7 +2017,6 @@ def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes(monke
     reasoning_items = interim_msgs[0].get("codex_reasoning_items")
     if reasoning_items:
         assert reasoning_items[0].get("id") == "rs_second"
-
 
 
 

@@ -73,6 +73,31 @@ class TestApiModeAccepted:
 
 
 class TestRunConversationCodexPath:
+    def test_turn_reports_app_server_runtime_metadata(self, monkeypatch):
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-runtime-1",
+                thread_id="thread-runtime-1",
+                resolved_model="gpt-runtime",
+                resolved_reasoning_effort="medium",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-runtime-1",
+        )
+        agent = _make_codex_agent()
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello")
+
+        assert result["runtime_model"] == "gpt-runtime"
+        assert result["runtime_reasoning_effort"] == "medium"
+
     def test_turn_additional_context_reaches_the_session(self, monkeypatch):
         captured = {}
 

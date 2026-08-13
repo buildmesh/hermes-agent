@@ -1286,6 +1286,12 @@ def run_conversation(
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
 
+    # Runtime observations are per turn. Clear them before the first provider
+    # request so an empty, interrupted, or failed turn cannot inherit evidence
+    # from a prior successful Responses turn on a cached agent.
+    agent._last_runtime_model = None
+    agent._last_runtime_reasoning_effort = None
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-
@@ -2442,6 +2448,29 @@ def run_conversation(
                         if _model_request_active is not None:
                             _model_request_active.clear()
                         _redirect_crossed_response = agent._has_pending_redirect()
+
+                if agent.api_mode == "codex_responses" and response is not None:
+                    observed_model = getattr(response, "resolved_model", None)
+                    if observed_model is None and not hasattr(
+                        response, "resolved_model"
+                    ):
+                        observed_model = getattr(response, "model", None)
+                    if isinstance(observed_model, str) and observed_model.strip():
+                        agent._last_runtime_model = observed_model.strip()
+                    observed_effort = getattr(
+                        response, "resolved_reasoning_effort", None
+                    )
+                    if observed_effort is None and not hasattr(
+                        response, "resolved_reasoning_effort"
+                    ):
+                        reasoning = getattr(response, "reasoning", None)
+                        observed_effort = getattr(reasoning, "effort", None)
+                        if observed_effort is None and isinstance(reasoning, dict):
+                            observed_effort = reasoning.get("effort")
+                    if isinstance(observed_effort, str) and observed_effort.strip():
+                        agent._last_runtime_reasoning_effort = (
+                            observed_effort.strip().lower()
+                        )
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this

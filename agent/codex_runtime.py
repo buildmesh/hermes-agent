@@ -893,6 +893,17 @@ def run_codex_app_server_turn(
         "agent_persisted": True,
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
+        **(
+            {"runtime_model": turn.resolved_model}
+            if isinstance(turn.resolved_model, str) and turn.resolved_model.strip()
+            else {}
+        ),
+        **(
+            {"runtime_reasoning_effort": turn.resolved_reasoning_effort}
+            if isinstance(turn.resolved_reasoning_effort, str)
+            and turn.resolved_reasoning_effort.strip()
+            else {}
+        ),
         **usage_result,
     }
 
@@ -1037,6 +1048,8 @@ def _consume_codex_event_stream(
     terminal_status: str = "completed"
     terminal_usage: Any = None
     terminal_response_id: str = None
+    terminal_model: str = None
+    terminal_reasoning_effort: str = None
     terminal_incomplete_details: Any = None
     terminal_error: Any = None
     saw_terminal = False
@@ -1171,6 +1184,19 @@ def _consume_codex_event_stream(
                 if rid is None and isinstance(resp_obj, dict):
                     rid = resp_obj.get("id")
                 terminal_response_id = rid
+                resolved_model = getattr(resp_obj, "model", None)
+                if resolved_model is None and isinstance(resp_obj, dict):
+                    resolved_model = resp_obj.get("model")
+                if isinstance(resolved_model, str) and resolved_model.strip():
+                    terminal_model = resolved_model.strip()
+                reasoning = getattr(resp_obj, "reasoning", None)
+                if reasoning is None and isinstance(resp_obj, dict):
+                    reasoning = resp_obj.get("reasoning")
+                effort = getattr(reasoning, "effort", None)
+                if effort is None and isinstance(reasoning, dict):
+                    effort = reasoning.get("effort")
+                if isinstance(effort, str) and effort.strip():
+                    terminal_reasoning_effort = effort.strip().lower()
                 rstatus = getattr(resp_obj, "status", None)
                 if rstatus is None and isinstance(resp_obj, dict):
                     rstatus = resp_obj.get("status")
@@ -1229,6 +1255,8 @@ def _consume_codex_event_stream(
         status=terminal_status,
         id=terminal_response_id,
         model=model,
+        resolved_model=terminal_model,
+        resolved_reasoning_effort=terminal_reasoning_effort,
         incomplete_details=terminal_incomplete_details,
         error=terminal_error,
     )
