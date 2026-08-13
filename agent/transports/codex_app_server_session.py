@@ -487,11 +487,20 @@ class CodexAppServerSession:
         available_servers: set[str] = set()
         profile_tools: dict[str, set[str]] = {}
         while True:
-            result = self._client.request(
-                "mcpServerStatus/list",
-                {"threadId": thread_id, "detail": "toolsAndAuthOnly"},
-                timeout=max(1.0, min(30.0, deadline - time.monotonic())),
-            )
+            remaining = deadline - time.monotonic()
+            try:
+                result = self._client.request(
+                    "mcpServerStatus/list",
+                    {"threadId": thread_id, "detail": "toolsAndAuthOnly"},
+                    timeout=max(10.0, min(30.0, remaining)),
+                )
+            except TimeoutError as exc:
+                if time.monotonic() < deadline:
+                    raise
+                raise CodexAppServerError(
+                    code=-32603,
+                    message="Codex MCP inventory did not become ready before timeout",
+                ) from exc
             servers = result.get("data")
             if not isinstance(servers, list):
                 raise CodexAppServerError(

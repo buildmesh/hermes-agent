@@ -31,6 +31,7 @@ class FakeClient:
         self.codex_bin = codex_bin
         self.codex_home = codex_home
         self.requests: list[tuple[str, dict]] = []
+        self.request_timeouts: list[tuple[str, float]] = []
         self.notifications_responses: list[dict] = []
         self.responses: list[tuple[Any, dict]] = []
         self.error_responses: list[tuple[Any, int, str]] = []
@@ -48,6 +49,7 @@ class FakeClient:
 
     def request(self, method: str, params: Optional[dict] = None, timeout: float = 30.0):
         self.requests.append((method, params or {}))
+        self.request_timeouts.append((method, timeout))
         if self._request_handler is not None:
             return self._request_handler(method, params or {})
         # Sensible defaults for protocol methods used by the session
@@ -293,6 +295,43 @@ class TestLifecycle:
         with patch("agent.transports.codex_app_server_session.time.sleep"):
             assert session.ensure_started() == "thread-delayed-tools"
         assert inventory_calls == 2
+
+    def test_final_mcp_inventory_probe_receives_bounded_grace(self):
+        client = FakeClient()
+        inventory_calls = 0
+
+        def respond(method, params):
+            nonlocal inventory_calls
+            if method == "thread/start":
+                return {"thread": {"id": "thread-final-probe"}}
+            if method == "mcpServerStatus/list":
+                inventory_calls += 1
+                tools = {"plugin_catalog": {}} if inventory_calls > 1 else {}
+                return {"data": [{"name": "hermes-tools", "tools": tools}]}
+            return {}
+
+        client._request_handler = respond
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            client_factory=lambda **kwargs: client,
+            required_mcp_tools={"plugin_catalog"},
+        )
+
+        with (
+            patch(
+                "agent.transports.codex_app_server_session.time.monotonic",
+                side_effect=[0.0, 0.0, 27.5, 27.5],
+            ),
+            patch("agent.transports.codex_app_server_session.time.sleep"),
+        ):
+            assert session.ensure_started() == "thread-final-probe"
+
+        inventory_timeouts = [
+            timeout
+            for method, timeout in client.request_timeouts
+            if method == "mcpServerStatus/list"
+        ]
+        assert inventory_timeouts == [30.0, 10.0]
 
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
