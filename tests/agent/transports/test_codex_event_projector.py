@@ -5,6 +5,7 @@ plus synthetic ones for item types we couldn't auth-test live."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import pytest
@@ -200,6 +201,31 @@ class TestMcpToolCallProjection:
             {"method": "item/completed", "params": {"item": item}}
         ).messages
         assert "error" in msgs[1]["content"]
+
+    def test_large_terminal_presenter_result_retains_full_content_digest(self) -> None:
+        artifact = '[{"render":{"text":"' + ("x" * 5000) + '"}}]'
+        item = {
+            "type": "mcpToolCall",
+            "id": "m3",
+            "server": "hermes-tools",
+            "tool": "run_terminal_workflow",
+            "status": "completed",
+            "arguments": {},
+            "result": {
+                "content": [{"type": "text", "text": artifact}],
+                "isError": False,
+            },
+            "error": None,
+        }
+
+        tool_message = CodexEventProjector().project(
+            {"method": "item/completed", "params": {"item": item}}
+        ).messages[1]
+
+        assert len(tool_message["content"]) == 4000
+        assert tool_message["terminal_presenter_content_sha256"] == (
+            hashlib.sha256(artifact.encode("utf-8")).hexdigest()
+        )
 
 
 class TestUserAndOpaqueProjection:

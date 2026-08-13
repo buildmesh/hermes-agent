@@ -52,6 +52,26 @@ def _format_tool_args(d: dict) -> str:
     return json.dumps(d, ensure_ascii=False, sort_keys=True)
 
 
+def _terminal_presenter_content_sha256(result: Any) -> Optional[str]:
+    """Digest the exact presenter text inside a nested FastMCP result."""
+    if isinstance(result, str):
+        return hashlib.sha256(result.encode("utf-8")).hexdigest()
+    if isinstance(result, dict):
+        text = result.get("text")
+        if isinstance(text, str):
+            return hashlib.sha256(text.encode("utf-8")).hexdigest()
+        for key in ("content", "structuredContent", "result"):
+            found = _terminal_presenter_content_sha256(result.get(key))
+            if found:
+                return found
+    elif isinstance(result, list):
+        for item in result:
+            found = _terminal_presenter_content_sha256(item)
+            if found:
+                return found
+    return None
+
+
 @dataclass
 class ProjectionResult:
     """Output of projecting one Codex item.
@@ -253,6 +273,18 @@ class CodexEventProjector:
             "tool_call_id": call_id,
             "content": content,
         }
+        if (
+            server.replace("_", "-") == "hermes-tools"
+            and tool in {
+                "finalize_telegram_presentation",
+                "run_terminal_workflow",
+                "run_terminal_mutation",
+            }
+            and not error
+        ):
+            content_sha256 = _terminal_presenter_content_sha256(result)
+            if content_sha256:
+                tool_msg["terminal_presenter_content_sha256"] = content_sha256
         return ProjectionResult(
             messages=[assistant_msg, tool_msg], is_tool_iteration=True
         )
