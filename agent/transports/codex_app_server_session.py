@@ -289,6 +289,7 @@ class CodexAppServerSession:
         profile_mcp_servers: Optional[dict[str, dict[str, Any]]] = None,
         required_mcp_servers: Optional[set[str]] = None,
         enable_experimental_additional_context: bool = False,
+        turn_approval_policy: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -308,6 +309,7 @@ class CodexAppServerSession:
         self._enable_experimental_additional_context = bool(
             enable_experimental_additional_context
         )
+        self._turn_approval_policy = turn_approval_policy
         self._required_mcp_server_tools = {
             name: frozenset(
                 str(tool)
@@ -729,6 +731,8 @@ class CodexAppServerSession:
                 "threadId": self._thread_id,
                 "input": [{"type": "text", "text": user_input_text}],
             }
+            if self._turn_approval_policy is not None:
+                turn_params["approvalPolicy"] = self._turn_approval_policy
             if additional_context is not None:
                 if not self._enable_experimental_additional_context:
                     raise CodexAppServerError(

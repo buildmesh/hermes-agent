@@ -155,6 +155,22 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    def test_turn_approval_policy_is_forwarded(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        session = make_session(client, turn_approval_policy="untrusted")
+
+        session.run_turn("clean prompt", turn_timeout=2.0)
+
+        params = next(
+            params for method, params in client.requests if method == "turn/start"
+        )
+        assert params["approvalPolicy"] == "untrusted"
+
     def test_additional_context_is_negotiated_and_turn_scoped(self):
         client = FakeClient()
         initialized = {}
