@@ -437,6 +437,29 @@ def _maybe_apply_codex_app_server_runtime(
     return api_mode
 
 
+def _finalize_runtime_provider(
+    runtime: Dict[str, Any],
+    *,
+    model_cfg: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Apply config-driven runtime selection after endpoint/auth resolution.
+
+    Provider resolution has several successful exits (explicit caller values,
+    credential-pool entries, and singleton credentials).  Runtime selection
+    must be normalized after those branches choose their endpoint and auth so
+    an explicit base URL cannot accidentally bypass ``openai_runtime``.
+    """
+    provider = str(runtime.get("provider") or "").strip().lower()
+    api_mode = str(runtime.get("api_mode") or "").strip().lower()
+    if provider and api_mode:
+        runtime["api_mode"] = _maybe_apply_codex_app_server_runtime(
+            provider=provider,
+            api_mode=api_mode,
+            model_cfg=model_cfg,
+        )
+    return runtime
+
+
 def _resolve_runtime_from_pool_entry(
     *,
     provider: str,
@@ -564,24 +587,21 @@ def _resolve_runtime_from_pool_entry(
 
         base_url = normalize_opencode_base_url(provider, api_mode, base_url)
 
-    # Optional opt-in: route OpenAI/Codex turns through `codex app-server`.
-    # Inert when `model.openai_runtime` is unset or "auto".
-    api_mode = _maybe_apply_codex_app_server_runtime(
-        provider=provider, api_mode=api_mode, model_cfg=model_cfg
-    )
-
     if provider == "lmstudio":
         base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
 
-    return {
-        "provider": provider,
-        "api_mode": api_mode,
-        "base_url": base_url,
-        "api_key": api_key,
-        "source": getattr(entry, "source", "pool"),
-        "credential_pool": pool,
-        "requested_provider": requested_provider,
-    }
+    return _finalize_runtime_provider(
+        {
+            "provider": provider,
+            "api_mode": api_mode,
+            "base_url": base_url,
+            "api_key": api_key,
+            "source": getattr(entry, "source", "pool"),
+            "credential_pool": pool,
+            "requested_provider": requested_provider,
+        },
+        model_cfg=model_cfg,
+    )
 
 
 def resolve_requested_provider(requested: Optional[str] = None) -> str:
@@ -1826,7 +1846,10 @@ def resolve_runtime_provider(
         target_model=target_model,
     )
     if explicit_runtime:
-        return explicit_runtime
+        return _finalize_runtime_provider(
+            explicit_runtime,
+            model_cfg=model_cfg,
+        )
 
     should_use_pool = provider != "openrouter"
     if provider == "openrouter":
@@ -1943,15 +1966,18 @@ def resolve_runtime_provider(
     if provider == "openai-codex":
         try:
             creds = resolve_codex_runtime_credentials()
-            return {
-                "provider": "openai-codex",
-                "api_mode": "codex_responses",
-                "base_url": creds.get("base_url", "").rstrip("/"),
-                "api_key": creds.get("api_key", ""),
-                "source": creds.get("source", "hermes-auth-store"),
-                "last_refresh": creds.get("last_refresh"),
-                "requested_provider": requested_provider,
-            }
+            return _finalize_runtime_provider(
+                {
+                    "provider": "openai-codex",
+                    "api_mode": "codex_responses",
+                    "base_url": creds.get("base_url", "").rstrip("/"),
+                    "api_key": creds.get("api_key", ""),
+                    "source": creds.get("source", "hermes-auth-store"),
+                    "last_refresh": creds.get("last_refresh"),
+                    "requested_provider": requested_provider,
+                },
+                model_cfg=model_cfg,
+            )
         except AuthError:
             if requested_provider != "auto":
                 raise
@@ -2236,14 +2262,17 @@ def resolve_runtime_provider(
             base_url = normalize_opencode_base_url(provider, api_mode, base_url)
         if provider == "lmstudio":
             base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
-        return {
-            "provider": provider,
-            "api_mode": api_mode,
-            "base_url": base_url,
-            "api_key": creds.get("api_key", ""),
-            "source": creds.get("source", "env"),
-            "requested_provider": requested_provider,
-        }
+        return _finalize_runtime_provider(
+            {
+                "provider": provider,
+                "api_mode": api_mode,
+                "base_url": base_url,
+                "api_key": creds.get("api_key", ""),
+                "source": creds.get("source", "env"),
+                "requested_provider": requested_provider,
+            },
+            model_cfg=model_cfg,
+        )
 
     runtime = _resolve_openrouter_runtime(
         requested_provider=requested_provider,

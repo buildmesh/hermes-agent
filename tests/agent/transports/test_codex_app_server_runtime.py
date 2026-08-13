@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+import hermes_cli.config as config_module
+import hermes_cli.runtime_provider as runtime_provider
 from hermes_cli.runtime_provider import (
     _VALID_API_MODES,
     _maybe_apply_codex_app_server_runtime,
@@ -87,6 +89,45 @@ class TestMaybeApplyCodexAppServerRuntime:
         assert got == "anthropic_messages", (
             f"provider={provider!r} should not be rerouted to codex_app_server"
         )
+
+
+class TestResolveCodexAppServerRuntime:
+    def test_explicit_base_url_does_not_bypass_runtime_selection(
+        self, monkeypatch
+    ) -> None:
+        config = {
+            "model": {
+                "provider": "openai-codex",
+                "default": "gpt-test-codex",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "openai_runtime": "codex_app_server",
+            }
+        }
+        monkeypatch.setattr(runtime_provider, "load_config", lambda: config)
+        monkeypatch.setattr(config_module, "load_config", lambda: config)
+        monkeypatch.setattr(
+            runtime_provider,
+            "resolve_provider",
+            lambda *_args, **_kwargs: "openai-codex",
+        )
+        monkeypatch.setattr(
+            runtime_provider,
+            "resolve_codex_runtime_credentials",
+            lambda: {
+                "api_key": "test-token",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+            },
+        )
+
+        resolved = runtime_provider.resolve_runtime_provider(
+            requested="openai-codex",
+            target_model="gpt-test-codex",
+            explicit_base_url="https://chatgpt.com/backend-api/codex",
+        )
+
+        assert resolved["provider"] == "openai-codex"
+        assert resolved["api_mode"] == "codex_app_server"
+        assert resolved["base_url"] == "https://chatgpt.com/backend-api/codex"
 
 
 class TestCodexAppServerModule:
@@ -339,4 +380,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-
