@@ -2651,6 +2651,20 @@ class TestMCPDiscoveryCrossProcessLock:
             assert result == ["mcp__test_srv__ping"]
             release_spy.assert_called_once()
 
+    def test_lock_path_lives_below_runtime_state(self, tmp_path, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(mcp_tool, "_MCP_DISCOVERY_LOCK_PATH", None)
+        cookie = mcp_tool._try_acquire_mcp_discovery_lock()
+        try:
+            assert isinstance(cookie, mcp_tool._LockCookie)
+            assert mcp_tool._MCP_DISCOVERY_LOCK_PATH == str(
+                tmp_path / "state/hermes-runtime/mcp-discovery.lock"
+            )
+        finally:
+            cookie.release()
+
     def test_lock_held_retries_exhausted_fallback(self):
         """All retry attempts see lock held -> runs discovery unguarded."""
         from tools.mcp_tool import (

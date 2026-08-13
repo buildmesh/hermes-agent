@@ -4238,13 +4238,14 @@ def _try_acquire_mcp_discovery_lock() -> Any:
         from hermes_constants import get_hermes_home
         if _MCP_DISCOVERY_LOCK_PATH is None:
             _MCP_DISCOVERY_LOCK_PATH = str(
-                get_hermes_home() / ".mcp-discovery.lock"
+                get_hermes_home() / "state/hermes-runtime/mcp-discovery.lock"
             )
         lock_path = _MCP_DISCOVERY_LOCK_PATH
     except Exception:
         return _LOCK_UNAVAILABLE
 
     try:
+        os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
         fh = open(lock_path, "w", encoding="utf-8")
     except Exception:
         return _LOCK_UNAVAILABLE

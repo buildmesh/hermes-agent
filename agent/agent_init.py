@@ -300,10 +300,13 @@ def _resolve_compression_threshold(
 def _codex_gpt55_autoraise_notice_marker():
     """Path to the per-profile marker recording that the autoraise notice ran.
 
-    Lives under ``$HERMES_HOME`` (which is profile-scoped) alongside the other
-    internal markers like ``.container-mode`` — so it is not a user-facing config
-    key, and every profile tracks its own notice state independently.
+    Lives below the profile's runtime state tree so closed installed-profile
+    inventories do not mistake Hermes-owned mutable state for payload files.
     """
+    return get_hermes_home() / "state/hermes-runtime/codex-gpt55-autoraise-notice"
+
+
+def _legacy_codex_gpt55_autoraise_notice_marker():
     return get_hermes_home() / ".codex_gpt55_autoraise_notice"
 
 
@@ -329,9 +332,16 @@ def _codex_gpt55_autoraise_notice_seen(autoraise: Dict[str, Any]) -> bool:
     """
     try:
         current = _codex_gpt55_autoraise_notice_state(autoraise)
-        return _codex_gpt55_autoraise_notice_marker().read_text(
-            encoding="utf-8"
-        ).strip() == current
+        for marker in (
+            _codex_gpt55_autoraise_notice_marker(),
+            _legacy_codex_gpt55_autoraise_notice_marker(),
+        ):
+            try:
+                if marker.read_text(encoding="utf-8").strip() == current:
+                    return True
+            except OSError:
+                continue
+        return False
     except (OSError, KeyError, TypeError, ValueError):
         return False
 

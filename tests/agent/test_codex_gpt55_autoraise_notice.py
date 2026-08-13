@@ -112,8 +112,18 @@ def test_codex_gpt55_autoraise_notice_deduped_across_agent_inits(monkeypatch, tm
 
 def test_marker_lives_under_hermes_home() -> None:
     marker = _codex_gpt55_autoraise_notice_marker()
-    assert marker.parent == get_hermes_home()
-    assert marker.name == ".codex_gpt55_autoraise_notice"
+    assert marker.parent == get_hermes_home() / "state/hermes-runtime"
+    assert marker.name == "codex-gpt55-autoraise-notice"
+
+
+def test_legacy_top_level_marker_still_dedupes_notice() -> None:
+    from agent.agent_init import _legacy_codex_gpt55_autoraise_notice_marker
+
+    legacy = _legacy_codex_gpt55_autoraise_notice_marker()
+    legacy.write_text(_codex_gpt55_autoraise_notice_state(AUTORAISE), encoding="utf-8")
+
+    assert _codex_gpt55_autoraise_notice_seen(AUTORAISE) is True
+    assert not _codex_gpt55_autoraise_notice_marker().exists()
 
 
 
