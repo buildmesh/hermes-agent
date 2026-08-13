@@ -174,6 +174,55 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_thread_start_accepts_explicit_configuration_once(self):
+        client = FakeClient()
+        s = make_session(
+            client,
+            desired_model="gpt-test",
+            desired_reasoning_effort="LOW",
+            developer_instructions="profile instructions\n",
+        )
+
+        first = s.ensure_started()
+        second = s.ensure_started()
+
+        assert first == second == "thread-fake-001"
+        starts = [params for method, params in client.requests if method == "thread/start"]
+        assert starts == [{
+            "cwd": "/tmp",
+            "model": "gpt-test",
+            "config": {"model_reasoning_effort": "low"},
+            "developerInstructions": "profile instructions\n",
+        }]
+
+    def test_run_turn_reports_thread_resolution(self):
+        client = FakeClient()
+
+        def respond(method, params):
+            if method == "thread/start":
+                return {
+                    "thread": {"id": "thread-fake-001"},
+                    "model": "gpt-resolved",
+                    "modelProvider": "openai",
+                    "reasoningEffort": "HIGH",
+                }
+            if method == "turn/start":
+                return {"turn": {"id": "turn-fake-001"}}
+            return {}
+
+        client._request_handler = respond
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+
+        result = make_session(client).run_turn("hello", turn_timeout=2.0)
+
+        assert result.resolved_model == "gpt-resolved"
+        assert result.resolved_model_provider == "openai"
+        assert result.resolved_reasoning_effort == "high"
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)
@@ -895,4 +944,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

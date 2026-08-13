@@ -76,6 +76,9 @@ class TurnResult:
     token_usage_total: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
+    resolved_model: Optional[str] = None
+    resolved_model_provider: Optional[str] = None
+    resolved_reasoning_effort: Optional[str] = None
     # Hint to the caller that the underlying codex subprocess is likely
     # wedged (turn-level timeout fired, post-tool watchdog tripped, or
     # token-refresh failure killed the child). The caller should retire
@@ -278,6 +281,9 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
+        desired_model: Optional[str] = None,
+        desired_reasoning_effort: Optional[str] = None,
+        developer_instructions: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -286,6 +292,11 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._desired_model = (desired_model or "").strip() or None
+        self._desired_reasoning_effort = (
+            (desired_reasoning_effort or "").strip().lower() or None
+        )
+        self._developer_instructions = developer_instructions
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -299,6 +310,9 @@ class CodexAppServerSession:
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
+        self._resolved_model: Optional[str] = None
+        self._resolved_model_provider: Optional[str] = None
+        self._resolved_reasoning_effort: Optional[str] = None
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
@@ -343,6 +357,14 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
+        if self._desired_model:
+            params["model"] = self._desired_model
+        if self._desired_reasoning_effort:
+            params["config"] = {
+                "model_reasoning_effort": self._desired_reasoning_effort
+            }
+        if self._developer_instructions:
+            params["developerInstructions"] = self._developer_instructions
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
@@ -364,6 +386,20 @@ class CodexAppServerSession:
                 ),
             )
         self._thread_id = thread_id
+        resolved_model = result.get("model")
+        resolved_provider = result.get("modelProvider")
+        resolved_reasoning_effort = result.get("reasoningEffort")
+        if isinstance(resolved_model, str) and resolved_model.strip():
+            self._resolved_model = resolved_model.strip()
+        if isinstance(resolved_provider, str) and resolved_provider.strip():
+            self._resolved_model_provider = resolved_provider.strip()
+        if (
+            isinstance(resolved_reasoning_effort, str)
+            and resolved_reasoning_effort.strip()
+        ):
+            self._resolved_reasoning_effort = (
+                resolved_reasoning_effort.strip().lower()
+            )
         logger.info(
             "codex app-server thread started: id=%s profile=%s cwd=%s",
             self._thread_id[:8],
@@ -385,6 +421,9 @@ class CodexAppServerSession:
                 pass
             self._client = None
         self._thread_id = None
+        self._resolved_model = None
+        self._resolved_model_provider = None
+        self._resolved_reasoning_effort = None
 
     def __enter__(self) -> "CodexAppServerSession":
         return self
@@ -504,6 +543,9 @@ class CodexAppServerSession:
             return result
         assert self._client is not None and self._thread_id is not None
         result.thread_id = self._thread_id
+        result.resolved_model = self._resolved_model
+        result.resolved_model_provider = self._resolved_model_provider
+        result.resolved_reasoning_effort = self._resolved_reasoning_effort
 
         # Do not clear here: a hard stop can arrive while ensure_started() is
         # spawning/initializing the subprocess. Honor it before launching a
