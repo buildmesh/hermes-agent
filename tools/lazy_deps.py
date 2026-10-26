@@ -286,7 +286,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # for stripped/source-build installs that somehow dropped it. The vision
     # call site uses prompt=False so it can never raise a blocking input()
     # prompt mid-session (#40490).
-    "tool.vision": ("Pillow==12.3.0",),
+    "tool.vision": ("Pillow==13.0.0",),
     # Computer Use (cua-driver) — the MCP client SDK used to spawn and talk
     # to the cua-driver process over stdio. Matches the `mcp` / `computer-use`
     # extras in pyproject.toml. The one-liner installer pulls this in via

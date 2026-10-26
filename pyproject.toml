@@ -122,7 +122,7 @@ dependencies = [
   # libs required for the codecs we use, so it's safe to ship in the base
   # install rather than gating it behind an extra + a mid-session lazy install
   # (which deadlocked the CLI under prompt_toolkit — see #40490).
-  "Pillow==12.3.0",
+  "Pillow==13.0.0",
   # Windows log rotation. Stdlib ``RotatingFileHandler.doRollover()`` uses
   # ``os.rename()`` which fails with ``PermissionError [WinError 32]`` on
   # Windows whenever any other process holds an append-mode handle on
@@ -359,8 +359,9 @@ override-dependencies = [
   "pynacl>=1.6,<1.7",
 ]
 exclude-newer = "14 days"
-# Brotli security fix for CVE-2026-111497 must bypass the cooling-off window.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, brotlicffi = false }
+# Brotli CVE-2026-111497 and Pillow GHSA-78g4-xqwv-q3g8 security fixes
+# must bypass the cooling-off window.
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, brotlicffi = false, pillow = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's
