@@ -207,6 +207,29 @@ mcp_servers:
       resources: false
 ```
 
+### Explicit Codex tool approvals
+
+For the Codex app-server runtime, `tools.approval_modes` projects explicit per-tool
+policy into the selected server's process-local Codex configuration:
+
+```yaml
+mcp_servers:
+  docs:
+    command: /opt/docs-mcp
+    tools:
+      include: [search, edit]
+      approval_modes:
+        search: approve
+        edit: prompt
+```
+
+Only configure `approve` for operations the user has authorized in advance.
+Every named tool must appear in `tools.include`; invalid modes and missing
+allowlist entries fail startup. Supported modes are `auto`, `prompt`, `writes`,
+and `approve`, matching [Codex configuration](https://developers.openai.com/codex/config-reference).
+Omitted tools retain the runtime's existing approval policy. This does not
+change shared Codex configuration or the approval behavior of other servers.
+
 ## What does filtering actually affect?
 
 There are two categories of MCP-exposed functionality in Hermes:

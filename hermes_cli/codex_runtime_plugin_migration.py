@@ -216,8 +216,22 @@ def _translate_one_server(
             out["enabled_tools"] = [str(tool) for tool in include]
         if isinstance(exclude, list):
             out["disabled_tools"] = [str(tool) for tool in exclude]
+        # Approval is explicit per tool and requires an inclusion allowlist.
+        # Unconfigured tools retain Codex's normal approval behavior.
+        approvals = tools.get("approval_modes", {})
+        if not isinstance(approvals, dict):
+            raise ValueError(f"MCP server {name!r} tools.approval_modes must be a mapping")
+        policies = {}
+        for tool, mode in approvals.items():
+            if not isinstance(tool, str) or not isinstance(include, list) or tool not in include:
+                raise ValueError(f"MCP server {name!r} approval tool must be in tools.include")
+            if not isinstance(mode, str) or mode not in {"auto", "prompt", "writes", "approve"}:
+                raise ValueError(f"MCP server {name!r} has invalid tool approval mode")
+            policies[tool] = {"approval_mode": mode}
+        if policies:
+            out["tools"] = policies
         for key in tools:
-            if key not in {"include", "exclude", "resources", "prompts"}:
+            if key not in {"include", "exclude", "resources", "prompts", "approval_modes"}:
                 skipped.append(f"tools.{key} (unknown Hermes key)")
 
     # Enabled flag (codex defaults to true so we only emit when explicitly false)

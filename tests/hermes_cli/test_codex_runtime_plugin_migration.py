@@ -23,6 +23,41 @@ from hermes_cli.codex_runtime_plugin_migration import (
 # ---- per-server translation ----
 
 class TestTranslateOneServer:
+    def test_explicit_tool_approval_projection(self):
+        import tomllib
+
+        args, env = profile_mcp_servers_app_server_config({
+            "selected": {"command": "example", "tools": {
+                "include": ["read", "write", "other"],
+                "approval_modes": {"read": "approve", "write": "prompt"},
+            }},
+            "unselected": {"command": "other"},
+        }, {"selected"})
+        parsed = tomllib.loads("\n".join(args[1::2]))
+        servers = parsed["mcp_servers"]
+        assert set(servers) == {"selected"}
+        assert servers["selected"]["tools"] == {
+            "read": {"approval_mode": "approve"},
+            "write": {"approval_mode": "prompt"},
+        }
+        assert "default_tools_approval_mode" not in servers["selected"]
+        assert env == {}
+
+    @pytest.mark.parametrize("include,approvals", [
+        (None, {"read": "approve"}),
+        (["read"], {"write": "approve"}),
+        (["read"], {"read": "invalid"}),
+        (["read"], {"read": []}),
+        (["read"], ["read"]),
+    ])
+    def test_invalid_tool_approval_fails_closed(self, include, approvals):
+        with pytest.raises(ValueError):
+            profile_mcp_servers_app_server_config({"selected": {
+                "command": "example", "tools": {
+                    "include": include, "approval_modes": approvals,
+                },
+            }}, {"selected"})
+
     def test_profile_projection_scopes_definition_and_hides_secret_from_args(
         self, monkeypatch
     ):
