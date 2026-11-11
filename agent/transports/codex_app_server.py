@@ -163,10 +163,15 @@ class CodexAppServerClient:
         client_title: str = "Hermes Agent",
         client_version: str = "0.1",
         capabilities: Optional[dict] = None,
-        timeout: float = 10.0,
+        timeout: float = 60.0,
     ) -> dict:
         """Send `initialize` + `initialized` handshake. Returns the server's
-        InitializeResponse (userAgent, codexHome, platformFamily, platformOs)."""
+        InitializeResponse (userAgent, codexHome, platformFamily, platformOs).
+
+        Cold starts can exceed ten seconds under host memory/CPU pressure.
+        Keep a bounded startup grace period independent of model turn timeouts;
+        callers can still impose a shorter deadline explicitly.
+        """
         if self._initialized:
             raise RuntimeError("already initialized")
         params = {
